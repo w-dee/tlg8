@@ -15,6 +15,9 @@ add_executable(tlgconv
     src/png_io.cpp
     src/bmp_io.cpp
     src/tlg_io.cpp
+    src/tlg_io_common.cpp
+    src/tlg5_io.cpp
+    src/tlg6_io.cpp
 )
 
 target_include_directories(tlgconv PRIVATE src)
