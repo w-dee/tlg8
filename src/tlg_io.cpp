@@ -7,50 +7,61 @@
 #include <cstring>
 #include <string>
 
-namespace {
-using tlg::detail::read_exact;
-using tlg::detail::read_u32le;
+namespace
+{
+  using tlg::detail::read_exact;
+  using tlg::detail::read_u32le;
 
-bool decode_raw(FILE *fp, const char *mark11, PixelBuffer &out, std::string &err) {
-  if (std::memcmp(mark11, "TLG5.0\x00raw\x1a\x00", 11) == 0) {
-    return tlg::v5::decode_stream(fp, out, err);
+  bool decode_raw(FILE *fp, const char *mark11, PixelBuffer &out, std::string &err)
+  {
+    if (std::memcmp(mark11, "TLG5.0\x00raw\x1a\x00", 11) == 0)
+    {
+      return tlg::v5::decode_stream(fp, out, err);
+    }
+    if (std::memcmp(mark11, "TLG6.0\x00raw\x1a\x00", 11) == 0)
+    {
+      return tlg::v6::decode_stream(fp, out, err);
+    }
+    err = "invalid tlg raw header";
+    return false;
   }
-  if (std::memcmp(mark11, "TLG6.0\x00raw\x1a\x00", 11) == 0) {
-    return tlg::v6::decode_stream(fp, out, err);
-  }
-  err = "invalid tlg raw header";
-  return false;
-}
 
 } // namespace
 
-bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err) {
+bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err)
+{
   err.clear();
   FILE *fp = std::fopen(path.c_str(), "rb");
-  if (!fp) {
+  if (!fp)
+  {
     err = "cannot open file";
     return false;
   }
 
   char mark[11];
-  if (!read_exact(fp, mark, sizeof(mark))) {
+  if (!read_exact(fp, mark, sizeof(mark)))
+  {
     std::fclose(fp);
     err = "read error";
     return false;
   }
 
   bool ok = false;
-  if (std::memcmp(mark, "TLG0.0\x00sds\x1a\x00", 11) == 0) {
+  if (std::memcmp(mark, "TLG0.0\x00sds\x1a\x00", 11) == 0)
+  {
     uint32_t rawlen = read_u32le(fp);
     (void)rawlen;
     char rawmark[11];
-    if (!read_exact(fp, rawmark, sizeof(rawmark))) {
+    if (!read_exact(fp, rawmark, sizeof(rawmark)))
+    {
       std::fclose(fp);
       err = "read error";
       return false;
     }
     ok = decode_raw(fp, rawmark, out, err);
-  } else {
+  }
+  else
+  {
     ok = decode_raw(fp, mark, out, err);
   }
 
@@ -58,9 +69,11 @@ bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err) {
   return ok;
 }
 
-bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions &opt, std::string &err) {
+bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions &opt, std::string &err)
+{
   err.clear();
-  if (!(src.channels == 3 || src.channels == 4)) {
+  if (!(src.channels == 3 || src.channels == 4))
+  {
     err = "unsupported pixel channels";
     return false;
   }
@@ -74,19 +87,22 @@ bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions 
     desired_colors = src.has_alpha() ? 4 : 3;
 
   FILE *fp = std::fopen(path.c_str(), "wb");
-  if (!fp) {
+  if (!fp)
+  {
     err = "cannot open file";
     return false;
   }
 
   bool ok = false;
-  if (opt.version == 6) {
+  if (opt.version == 6)
+  {
     ok = tlg::v6::enc::write_raw(fp, src, desired_colors, err);
-  } else {
+  }
+  else
+  {
     ok = tlg::v5::write_raw(fp, src, desired_colors, err);
   }
 
   std::fclose(fp);
   return ok;
 }
-
