@@ -17,6 +17,197 @@ namespace
   using tlg::detail::tlg5_lzss_decompress;
 }
 
+// CAS-8 lightweight classifier + 2-choice predictor selector (C++17)
+// - Deterministic on both encoder/decoder sides
+// - Uses only causal neighbors: a=left, b=top, c=top-left, d=top-right, f=top-top
+// - Two-choice per class; choice driven by per-predictor recent |e| (exponential decay)
+// - Optional: Planar-lite (Pp) can be enabled to replace one candidate in DIAG/FLAT
+
+#include <cstdint>
+#include <algorithm>
+#include <array>
+
+namespace tlg7
+{
+
+  // ---------- Tunables ----------
+  constexpr int T1 = 2; // flat threshold
+  constexpr int T2 = 6; // orientation threshold (Dh-Dv or Dv-Dh)
+
+  // Exponential decay for recent |e| scores (smaller is better)
+  constexpr int ERR_DECAY_SHIFT = 2; // ~= 1/4 smoothing
+
+  // ---------- Small helpers ----------
+  template <typename T>
+  inline T clip_int(int v, int lo, int hi)
+  {
+    return static_cast<T>(std::min(hi, std::max(lo, v)));
+  }
+
+  inline int iabs(int v) { return v < 0 ? -v : v; }
+
+  // ---------- Classes ----------
+  enum class Class : uint8_t
+  {
+    FLAT = 0,
+    HORZ = 1,
+    VERT = 2,
+    DIAG = 3
+  };
+
+  // ---------- Predictor indices ----------
+  enum PredId : uint8_t
+  {
+    P0 = 0, // a
+    P1,     // b
+    P2,     // (a+b+1)>>1
+    P3,     // a+b-c        (MED/Paeth core)
+    P4,     // a + ((b-c)>>1)
+    P5,     // b + ((a-c)>>1)
+    P6,     // ((a<<1)+b-c+2)>>2
+    P7,     // (a+(b<<1)-c+2)>>2
+    Pp,     // Planar-lite (optional)
+    PRED_COUNT
+  };
+
+  // Keep recent |e| scores per predictor (lower = better).
+  struct SelectorState
+  {
+    std::array<uint16_t, PRED_COUNT> errScore{}; // initialized to 0
+
+    // Update after decoding one pixel with predictor pid and residual e
+    inline void update(PredId pid, int e_abs)
+    {
+      // y[n] = ( (y[n-1] * (2^s - 1)) + e_abs ) / 2^s  ; here implemented branchlessly
+      uint16_t prev = errScore[pid];
+      uint16_t dec = static_cast<uint16_t>(prev - (prev >> ERR_DECAY_SHIFT));
+      errScore[pid] = static_cast<uint16_t>(dec + std::min(e_abs, 0xFFFF));
+    }
+  };
+
+  // ---------- Classification ----------
+  inline Class classify_cas8(int a, int b, int c)
+  {
+    const int Dh = iabs(a - b);
+    const int Dv = iabs(b - c);
+    if (Dh <= T1 && Dv <= T1)
+      return Class::FLAT;
+    if ((Dh - Dv) >= T2)
+      return Class::VERT; // vertical edge (favor left predictors)
+    if ((Dv - Dh) >= T2)
+      return Class::HORZ; // horizontal edge (favor top predictors)
+    return Class::DIAG;
+  }
+
+  // ---------- Predictors ----------
+  // NOTE: pass pixel depth (lo..hi) to enforce identical clipping on encoder/decoder
+  template <typename T>
+  inline int predict(PredId pid, int a, int b, int c, int d, int f, int lo, int hi)
+  {
+    int p;
+    switch (pid)
+    {
+    case P0:
+      p = a;
+      break;
+    case P1:
+      p = b;
+      break;
+    case P2:
+      p = (a + b + 1) >> 1;
+      break;
+    case P3:
+      p = a + b - c;
+      break;
+    case P4:
+      p = a + ((b - c) >> 1);
+      break;
+    case P5:
+      p = b + ((a - c) >> 1);
+      break;
+    case P6:
+      p = ((a << 1) + b - c + 2) >> 2;
+      break;
+    case P7:
+      p = (a + (b << 1) - c + 2) >> 2;
+      break;
+    case Pp:
+    {
+      // Planar-lite (very light plane fit using 5 causal taps)
+      const int Hx = (a - c) + (b - d);
+      const int Vy = (b - c) + (f - b);
+      p = a + ((Hx + Vy + 2) >> 2);
+      break;
+    }
+    default:
+      p = b;
+      break;
+    }
+    return clip_int<T>(p, lo, hi);
+  }
+
+  // ---------- Two-choice mapping per class ----------
+  // FLAT  -> {P2, P3}
+  // VERT  -> {P0, P6}
+  // HORZ  -> {P1, P7}
+  // DIAG  -> {P3, best(P4,P5)} ; if Planar-lite enabled, you may replace P3 with Pp when its score is better.
+  struct Cas8Config
+  {
+    bool enablePlanarLite = false; // if true, allow Pp to replace P3 in FLAT/DIAG when its score is better
+  };
+
+  // Decide final predictor id given neighbors and selector state.
+  // Does NOT update state; call state.update(pid, abs(e)) after you decode e.
+  inline PredId select_pred_cas8(const SelectorState &st, Class klass, const Cas8Config &cfg)
+  {
+    PredId a = P2, b = P3; // defaults for FLAT
+    switch (klass)
+    {
+    case Class::FLAT:
+      a = P2;
+      b = P3;
+      if (cfg.enablePlanarLite && st.errScore[Pp] + 0u < st.errScore[b] + 0u)
+        b = Pp;
+      break;
+    case Class::VERT:
+      a = P0;
+      b = P6;
+      break;
+    case Class::HORZ:
+      a = P1;
+      b = P7;
+      break;
+    case Class::DIAG:
+    {
+      PredId second = (st.errScore[P4] + 0u <= st.errScore[P5] + 0u) ? P4 : P5;
+      a = P3;
+      b = second;
+      if (cfg.enablePlanarLite && st.errScore[Pp] + 0u < st.errScore[a] + 0u)
+        a = Pp;
+      break;
+    }
+    }
+    // Final 2-choice by smaller recent |e|
+    return (st.errScore[a] + 0u <= st.errScore[b] + 0u) ? a : b;
+  }
+
+  // ---------- One-stop predict-or-select ----------
+  // Returns (pred, chosen predictor id). T = storage type (e.g., uint8_t, uint16_t)
+  template <typename T>
+  inline std::pair<int, PredId>
+  cas8_predict(int a, int b, int c, int d, int f,
+               int lo, int hi,
+               const Cas8Config &cfg,
+               const SelectorState &state)
+  {
+    const Class cls = classify_cas8(a, b, c);
+    const PredId pid = select_pred_cas8(state, cls, cfg);
+    const int pred = predict<T>(pid, a, b, c, d, f, lo, hi);
+    return {pred, pid};
+  }
+
+} // namespace tlg7
+
 namespace tlg7
 {
   static const int GOLOMB_N_COUNT = 4;
@@ -838,7 +1029,7 @@ namespace tlg::v7::enc
     c.Encode(code, 4096, dum, dumlen);
   }
 
-  constexpr int FILTER_TRY_COUNT = 16;
+  constexpr int FILTER_TRY_COUNT = 32;
   constexpr int GOLOMB_GIVE_UP_BYTES = 4;
 
   class TLG7BitStream
@@ -1286,6 +1477,284 @@ namespace tlg::v7::enc
     return best_code;
   }
 
+  struct Candidate
+  {
+    int predictor = 0;
+    int filter = 0;
+    size_t total_bits = std::numeric_limits<size_t>::max();
+    std::array<std::vector<uint8_t>, MAX_COLOR_COMPONENTS> comps;
+  };
+
+  struct EncodingContext
+  {
+    const PixelBuffer &src;
+    int colors;
+    int x_block_count;
+    int y_block_count;
+    size_t block_capacity;
+    size_t block_group_capacity;
+    std::vector<uint32_t> argb;
+    std::array<std::vector<uint8_t>, MAX_COLOR_COMPONENTS> buf;
+    std::array<std::vector<uint8_t>, MAX_COLOR_COMPONENTS> block_buf;
+    std::vector<uint32_t> zeroline;
+    std::vector<uint8_t> filtertypes;
+    std::vector<uint8_t> temp_storage;
+    int max_bit_length = 0;
+    size_t filter_index = 0;
+
+    EncodingContext(const PixelBuffer &src_in, int color_count, int xb, int yb)
+        : src(src_in),
+          colors(color_count),
+          x_block_count(xb),
+          y_block_count(yb),
+          block_capacity((size_t)W_BLOCK_SIZE * H_BLOCK_SIZE),
+          block_group_capacity((size_t)H_BLOCK_SIZE * src_in.width),
+          argb((size_t)src_in.width * src_in.height),
+          zeroline(src_in.width, color_count == 3 ? 0xff000000u : 0u),
+          filtertypes((size_t)xb * yb, 0)
+    {
+      for (int c = 0; c < colors; ++c)
+      {
+        buf[c].resize(block_capacity * 3);
+        block_buf[c].resize(block_group_capacity);
+      }
+      temp_storage.reserve((size_t)src_in.width * src_in.height);
+    }
+  };
+
+  static void write_stream_header(FILE *fp, const PixelBuffer &src, int colors)
+  {
+    unsigned char mark[11] = {'T', 'L', 'G', '7', '.', '0', 0, 'r', 'a', 'w', 0x1a};
+    fwrite(mark, 1, sizeof(mark), fp);
+    uint8_t cbyte = static_cast<uint8_t>(colors);
+    fwrite(&cbyte, 1, 1, fp);
+    uint8_t zeros[3] = {0, 0, 0};
+    fwrite(zeros, 1, 3, fp);
+    write_u32le_fp(fp, src.width);
+    write_u32le_fp(fp, src.height);
+  }
+
+  static void populate_argb_buffer(const PixelBuffer &src, std::vector<uint32_t> &argb)
+  {
+    for (uint32_t y = 0; y < src.height; ++y)
+    {
+      for (uint32_t x = 0; x < src.width; ++x)
+      {
+        uint8_t a, r, g, b;
+        fetch_argb(src, x, y, a, r, g, b);
+        argb[(size_t)y * src.width + x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+      }
+    }
+  }
+
+  static Candidate build_candidate(EncodingContext &ctx,
+                                   int predictor,
+                                   std::array<tlg7::SelectorState, MAX_COLOR_COMPONENTS> &state,
+                                   uint32_t x,
+                                   uint32_t xlim,
+                                   uint32_t y,
+                                   uint32_t ylim,
+                                   uint32_t xp,
+                                   size_t block_pixels)
+  {
+    Candidate cand;
+    cand.predictor = predictor;
+    const uint32_t width = ctx.src.width;
+    const uint32_t bw = xlim - x;
+    const uint32_t block_h = ylim - y;
+
+    for (int c = 0; c < ctx.colors; ++c)
+    {
+      size_t wp = 0;
+      for (uint32_t yy = y; yy < ylim; ++yy)
+      {
+        const uint32_t *sl = &ctx.argb[yy * width];
+        const uint32_t *upper_line = (yy < 1) ? ctx.zeroline.data() : &ctx.argb[(yy - 1) * width];
+        const uint32_t *upper_upper_line = (yy < 2) ? ctx.zeroline.data() : &ctx.argb[(yy - 2) * width];
+        for (uint32_t xx = x; xx < xlim; ++xx)
+        {
+          uint8_t px = static_cast<uint8_t>((sl[xx] >> (c * 8)) & 0xff);
+          uint8_t pa = (xx > 0) ? static_cast<uint8_t>((sl[xx - 1] >> (c * 8)) & 0xff) : 0;
+          uint8_t pb = static_cast<uint8_t>((upper_line[xx] >> (c * 8)) & 0xff);
+          uint8_t pc = (xx > 0) ? static_cast<uint8_t>((upper_line[xx - 1] >> (c * 8)) & 0xff) : 0;
+          uint8_t pd = (xx < width - 1) ? static_cast<uint8_t>((upper_line[xx + 1] >> (c * 8)) & 0xff) : 0;
+          uint8_t pf = static_cast<uint8_t>((upper_upper_line[xx] >> (c * 8)) & 0xff);
+          uint8_t py;
+          if (predictor == 0)
+          {
+            auto [pred, pid] = tlg7::cas8_predict<uint8_t>(
+                pa, pb, pc, pd, pf, 0, 255, {true /*enablePlanarLite*/}, state[c]);
+
+            py = pred;
+            state[c].update(pid, std::abs((int)px - (int)py));
+          }
+          else
+          {
+            py = static_cast<uint8_t>((pa + pb + 1) >> 1);
+          }
+          int pix = (static_cast<int>(px) - static_cast<int>(py)) & 0xff;
+          ctx.buf[c][wp] = static_cast<uint8_t>(pix);
+          ++wp;
+        }
+      }
+    }
+
+    size_t dbofs = (size_t)(predictor + 1) * ctx.block_capacity;
+    size_t write_pos = 0;
+    for (uint32_t yy = y; yy < ylim; ++yy)
+    {
+      size_t ofs;
+      if (!(xp & 1))
+        ofs = (size_t)(yy - y) * bw;
+      else
+        ofs = (size_t)(ylim - yy - 1) * bw;
+      bool dir;
+      if (!(block_h & 1))
+        dir = ((yy & 1) ^ (xp & 1)) != 0;
+      else
+      {
+        if (xp & 1)
+          dir = (yy & 1) != 0;
+        else
+          dir = ((yy & 1) ^ (xp & 1)) != 0;
+      }
+      if (!dir)
+      {
+        for (uint32_t xx = 0; xx < bw; ++xx)
+        {
+          for (int c = 0; c < ctx.colors; ++c)
+            ctx.buf[c][dbofs + write_pos] = ctx.buf[c][ofs + xx];
+          ++write_pos;
+        }
+      }
+      else
+      {
+        for (int xx = (int)bw - 1; xx >= 0; --xx)
+        {
+          for (int c = 0; c < ctx.colors; ++c)
+            ctx.buf[c][dbofs + write_pos] = ctx.buf[c][ofs + (size_t)xx];
+          ++write_pos;
+        }
+      }
+    }
+
+    for (int c = 0; c < ctx.colors; ++c)
+    {
+      const uint8_t *begin = ctx.buf[c].data() + dbofs;
+      cand.comps[c].assign(begin, begin + block_pixels);
+    }
+
+    if (ctx.colors >= 3)
+    {
+      std::vector<uint8_t> filtered_b, filtered_g, filtered_r;
+      int ft = detect_color_filter(cand.comps[0], cand.comps[1], cand.comps[2], filtered_b, filtered_g, filtered_r);
+      cand.filter = ft;
+      cand.comps[0] = std::move(filtered_b);
+      cand.comps[1] = std::move(filtered_g);
+      cand.comps[2] = std::move(filtered_r);
+    }
+
+    size_t bits = 0;
+    for (int c = 0; c < ctx.colors; ++c)
+      bits += estimate_golomb_bits(cand.comps[c]);
+    cand.total_bits = bits;
+
+    return cand;
+  }
+
+  static void append_encoded_components(EncodingContext &ctx, uint32_t pixel_count)
+  {
+    for (int c = 0; c < ctx.colors; ++c)
+    {
+      std::vector<int8_t> signed_data(pixel_count);
+      for (size_t i = 0; i < pixel_count; ++i)
+        signed_data[i] = static_cast<int8_t>(ctx.block_buf[c][i]);
+      std::vector<uint8_t> bit_bytes;
+      TLG7BitStream bs(bit_bytes);
+      compress_values_golomb(bs, signed_data);
+      uint32_t bitlen = static_cast<uint32_t>(bs.GetBitLength());
+      if ((int)bitlen > ctx.max_bit_length)
+        ctx.max_bit_length = (int)bitlen;
+      uint8_t header[4] = {
+          static_cast<uint8_t>(bitlen & 0xff),
+          static_cast<uint8_t>((bitlen >> 8) & 0xff),
+          static_cast<uint8_t>((bitlen >> 16) & 0xff),
+          static_cast<uint8_t>((bitlen >> 24) & 0xff)};
+      bs.Flush();
+      ctx.temp_storage.insert(ctx.temp_storage.end(), header, header + 4);
+      ctx.temp_storage.insert(ctx.temp_storage.end(), bit_bytes.begin(), bit_bytes.end());
+    }
+  }
+
+  static bool encode_block_row(EncodingContext &ctx, uint32_t y, std::string &err)
+  {
+    const uint32_t width = ctx.src.width;
+    uint32_t ylim = std::min<uint32_t>(y + H_BLOCK_SIZE, ctx.src.height);
+    uint32_t block_h = ylim - y;
+    uint32_t pixel_count = block_h * width;
+    std::array<tlg7::SelectorState, MAX_COLOR_COMPONENTS> states;
+
+    for (int c = 0; c < ctx.colors; ++c)
+      std::fill(ctx.block_buf[c].begin(), ctx.block_buf[c].begin() + pixel_count, 0);
+
+    size_t gwp = 0;
+    for (uint32_t x = 0, xp = 0; x < width; x += W_BLOCK_SIZE, ++xp)
+    {
+      uint32_t xlim = std::min<uint32_t>(x + W_BLOCK_SIZE, width);
+      uint32_t bw = xlim - x;
+      size_t block_pixels = (size_t)bw * block_h;
+
+      std::array<Candidate, 2> candidates = {
+          build_candidate(ctx, 0, states, x, xlim, y, ylim, xp, block_pixels),
+          build_candidate(ctx, 1, states, x, xlim, y, ylim, xp, block_pixels)};
+
+      const Candidate *best = &candidates[0];
+      //      if (candidates[1].total_bits < best->total_bits)
+      //        best = &candidates[1];
+
+      ctx.filtertypes[ctx.filter_index++] = static_cast<uint8_t>((best->filter << 1) | best->predictor);
+
+      for (int c = 0; c < ctx.colors; ++c)
+      {
+        uint8_t *dst = ctx.block_buf[c].data() + gwp;
+        std::copy(best->comps[c].begin(), best->comps[c].end(), dst);
+      }
+
+      gwp += block_pixels;
+    }
+
+    if (gwp != pixel_count)
+    {
+      err = "tlg7: block size mismatch";
+      return false;
+    }
+
+    append_encoded_components(ctx, pixel_count);
+
+    const uint32_t *last_line = &ctx.argb[(ylim - 1) * width];
+    std::copy(last_line, last_line + width, ctx.zeroline.begin());
+
+    return true;
+  }
+
+  static void write_encoded_payload(FILE *fp, const EncodingContext &ctx)
+  {
+    write_u32le_fp(fp, (uint32_t)ctx.max_bit_length);
+
+    SlideCompressor filter_comp;
+    InitializeColorFilterCompressor(filter_comp);
+    std::vector<uint8_t> filter_out(ctx.filtertypes.empty() ? 0 : ctx.filtertypes.size() * 2 + 16);
+    size_t outlen = 0;
+    if (!ctx.filtertypes.empty())
+      filter_comp.Encode(ctx.filtertypes.data(), ctx.filtertypes.size(), filter_out.data(), outlen);
+    write_u32le_fp(fp, (uint32_t)outlen);
+    if (outlen)
+      fwrite(filter_out.data(), 1, outlen, fp);
+
+    if (!ctx.temp_storage.empty())
+      fwrite(ctx.temp_storage.data(), 1, ctx.temp_storage.size(), fp);
+  }
+
   static bool write_tlg7_raw(FILE *fp, const PixelBuffer &src, int colors, std::string &err)
   {
     err.clear();
@@ -1297,247 +1766,27 @@ namespace tlg::v7::enc
 
     init_tables();
 
-    unsigned char mark[11] = {'T', 'L', 'G', '7', '.', '0', 0, 'r', 'a', 'w', 0x1a};
-    fwrite(mark, 1, sizeof(mark), fp);
-    uint8_t cbyte = static_cast<uint8_t>(colors);
-    fwrite(&cbyte, 1, 1, fp);
-    uint8_t zeros[3] = {0, 0, 0};
-    fwrite(zeros, 1, 3, fp);
-    write_u32le_fp(fp, src.width);
-    write_u32le_fp(fp, src.height);
-
     const int x_block_count = (int)((src.width - 1) / W_BLOCK_SIZE) + 1;
     const int y_block_count = (int)((src.height - 1) / H_BLOCK_SIZE) + 1;
 
-    const size_t block_capacity = (size_t)W_BLOCK_SIZE * H_BLOCK_SIZE;
-    const size_t block_group_capacity = (size_t)H_BLOCK_SIZE * src.width;
+    write_stream_header(fp, src, colors);
 
-    std::vector<uint32_t> argb((size_t)src.width * src.height);
-    for (uint32_t y = 0; y < src.height; ++y)
-    {
-      for (uint32_t x = 0; x < src.width; ++x)
-      {
-        uint8_t a, r, g, b;
-        fetch_argb(src, x, y, a, r, g, b);
-        argb[(size_t)y * src.width + x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-      }
-    }
-
-    std::array<std::vector<uint8_t>, MAX_COLOR_COMPONENTS> buf;
-    std::array<std::vector<uint8_t>, MAX_COLOR_COMPONENTS> block_buf;
-    for (int c = 0; c < colors; ++c)
-    {
-      buf[c].resize(block_capacity * 3);
-      block_buf[c].resize(block_group_capacity);
-    }
-
-    std::vector<uint32_t> zeroline(src.width, colors == 3 ? 0xff000000u : 0u);
-    std::vector<uint8_t> filtertypes((size_t)x_block_count * y_block_count, 0);
-    std::vector<uint8_t> temp_storage;
-    temp_storage.reserve((size_t)src.width * src.height);
-
-    int max_bit_length = 0;
-    size_t filter_index = 0;
+    EncodingContext ctx(src, colors, x_block_count, y_block_count);
+    populate_argb_buffer(src, ctx.argb);
 
     for (uint32_t y = 0; y < src.height; y += H_BLOCK_SIZE)
     {
-      uint32_t ylim = std::min<uint32_t>(y + H_BLOCK_SIZE, src.height);
-      uint32_t block_h = ylim - y;
-      uint32_t pixel_count = block_h * src.width;
-
-      for (int c = 0; c < colors; ++c)
-      {
-        std::fill(block_buf[c].begin(), block_buf[c].begin() + pixel_count, 0);
-      }
-
-      size_t gwp = 0;
-      for (uint32_t x = 0, xp = 0; x < src.width; x += W_BLOCK_SIZE, ++xp)
-      {
-        uint32_t xlim = std::min<uint32_t>(x + W_BLOCK_SIZE, src.width);
-        uint32_t bw = xlim - x;
-        size_t block_pixels = static_cast<size_t>(bw) * block_h;
-
-        struct Candidate
-        {
-          int predictor = 0;
-          int filter = 0;
-          size_t total_bits = std::numeric_limits<size_t>::max();
-          std::array<std::vector<uint8_t>, MAX_COLOR_COMPONENTS> comps;
-        };
-
-        std::array<Candidate, 2> candidates;
-
-        for (int predictor = 0; predictor < 2; ++predictor)
-        {
-          for (int c = 0; c < colors; ++c)
-          {
-            size_t wp = 0;
-            for (uint32_t yy = y; yy < ylim; ++yy)
-            {
-              const uint32_t *sl = &argb[yy * src.width];
-              const uint32_t *upper_line = (yy == 0) ? zeroline.data() : &argb[(yy - 1) * src.width];
-              for (uint32_t xx = x; xx < xlim; ++xx)
-              {
-                uint8_t px = static_cast<uint8_t>((sl[xx] >> (c * 8)) & 0xff);
-                uint8_t pa = (xx > 0) ? static_cast<uint8_t>((sl[xx - 1] >> (c * 8)) & 0xff) : 0;
-                uint8_t pb = static_cast<uint8_t>((upper_line[xx] >> (c * 8)) & 0xff);
-                uint8_t pc = (xx > 0) ? static_cast<uint8_t>((upper_line[xx - 1] >> (c * 8)) & 0xff) : 0;
-                uint8_t py;
-                if (predictor == 0)
-                {
-                  uint8_t min_ab = pa < pb ? pa : pb;
-                  uint8_t max_ab = pa > pb ? pa : pb;
-                  if (pc >= max_ab)
-                    py = min_ab;
-                  else if (pc < min_ab)
-                    py = max_ab;
-                  else
-                    py = static_cast<uint8_t>(pa + pb - pc);
-                }
-                else
-                {
-                  py = static_cast<uint8_t>((pa + pb + 1) >> 1);
-                }
-                buf[c][wp] = static_cast<uint8_t>((static_cast<int>(px) - static_cast<int>(py)) & 0xff);
-                wp++;
-              }
-            }
-          }
-
-          int dbofs = (predictor + 1) * (int)block_capacity;
-          int wp = 0;
-          for (uint32_t yy = y; yy < ylim; ++yy)
-          {
-            int ofs;
-            if (!(xp & 1))
-              ofs = (int)((yy - y) * bw);
-            else
-              ofs = (int)((ylim - yy - 1) * bw);
-            bool dir;
-            if (!((block_h) & 1))
-              dir = ((yy & 1) ^ (xp & 1));
-            else
-            {
-              if (xp & 1)
-                dir = (yy & 1);
-              else
-                dir = ((yy & 1) ^ (xp & 1));
-            }
-            if (!dir)
-            {
-              for (uint32_t xx = 0; xx < bw; ++xx)
-              {
-                for (int c = 0; c < colors; ++c)
-                  buf[c][dbofs + wp] = buf[c][ofs + xx];
-                wp++;
-              }
-            }
-            else
-            {
-              for (int xx = (int)bw - 1; xx >= 0; --xx)
-              {
-                for (int c = 0; c < colors; ++c)
-                  buf[c][dbofs + wp] = buf[c][ofs + xx];
-                wp++;
-              }
-            }
-          }
-
-          Candidate cand;
-          cand.predictor = predictor;
-          cand.filter = 0;
-          for (int c = 0; c < colors; ++c)
-          {
-            cand.comps[c].assign(buf[c].begin() + dbofs, buf[c].begin() + dbofs + block_pixels);
-          }
-
-          if (colors >= 3)
-          {
-            std::vector<uint8_t> filtered_b, filtered_g, filtered_r;
-            int ft = detect_color_filter(cand.comps[0], cand.comps[1], cand.comps[2], filtered_b, filtered_g, filtered_r);
-            cand.filter = ft;
-            cand.comps[0] = std::move(filtered_b);
-            cand.comps[1] = std::move(filtered_g);
-            cand.comps[2] = std::move(filtered_r);
-          }
-
-          size_t bits = 0;
-          for (int c = 0; c < colors; ++c)
-            bits += estimate_golomb_bits(cand.comps[c]);
-          cand.total_bits = bits;
-          candidates[predictor] = std::move(cand);
-        }
-
-        const Candidate *best = &candidates[0];
-        if (candidates[1].total_bits < best->total_bits)
-          best = &candidates[1];
-
-        filtertypes[filter_index++] = static_cast<uint8_t>((best->filter << 1) | best->predictor);
-
-        for (int c = 0; c < colors; ++c)
-        {
-          auto &dst = block_buf[c];
-          const auto &src_comp = best->comps[c];
-          size_t base = gwp;
-          for (size_t i = 0; i < src_comp.size(); ++i)
-            dst[base + i] = src_comp[i];
-        }
-        gwp += block_pixels;
-      }
-
-      if (gwp != pixel_count)
-      {
-        err = "tlg7: block size mismatch";
+      if (!encode_block_row(ctx, y, err))
         return false;
-      }
-
-      for (int c = 0; c < colors; ++c)
-      {
-        std::vector<int8_t> signed_data(pixel_count);
-        for (size_t i = 0; i < pixel_count; ++i)
-          signed_data[i] = static_cast<int8_t>(block_buf[c][i]);
-        std::vector<uint8_t> bit_bytes;
-        {
-          TLG7BitStream bs(bit_bytes);
-          compress_values_golomb(bs, signed_data);
-          uint32_t bitlen = static_cast<uint32_t>(bs.GetBitLength());
-          if ((int)bitlen > max_bit_length)
-            max_bit_length = (int)bitlen;
-          uint8_t header[4] = {
-              static_cast<uint8_t>(bitlen & 0xff),
-              static_cast<uint8_t>((bitlen >> 8) & 0xff),
-              static_cast<uint8_t>((bitlen >> 16) & 0xff),
-              static_cast<uint8_t>((bitlen >> 24) & 0xff)};
-          bs.Flush();
-          temp_storage.insert(temp_storage.end(), header, header + 4);
-        }
-        temp_storage.insert(temp_storage.end(), bit_bytes.begin(), bit_bytes.end());
-      }
-
-      const uint32_t *last_line = &argb[(ylim - 1) * src.width];
-      std::copy(last_line, last_line + src.width, zeroline.begin());
     }
 
-    if (filter_index != filtertypes.size())
+    if (ctx.filter_index != ctx.filtertypes.size())
     {
       err = "tlg7: filter count mismatch";
       return false;
     }
 
-    write_u32le_fp(fp, (uint32_t)max_bit_length);
-
-    SlideCompressor filter_comp;
-    InitializeColorFilterCompressor(filter_comp);
-    std::vector<uint8_t> filter_out(filtertypes.empty() ? 0 : filtertypes.size() * 2 + 16);
-    size_t outlen = 0;
-    if (!filtertypes.empty())
-      filter_comp.Encode(filtertypes.data(), filtertypes.size(), filter_out.data(), outlen);
-    write_u32le_fp(fp, (uint32_t)outlen);
-    if (outlen)
-      fwrite(filter_out.data(), 1, outlen, fp);
-
-    if (!temp_storage.empty())
-      fwrite(temp_storage.data(), 1, temp_storage.size(), fp);
+    write_encoded_payload(fp, ctx);
     return true;
   }
 }
