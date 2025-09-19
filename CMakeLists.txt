@@ -18,6 +18,7 @@ add_executable(tlgconv
     src/tlg_io_common.cpp
     src/tlg5_io.cpp
     src/tlg6_io.cpp
+    src/tlg7_io.cpp
 )
 
 target_include_directories(tlgconv PRIVATE src)

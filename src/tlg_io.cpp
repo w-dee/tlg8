@@ -2,6 +2,7 @@
 #include "tlg_io_common.h"
 #include "tlg5_io.h"
 #include "tlg6_io.h"
+#include "tlg7_io.h"
 
 #include <cstdio>
 #include <cstring>
@@ -21,6 +22,10 @@ namespace
     if (std::memcmp(mark11, "TLG6.0\x00raw\x1a\x00", 11) == 0)
     {
       return tlg::v6::decode_stream(fp, out, err);
+    }
+    if (std::memcmp(mark11, "TLG7.0\x00raw\x1a\x00", 11) == 0)
+    {
+      return tlg::v7::decode_stream(fp, out, err);
     }
     err = "invalid tlg raw header";
     return false;
@@ -94,13 +99,23 @@ bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions 
   }
 
   bool ok = false;
-  if (opt.version == 6)
+  if (opt.version == 7)
+  {
+    ok = tlg::v7::enc::write_raw(fp, src, desired_colors, err);
+  }
+  else if (opt.version == 6)
   {
     ok = tlg::v6::enc::write_raw(fp, src, desired_colors, err);
   }
-  else
+  else if (opt.version == 5)
   {
     ok = tlg::v5::write_raw(fp, src, desired_colors, err);
+  }
+  else
+  {
+    err = "unsupported TLG version";
+    std::fclose(fp);
+    return false;
   }
 
   std::fclose(fp);
