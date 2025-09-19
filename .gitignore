@@ -1,0 +1,46 @@
+# Build directories
+/build/
+/build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+
+# Ninja build artifacts
+.ninja_deps
+.ninja_log
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.so
+*.dll
+*.dylib
+*.lib
+*.exe
+*.out
+*.app
+
+# Coverage and profiling data
+*.gcno
+*.gcda
+*.gcov
+*.prof
+
+# Logs and temporary files
+*.log
+*~
+*.swp
+*.swo
+
+# OS-specific clutter
+.DS_Store
+Thumbs.db
