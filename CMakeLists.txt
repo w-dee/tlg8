@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(PNG REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 add_executable(tlgconv
     src/main.cpp
@@ -25,3 +26,25 @@ else()
 endif()
 
 target_link_libraries(tlgconv PRIVATE PNG::PNG ZLIB::ZLIB)
+
+enable_testing()
+
+add_test(
+    NAME roundtrip
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/run_roundtrip.py
+            --tlgconv $<TARGET_FILE:tlgconv>
+            --images ${CMAKE_CURRENT_SOURCE_DIR}/test/images
+)
+
+set_tests_properties(roundtrip PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_custom_target(roundtrip_tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/run_roundtrip.py
+            --tlgconv $<TARGET_FILE:tlgconv>
+            --images ${CMAKE_CURRENT_SOURCE_DIR}/test/images
+    DEPENDS tlgconv
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Running tlgconv BMP round-trip tests"
+    VERBATIM
+)
