@@ -90,6 +90,11 @@ namespace
 
   constexpr std::array<uint8_t, 64> HILBERT8x8_INV = make_hilbert_inverse();
 
+  constexpr int CAS_DEFAULT_T1 = 4;
+  constexpr int CAS_DEFAULT_T2 = 9;
+  constexpr int CAS_DEFAULT_ERR_DECAY = 3;
+  constexpr int CAS_ADAPT_HIGH_ACTIVITY = 128;
+
   constexpr int GOLOMB_N_COUNT = 4;
 
   static const short GOLOMB_COMPRESSED[GOLOMB_N_COUNT][9] = {
@@ -1364,7 +1369,11 @@ namespace tlg::v7
         auto [pred, pid] = cas.predict_and_choose<uint8_t>(a, b, cdiag, d, f, state);
         const int residual = static_cast<int>(value) - pred;
         residual_out[idx] = static_cast<int16_t>(residual);
-        cas.update_state(state, pid, std::abs(residual));
+        const int Dh = std::abs(a - b);
+        const int Dv = std::abs(b - cdiag);
+        const int high = std::max(Dh, Dv);
+        const int decay = (high >= CAS_ADAPT_HIGH_ACTIVITY) ? std::max(1, CAS_DEFAULT_ERR_DECAY - 1) : CAS_DEFAULT_ERR_DECAY;
+        state.update(pid, std::abs(residual), decay);
         plane.row_ptr(ctx.y0 + y)[ctx.x0 + x] = value;
         ++idx;
       }
@@ -1483,6 +1492,9 @@ namespace tlg::v7
     }
 
     CAS8::Config cas_cfg;
+    cas_cfg.T1 = CAS_DEFAULT_T1;
+    cas_cfg.T2 = CAS_DEFAULT_T2;
+    cas_cfg.errDecayShift = CAS_DEFAULT_ERR_DECAY;
     cas_cfg.enablePlanarLite = true;
     CAS8 cas(cas_cfg, 0, 255);
 
@@ -1568,7 +1580,11 @@ namespace tlg::v7
                 filtered_planes[c].row_ptr(ctx.y0 + y)[ctx.x0 + x] = static_cast<uint8_t>(recon);
                 filtered_block[c][idx] = static_cast<uint8_t>(recon);
 
-                cas.update_state(states[c], pid, std::abs(recon - pred));
+                const int Dh = std::abs(a - b);
+                const int Dv = std::abs(b - cdiag);
+                const int high = std::max(Dh, Dv);
+                const int decay = (high >= CAS_ADAPT_HIGH_ACTIVITY) ? std::max(1, CAS_DEFAULT_ERR_DECAY - 1) : CAS_DEFAULT_ERR_DECAY;
+                states[c].update(pid, std::abs(recon - pred), decay);
                 ++idx;
               }
             }
@@ -1695,6 +1711,9 @@ namespace tlg::v7
         filtered_planes.emplace_back(width, height, 0);
 
       CAS8::Config cas_cfg;
+      cas_cfg.T1 = CAS_DEFAULT_T1;
+      cas_cfg.T2 = CAS_DEFAULT_T2;
+      cas_cfg.errDecayShift = CAS_DEFAULT_ERR_DECAY;
       cas_cfg.enablePlanarLite = true;
       CAS8 cas(cas_cfg, 0, 255);
 
