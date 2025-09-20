@@ -90,6 +90,35 @@ namespace
 
   constexpr std::array<uint8_t, 64> HILBERT8x8_INV = make_hilbert_inverse();
 
+  constexpr int GOLOMB_N_COUNT = 4;
+
+  static const short GOLOMB_COMPRESSED[GOLOMB_N_COUNT][9] = {
+      {3, 7, 15, 27, 63, 108, 223, 448, 130},
+      {3, 5, 13, 24, 51, 95, 192, 384, 257},
+      {2, 5, 12, 21, 39, 86, 155, 320, 384},
+      {2, 3, 9, 18, 33, 61, 129, 258, 511},
+  };
+
+  static unsigned char GolombBitLengthTable[GOLOMB_N_COUNT * 2 * 128][GOLOMB_N_COUNT];
+  static bool golomb_tables_ready = false;
+
+  inline void init_golomb_tables()
+  {
+    if (golomb_tables_ready)
+      return;
+    golomb_tables_ready = true;
+    int a;
+    for (int n = 0; n < GOLOMB_N_COUNT; ++n)
+    {
+      a = 0;
+      for (int i = 0; i < 9; ++i)
+      {
+        for (int j = 0; j < GOLOMB_COMPRESSED[n][i]; ++j)
+          GolombBitLengthTable[a++][n] = static_cast<unsigned char>(i);
+      }
+    }
+  }
+
   template <typename T>
   void reorder_to_hilbert(std::vector<T> &values)
   {
@@ -112,6 +141,293 @@ namespace
       tmp[HILBERT8x8[i]] = values[i];
     for (std::size_t i = 0; i < 64; ++i)
       values[i] = tmp[i];
+  }
+
+  class GolombBitStream
+  {
+  public:
+    explicit GolombBitStream(std::vector<uint8_t> &out) : out_(out) {}
+    ~GolombBitStream() { Flush(); }
+
+    size_t GetBytePos() const { return byte_pos_; }
+    size_t GetBitLength() const { return byte_pos_ * 8 + bit_pos_; }
+
+    void Put1Bit(bool bit)
+    {
+      ensure_capacity();
+      if (bit)
+        buffer_[byte_pos_] |= static_cast<uint8_t>(1u << bit_pos_);
+      ++bit_pos_;
+      if (bit_pos_ == 8)
+      {
+        bit_pos_ = 0;
+        ++byte_pos_;
+      }
+    }
+
+    void PutValue(long value, int len)
+    {
+      for (int i = 0; i < len; ++i)
+        Put1Bit((value >> i) & 1);
+    }
+
+    void PutGamma(int v)
+    {
+      if (v <= 0)
+        return;
+      int t = v >> 1;
+      int cnt = 0;
+      while (t)
+      {
+        Put1Bit(0);
+        t >>= 1;
+        ++cnt;
+      }
+      Put1Bit(1);
+      while (cnt--)
+      {
+        Put1Bit(v & 1);
+        v >>= 1;
+      }
+    }
+
+    void Flush()
+    {
+      const size_t bytes = byte_pos_ + (bit_pos_ ? 1 : 0);
+      if (bytes)
+      {
+        ensure_capacity();
+        out_.insert(out_.end(), buffer_.begin(), buffer_.begin() + bytes);
+      }
+      buffer_.clear();
+      byte_pos_ = 0;
+      bit_pos_ = 0;
+    }
+
+  private:
+    void ensure_capacity()
+    {
+      if (buffer_.size() <= byte_pos_)
+        buffer_.resize(byte_pos_ + 1, 0);
+    }
+
+    std::vector<uint8_t> &out_;
+    std::vector<uint8_t> buffer_;
+    size_t byte_pos_ = 0;
+    int bit_pos_ = 0;
+  };
+
+  void compress_residuals_golomb(GolombBitStream &bs, const std::vector<int16_t> &buf)
+  {
+    if (buf.empty())
+      return;
+
+    init_golomb_tables();
+
+    bs.PutValue(buf[0] ? 1 : 0, 1);
+
+    int n = GOLOMB_N_COUNT - 1;
+    int a = 0;
+    int count = 0;
+    const size_t size = buf.size();
+
+    for (size_t i = 0; i < size; ++i)
+    {
+      long e = buf[i];
+      if (e != 0)
+      {
+        if (count)
+        {
+          bs.PutGamma(count);
+          count = 0;
+        }
+
+        size_t ii = i;
+        while (ii < size && buf[ii] != 0)
+          ++ii;
+        const size_t nonzero_count = ii - i;
+        bs.PutGamma(static_cast<int>(nonzero_count));
+
+        for (; i < ii; ++i)
+        {
+          e = buf[i];
+          long m = ((e >= 0) ? (2 * e) : (-2 * e - 1)) - 1;
+          if (m < 0)
+            m = 0;
+          int k = GolombBitLengthTable[a][n];
+          long q = (k > 0) ? (m >> k) : m;
+          for (; q > 0; --q)
+            bs.Put1Bit(0);
+          bs.Put1Bit(1);
+          if (k)
+            bs.PutValue(m & ((1 << k) - 1), k);
+          a += static_cast<int>(m >> 1);
+          if (--n < 0)
+          {
+            a >>= 1;
+            n = GOLOMB_N_COUNT - 1;
+          }
+        }
+        i = ii - 1;
+      }
+      else
+      {
+        ++count;
+      }
+    }
+
+    if (count)
+      bs.PutGamma(count);
+  }
+
+  struct GolombDecoder
+  {
+    GolombDecoder(const uint8_t *data, size_t size)
+        : data_(data), size_(size) {}
+
+    void fill()
+    {
+      while (bit_pos_ <= 24 && byte_pos_ < size_)
+      {
+        bits_ |= static_cast<uint32_t>(data_[byte_pos_++]) << bit_pos_;
+        bit_pos_ += 8;
+      }
+    }
+
+    bool read_bit(uint32_t &bit)
+    {
+      fill();
+      if (bit_pos_ <= 0)
+        return false;
+      bit = bits_ & 1u;
+      bits_ >>= 1;
+      --bit_pos_;
+      return true;
+    }
+
+    bool read_bits(unsigned count, uint32_t &value)
+    {
+      value = 0;
+      for (unsigned i = 0; i < count; ++i)
+      {
+        uint32_t bit = 0;
+        if (!read_bit(bit))
+          return false;
+        value |= (bit << i);
+      }
+      return true;
+    }
+
+    int read_gamma()
+    {
+      uint32_t bit = 0;
+      unsigned zeros = 0;
+      while (true)
+      {
+        if (!read_bit(bit))
+          return 0;
+        if (bit)
+          break;
+        ++zeros;
+      }
+      int value = 1 << zeros;
+      if (zeros)
+      {
+        uint32_t suffix = 0;
+        if (!read_bits(zeros, suffix))
+          return 0;
+        value += static_cast<int>(suffix);
+      }
+      return value;
+    }
+
+    uint32_t bits_ = 0;
+    int bit_pos_ = 0;
+
+  private:
+    const uint8_t *data_ = nullptr;
+    size_t size_ = 0;
+    size_t byte_pos_ = 0;
+  };
+
+  bool decode_residuals_golomb(const uint8_t *data,
+                               size_t size,
+                               size_t expected_count,
+                               std::vector<int16_t> &out)
+  {
+    out.clear();
+    out.reserve(expected_count);
+
+    if (expected_count == 0)
+      return true;
+
+    init_golomb_tables();
+
+    GolombDecoder decoder(data, size);
+    decoder.fill();
+
+    uint32_t first_bit = 0;
+    if (!decoder.read_bit(first_bit))
+      return false;
+
+    bool expect_nonzero = (first_bit != 0);
+    int a = 0;
+    int n = GOLOMB_N_COUNT - 1;
+
+    while (out.size() < expected_count)
+    {
+      int run = decoder.read_gamma();
+      if (run <= 0)
+        return false;
+
+      const size_t remaining = expected_count - out.size();
+      if (!expect_nonzero)
+      {
+        if (static_cast<size_t>(run) > remaining)
+          return false;
+        out.insert(out.end(), run, 0);
+        expect_nonzero = true;
+        continue;
+      }
+
+      if (static_cast<size_t>(run) > remaining)
+        return false;
+
+      for (int i = 0; i < run; ++i)
+      {
+        int k = GolombBitLengthTable[a][n];
+        int q = 0;
+        while (true)
+        {
+          uint32_t bit = 0;
+          if (!decoder.read_bit(bit))
+            return false;
+          if (bit)
+            break;
+          ++q;
+        }
+        uint32_t remainder_bits = 0;
+        if (k > 0 && !decoder.read_bits(static_cast<unsigned>(k), remainder_bits))
+          return false;
+        int m = (q << k) + static_cast<int>(remainder_bits);
+        int sign = (m & 1) - 1;
+        int vv = m >> 1;
+        int residual = (vv ^ sign) + sign + 1;
+        a += vv;
+
+        out.push_back(static_cast<int16_t>(residual));
+
+        if (--n < 0)
+        {
+          a >>= 1;
+          n = GOLOMB_N_COUNT - 1;
+        }
+      }
+
+      expect_nonzero = false;
+    }
+
+    return out.size() == expected_count;
   }
 
   class CAS8
@@ -744,189 +1060,6 @@ namespace
     return best_code;
   }
 
-  inline uint32_t rice_map(int v)
-  {
-    if (v < 0)
-      return static_cast<uint32_t>((-v << 1) - 1);
-    return static_cast<uint32_t>(v << 1);
-  }
-
-  inline int rice_unmap(uint32_t u)
-  {
-    if (u & 1u)
-      return -static_cast<int>((u + 1) >> 1);
-    return static_cast<int>(u >> 1);
-  }
-
-  struct BitWriter
-  {
-    void write_bit(uint32_t bit)
-    {
-      current_ = static_cast<uint8_t>((current_ << 1) | (bit & 1u));
-      ++bit_count_;
-      if (bit_count_ == 8)
-      {
-        data_.push_back(current_);
-        current_ = 0;
-        bit_count_ = 0;
-      }
-    }
-
-    void write_bits(uint32_t value, unsigned count)
-    {
-      for (unsigned i = 0; i < count; ++i)
-      {
-        const unsigned shift = count - 1 - i;
-        write_bit((value >> shift) & 1u);
-      }
-    }
-
-    void write_rice(uint32_t value, unsigned k)
-    {
-      const uint32_t q = k ? (value >> k) : value;
-      for (uint32_t i = 0; i < q; ++i)
-        write_bit(0);
-      write_bit(1);
-      if (k)
-        write_bits(value & ((1u << k) - 1u), k);
-    }
-
-    void flush()
-    {
-      if (bit_count_ > 0)
-      {
-        current_ <<= (8 - bit_count_);
-        data_.push_back(current_);
-        current_ = 0;
-        bit_count_ = 0;
-      }
-    }
-
-    std::vector<uint8_t> data_;
-    uint8_t current_ = 0;
-    unsigned bit_count_ = 0;
-  };
-
-  struct BitReader
-  {
-    BitReader(const uint8_t *data, std::size_t size)
-        : data_(data), size_(size) {}
-
-    bool read_bit(uint32_t &bit)
-    {
-      if (byte_pos_ >= size_)
-        return false;
-      const uint8_t cur = data_[byte_pos_];
-      bit = (cur >> (7 - bit_pos_)) & 1u;
-      ++bit_pos_;
-      if (bit_pos_ == 8)
-      {
-        bit_pos_ = 0;
-        ++byte_pos_;
-      }
-      return true;
-    }
-
-    bool read_bits(unsigned count, uint32_t &value)
-    {
-      value = 0;
-      for (unsigned i = 0; i < count; ++i)
-      {
-        uint32_t bit = 0;
-        if (!read_bit(bit))
-          return false;
-        value = (value << 1) | bit;
-      }
-      return true;
-    }
-
-    bool read_rice(unsigned k, uint32_t &value)
-    {
-      uint32_t q = 0;
-      while (true)
-      {
-        uint32_t bit = 0;
-        if (!read_bit(bit))
-          return false;
-        if (bit)
-          break;
-        ++q;
-      }
-      uint32_t r = 0;
-      if (k)
-      {
-        if (!read_bits(k, r))
-          return false;
-      }
-      value = (q << k) | r;
-      return true;
-    }
-
-    const uint8_t *data_ = nullptr;
-    std::size_t size_ = 0;
-    std::size_t byte_pos_ = 0;
-    unsigned bit_pos_ = 0;
-  };
-
-  uint8_t choose_rice_parameter(const std::vector<uint32_t> &mapped, unsigned max_k = 7)
-  {
-    std::array<std::uint64_t, 8> costs{};
-    for (uint32_t value : mapped)
-    {
-      for (unsigned k = 0; k <= max_k; ++k)
-      {
-        const uint32_t q = k ? (value >> k) : value;
-        costs[k] += q + 1 + k;
-      }
-    }
-    unsigned best_k = 0;
-    std::uint64_t best_cost = std::numeric_limits<std::uint64_t>::max();
-    for (unsigned k = 0; k <= max_k; ++k)
-    {
-      if (costs[k] < best_cost)
-      {
-        best_cost = costs[k];
-        best_k = k;
-      }
-    }
-    return static_cast<uint8_t>(best_k);
-  }
-
-  void encode_residual_stream(const std::vector<int16_t> &residuals,
-                              std::vector<uint8_t> &out_bytes,
-                              uint8_t &rice_k)
-  {
-    std::vector<uint32_t> mapped;
-    mapped.reserve(residuals.size());
-    for (int16_t v : residuals)
-      mapped.push_back(rice_map(v));
-    rice_k = choose_rice_parameter(mapped);
-    BitWriter bw;
-    for (uint32_t value : mapped)
-      bw.write_rice(value, rice_k);
-    bw.flush();
-    out_bytes = std::move(bw.data_);
-  }
-
-  bool decode_residual_stream(const uint8_t *data,
-                              std::size_t size,
-                              uint8_t rice_k,
-                              std::size_t expected_count,
-                              std::vector<int16_t> &out_residuals)
-  {
-    BitReader br(data, size);
-    out_residuals.clear();
-    out_residuals.reserve(expected_count);
-    for (std::size_t i = 0; i < expected_count; ++i)
-    {
-      uint32_t code = 0;
-      if (!br.read_rice(rice_k, code))
-        return false;
-      out_residuals.push_back(static_cast<int16_t>(rice_unmap(code)));
-    }
-    return true;
-  }
-
   template <typename T>
   void copy_block_from_plane(const tlg::v7::detail::image<T> &plane,
                              std::size_t x0,
@@ -1252,8 +1385,6 @@ bool decode_stream(FILE *fp, PixelBuffer &out, std::string &err)
   std::vector<int16_t> block_buffer;
   block_buffer.reserve(BLOCK_SIZE * BLOCK_SIZE);
 
-  std::vector<int16_t> residuals;
-
   for (std::size_t chunk_y = 0; chunk_y < chunk_rows; ++chunk_y)
   {
     const std::size_t chunk_y0 = chunk_y * CHUNK_SCAN_LINES;
@@ -1261,25 +1392,18 @@ bool decode_stream(FILE *fp, PixelBuffer &out, std::string &err)
     const std::size_t chunk_pixels = chunk_height * width;
 
     std::vector<std::vector<int16_t>> chunk_residuals(component_count);
-    std::vector<uint8_t> rice_params(component_count);
 
     for (std::size_t c = 0; c < component_count; ++c)
     {
-      int cbyte = std::fgetc(fp);
-      if (cbyte == EOF)
-      {
-        err = "tlg7: read rice parameter";
-        return false;
-      }
-      rice_params[c] = static_cast<uint8_t>(cbyte);
-      const uint32_t byte_count = read_u32le(fp);
+      const uint32_t bit_length = read_u32le(fp);
+      const std::size_t byte_count = (bit_length + 7u) / 8u;
       std::vector<uint8_t> buf(byte_count);
-      if (byte_count && !read_exact(fp, buf.data(), buf.size()))
+      if (byte_count && !read_exact(fp, buf.data(), byte_count))
       {
         err = "tlg7: read residual stream";
         return false;
       }
-      if (!decode_residual_stream(buf.data(), buf.size(), rice_params[c], chunk_pixels, chunk_residuals[c]))
+      if (!decode_residuals_golomb(buf.data(), buf.size(), chunk_pixels, chunk_residuals[c]))
       {
         err = "tlg7: residual decode error";
         return false;
@@ -1577,16 +1701,16 @@ bool write_raw(FILE *fp, const PixelBuffer &src, int colors, std::string &err)
 
     for (std::size_t c = 0; c < component_count; ++c)
     {
-      uint8_t rice_k = 0;
       std::vector<uint8_t> encoded;
-      encode_residual_stream(chunk_residuals[c], encoded, rice_k);
-      if (std::fputc(rice_k, fp) == EOF)
-      {
-        err = "tlg7: write rice parameter";
-        return false;
-      }
-      write_u32le(fp, static_cast<uint32_t>(encoded.size()));
-      if (!encoded.empty() && fwrite(encoded.data(), 1, encoded.size(), fp) != encoded.size())
+      GolombBitStream bs(encoded);
+      compress_residuals_golomb(bs, chunk_residuals[c]);
+      const uint32_t bit_length = static_cast<uint32_t>(bs.GetBitLength());
+      bs.Flush();
+      write_u32le(fp, bit_length);
+      const std::size_t byte_count = (bit_length + 7u) / 8u;
+      if (encoded.size() != byte_count)
+        encoded.resize(byte_count);
+      if (byte_count && fwrite(encoded.data(), 1, byte_count, fp) != byte_count)
       {
         err = "tlg7: write residual data";
         return false;
