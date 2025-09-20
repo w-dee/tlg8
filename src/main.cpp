@@ -25,7 +25,8 @@ bool has_ext(const std::string &path, const char *extLowerNoDot)
 
 static void print_usage()
 {
-  std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|png|bmp)> [--tlg-version=5|6|7] [--pixel-format=auto|R8G8B8|A8R8G8B8]\n";
+  std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|png|bmp)>"
+            << " [--tlg-version=5|6|7] [--pixel-format=auto|R8G8B8|A8R8G8B8] [--tlg7-fast]\n";
 }
 
 int main(int argc, char **argv)
@@ -74,6 +75,10 @@ int main(int argc, char **argv)
         std::cerr << "Invalid --pixel-format: " << f << "\n";
         return 2;
       }
+    }
+    else if (arg == "--tlg7-fast")
+    {
+      tlgopt.tlg7_fast_mode = true;
     }
     else if (arg == "-h" || arg == "--help")
     {
