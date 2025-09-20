@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+#include <iostream>
 
 #include "tlg_io_common.h"
 
@@ -1474,6 +1475,8 @@ namespace tlg::v7::enc
         out_r = std::move(tr);
       }
     }
+    //    std::cout << "Selected color filter code: " << best_code << " (estimated bits: " << best_bits << ")\n"
+    //              << std::flush;
     return best_code;
   }
 
@@ -1485,7 +1488,7 @@ namespace tlg::v7::enc
     std::array<std::vector<uint8_t>, MAX_COLOR_COMPONENTS> comps;
   };
 
-  struct EncodingContext
+  struct EncodingContext 
   {
     const PixelBuffer &src;
     int colors;
@@ -1565,6 +1568,9 @@ namespace tlg::v7::enc
 
     for (int c = 0; c < ctx.colors; ++c)
     {
+      //      if (predictor == 0)
+      //        std::cout << "color: " << c << "\n"
+      //                  << std::flush;
       size_t wp = 0;
       for (uint32_t yy = y; yy < ylim; ++yy)
       {
@@ -1587,6 +1593,19 @@ namespace tlg::v7::enc
 
             py = pred;
             state[c].update(pid, std::abs((int)px - (int)py));
+
+            int med_py;
+            uint8_t min_ab = pa < pb ? pa : pb;
+            uint8_t max_ab = pa > pb ? pa : pb;
+            if (pc >= max_ab)
+              med_py = min_ab;
+            else if (pc < min_ab)
+              med_py = max_ab;
+            else
+              med_py = static_cast<uint8_t>(pa + pb - pc);
+            //            printf("(%3u,%3u[%3u],%1u)", (int)px, (int)py, (int)med_py, (int)pid);
+            //            fflush(stdout);
+            py = med_py;
           }
           else
           {
@@ -1596,6 +1615,8 @@ namespace tlg::v7::enc
           ctx.buf[c][wp] = static_cast<uint8_t>(pix);
           ++wp;
         }
+        //        std::cout << "\n"
+        //                  << std::flush;
       }
     }
 
