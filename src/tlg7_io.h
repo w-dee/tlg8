@@ -185,6 +185,8 @@ std::vector<image<uint8_t>> split_components_from_packed(const image<uint32_t> &
 
 } // namespace detail
 
+bool configure_golomb_table(const std::string &path, std::string &err);
+
 bool decode_stream(FILE *fp, PixelBuffer &out, std::string &err);
 
 namespace enc

@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -95,33 +97,42 @@ namespace
   constexpr int CAS_DEFAULT_ERR_DECAY = 3;
   constexpr int CAS_ADAPT_HIGH_ACTIVITY = 128;
 
-  constexpr int GOLOMB_N_COUNT = 4;
+  constexpr int GOLOMB_N_COUNT = 2;
+  constexpr int GOLOMB_ROW_SUM = 1024;
 
-  static const short GOLOMB_COMPRESSED[GOLOMB_N_COUNT][9] = {
-      {3, 7, 15, 27, 63, 108, 223, 448, 130},
-      {3, 5, 13, 24, 51, 95, 192, 384, 257},
-      {2, 5, 12, 21, 39, 86, 155, 320, 384},
-      {2, 3, 9, 18, 33, 61, 129, 258, 511},
+  using GolombRow = std::array<uint16_t, 9>;
+  using GolombTable = std::array<GolombRow, GOLOMB_N_COUNT>;
+
+  constexpr GolombTable DEFAULT_GOLOMB_TABLE = {
+      GolombRow{3, 7, 15, 27, 63, 108, 223, 448, 130},
+      GolombRow{3, 5, 13, 24, 51, 95, 192, 384, 257},
   };
 
-  static unsigned char GolombBitLengthTable[GOLOMB_N_COUNT * 2 * 128][GOLOMB_N_COUNT];
+  static GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
+
+  static unsigned char GolombBitLengthTable[GOLOMB_ROW_SUM][GOLOMB_N_COUNT];
   static bool golomb_tables_ready = false;
 
   inline void init_golomb_tables()
   {
     if (golomb_tables_ready)
       return;
-    golomb_tables_ready = true;
-    int a;
     for (int n = 0; n < GOLOMB_N_COUNT; ++n)
     {
-      a = 0;
+      int a = 0;
       for (int i = 0; i < 9; ++i)
       {
-        for (int j = 0; j < GOLOMB_COMPRESSED[n][i]; ++j)
-          GolombBitLengthTable[a++][n] = static_cast<unsigned char>(i);
+        const uint16_t count = g_golomb_table[static_cast<std::size_t>(n)][static_cast<std::size_t>(i)];
+        for (uint16_t j = 0; j < count; ++j)
+        {
+          const int idx = std::min(a, GOLOMB_ROW_SUM - 1);
+          GolombBitLengthTable[idx][n] = static_cast<unsigned char>(i);
+          ++a;
+        }
       }
+      assert(a == GOLOMB_ROW_SUM);
     }
+    golomb_tables_ready = true;
   }
 
   template <typename T>
@@ -230,8 +241,8 @@ namespace
     init_golomb_tables();
 
     bs.PutValue(buf[0] ? 1 : 0, 1);
-
-    int n = GOLOMB_N_COUNT - 1;
+    const int g_n_count = GOLOMB_N_COUNT;
+    int n = g_n_count - 1;
     int a = 0;
     int count = 0;
     const size_t size = buf.size();
@@ -259,18 +270,19 @@ namespace
           long m = ((e >= 0) ? (2 * e) : (-2 * e - 1)) - 1;
           if (m < 0)
             m = 0;
-          int k = GolombBitLengthTable[a][n];
+          const int lut_index = std::min(a >> 1, GOLOMB_ROW_SUM - 1);
+          int k = GolombBitLengthTable[lut_index][n];
           long q = (k > 0) ? (m >> k) : m;
           for (; q > 0; --q)
             bs.Put1Bit(0);
           bs.Put1Bit(1);
           if (k)
             bs.PutValue(m & ((1 << k) - 1), k);
-          a += static_cast<int>(m >> 1);
+          a += static_cast<int>(m);
           if (--n < 0)
           {
+            n = g_n_count - 1;
             a >>= 1;
-            n = GOLOMB_N_COUNT - 1;
           }
         }
         i = ii - 1;
@@ -400,7 +412,8 @@ namespace
 
       for (int i = 0; i < run; ++i)
       {
-        int k = GolombBitLengthTable[a][n];
+        const int lut_index = std::min(a, GOLOMB_ROW_SUM - 1);
+        int k = GolombBitLengthTable[lut_index][n];
         int q = 0;
         while (true)
         {
@@ -1110,11 +1123,115 @@ namespace
     }
   }
 
-
 } // namespace
 
 namespace tlg::v7
 {
+
+  bool configure_golomb_table(const std::string &path, std::string &err)
+  {
+    if (path.empty())
+    {
+      if (g_golomb_table != DEFAULT_GOLOMB_TABLE)
+      {
+        g_golomb_table = DEFAULT_GOLOMB_TABLE;
+        golomb_tables_ready = false;
+      }
+      err.clear();
+      return true;
+    }
+
+    std::ifstream in(path);
+    if (!in)
+    {
+      err = "tlg7: failed to open Golomb table: " + path;
+      return false;
+    }
+
+    GolombTable candidate{};
+    std::size_t row = 0;
+    std::string line;
+    std::size_t line_number = 0;
+
+    while (std::getline(in, line))
+    {
+      ++line_number;
+      const auto comment_pos = line.find_first_of("#;");
+      if (comment_pos != std::string::npos)
+        line.erase(comment_pos);
+
+      if (line.find_first_not_of(" \t\r\n") == std::string::npos)
+        continue;
+
+      if (row >= GOLOMB_N_COUNT)
+      {
+        err = "tlg7: extra data in Golomb table '" + path + "' at line " + std::to_string(line_number);
+        return false;
+      }
+
+      std::istringstream iss(line);
+      GolombRow row_values{};
+      int sum = 0;
+      int value = 0;
+      std::size_t col = 0;
+      while (col < row_values.size() && (iss >> value))
+      {
+        if (value < 0)
+        {
+          err = "tlg7: negative value in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+          return false;
+        }
+        if (value > std::numeric_limits<uint16_t>::max())
+        {
+          err = "tlg7: value too large in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+          return false;
+        }
+        row_values[col++] = static_cast<uint16_t>(value);
+        sum += value;
+      }
+
+      if (col != row_values.size())
+      {
+        if (iss.fail() && !iss.eof())
+        {
+          err = "tlg7: invalid token in Golomb table '" + path + "' at line " + std::to_string(line_number);
+        }
+        else
+        {
+          err = "tlg7: expected 9 values in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+        }
+        return false;
+      }
+
+      if (iss >> value)
+      {
+        err = "tlg7: too many values in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+        return false;
+      }
+
+      if (sum != GOLOMB_ROW_SUM)
+      {
+        err = "tlg7: row sum must be 1024 in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+        return false;
+      }
+
+      candidate[row++] = row_values;
+    }
+
+    if (row != GOLOMB_N_COUNT)
+    {
+      err = "tlg7: Golomb table '" + path + "' must contain " + std::to_string(GOLOMB_N_COUNT) + " rows";
+      return false;
+    }
+
+    if (candidate != g_golomb_table)
+    {
+      g_golomb_table = candidate;
+      golomb_tables_ready = false;
+    }
+    err.clear();
+    return true;
+  }
 
   namespace
   {
@@ -1332,11 +1449,11 @@ namespace tlg::v7
       std::size_t index = 0;
     };
 
-  BlockContext make_block_context(std::size_t block_x,
-                                  std::size_t block_y,
-                                  std::size_t width,
-                                  std::size_t height,
-                                  std::size_t blocks_x)
+    BlockContext make_block_context(std::size_t block_x,
+                                    std::size_t block_y,
+                                    std::size_t width,
+                                    std::size_t height,
+                                    std::size_t blocks_x)
     {
       BlockContext ctx;
       ctx.x0 = block_x * BLOCK_SIZE;
@@ -1344,97 +1461,97 @@ namespace tlg::v7
       ctx.bw = std::min<std::size_t>(BLOCK_SIZE, width - ctx.x0);
       ctx.bh = std::min<std::size_t>(BLOCK_SIZE, height - ctx.y0);
       ctx.index = block_y * blocks_x + block_x;
-    return ctx;
-  }
-
-  void encode_block_component(const BlockContext &ctx,
-                              const std::vector<uint8_t> &block_values,
-                              CAS8 &cas,
-                              CAS8::State &state,
-                              detail::image<uint8_t> &plane,
-                              std::vector<int16_t> &residual_out)
-  {
-    const std::size_t pixel_count = ctx.bw * ctx.bh;
-    residual_out.resize(pixel_count);
-    std::size_t idx = 0;
-    for (std::size_t y = 0; y < ctx.bh; ++y)
-    {
-      for (std::size_t x = 0; x < ctx.bw; ++x)
-      {
-        const int gx = static_cast<int>(ctx.x0 + x);
-        const int gy = static_cast<int>(ctx.y0 + y);
-        const uint8_t value = block_values[idx];
-
-        const int a = sample_pixel(plane, gx - 1, gy);
-        const int b = sample_pixel(plane, gx, gy - 1);
-        const int cdiag = sample_pixel(plane, gx - 1, gy - 1);
-        const int d = sample_pixel(plane, gx + 1, gy - 1);
-        const int f = sample_pixel(plane, gx, gy - 2);
-
-        auto [pred, pid] = cas.predict_and_choose<uint8_t>(a, b, cdiag, d, f, state);
-        const int residual = static_cast<int>(value) - pred;
-        residual_out[idx] = static_cast<int16_t>(residual);
-        const int Dh = std::abs(a - b);
-        const int Dv = std::abs(b - cdiag);
-        const int high = std::max(Dh, Dv);
-        const int decay = (high >= CAS_ADAPT_HIGH_ACTIVITY) ? std::max(1, CAS_DEFAULT_ERR_DECAY - 1) : CAS_DEFAULT_ERR_DECAY;
-        state.update(pid, std::abs(residual), decay);
-        plane.row_ptr(ctx.y0 + y)[ctx.x0 + x] = value;
-        ++idx;
-      }
+      return ctx;
     }
-  }
 
-  uint64_t estimate_residual_bits(const std::vector<int16_t> &residuals)
-  {
-    std::vector<uint8_t> tmp;
-    GolombBitStream bs(tmp);
-    compress_residuals_golomb(bs, residuals);
-    return bs.GetBitLength();
-  }
-
-  struct FilterSelectionResult
-  {
-    int code = 0;
-    std::array<std::vector<int16_t>, 3> filtered;
-  };
-
-  FilterSelectionResult choose_filter_optimal(const BlockContext &ctx,
-                                              const std::vector<int16_t> &residual_b,
-                                              const std::vector<int16_t> &residual_g,
-                                              const std::vector<int16_t> &residual_r)
-  {
-    FilterSelectionResult result;
-    const bool is_full_block = (ctx.bw == BLOCK_SIZE && ctx.bh == BLOCK_SIZE);
-
-    uint64_t best_bits = std::numeric_limits<uint64_t>::max();
-
-    for (int code = 0; code < 32; ++code)
+    void encode_block_component(const BlockContext &ctx,
+                                const std::vector<uint8_t> &block_values,
+                                CAS8 &cas,
+                                CAS8::State &state,
+                                detail::image<uint8_t> &plane,
+                                std::vector<int16_t> &residual_out)
     {
-      std::array<std::vector<int16_t>, 3> candidate = {residual_b, residual_g, residual_r};
-      apply_color_filter(code, candidate[0], candidate[1], candidate[2]);
-
-      uint64_t total_bits = 0;
-      for (int c = 0; c < 3; ++c)
+      const std::size_t pixel_count = ctx.bw * ctx.bh;
+      residual_out.resize(pixel_count);
+      std::size_t idx = 0;
+      for (std::size_t y = 0; y < ctx.bh; ++y)
       {
-        std::vector<int16_t> tmp = candidate[c];
-        if (is_full_block)
-          reorder_to_hilbert(tmp);
-        total_bits += estimate_residual_bits(tmp);
-      }
+        for (std::size_t x = 0; x < ctx.bw; ++x)
+        {
+          const int gx = static_cast<int>(ctx.x0 + x);
+          const int gy = static_cast<int>(ctx.y0 + y);
+          const uint8_t value = block_values[idx];
 
-      if (total_bits < best_bits)
-      {
-        best_bits = total_bits;
-        result.code = code;
-        result.filtered = std::move(candidate);
+          const int a = sample_pixel(plane, gx - 1, gy);
+          const int b = sample_pixel(plane, gx, gy - 1);
+          const int cdiag = sample_pixel(plane, gx - 1, gy - 1);
+          const int d = sample_pixel(plane, gx + 1, gy - 1);
+          const int f = sample_pixel(plane, gx, gy - 2);
+
+          auto [pred, pid] = cas.predict_and_choose<uint8_t>(a, b, cdiag, d, f, state);
+          const int residual = static_cast<int>(value) - pred;
+          residual_out[idx] = static_cast<int16_t>(residual);
+          const int Dh = std::abs(a - b);
+          const int Dv = std::abs(b - cdiag);
+          const int high = std::max(Dh, Dv);
+          const int decay = (high >= CAS_ADAPT_HIGH_ACTIVITY) ? std::max(1, CAS_DEFAULT_ERR_DECAY - 1) : CAS_DEFAULT_ERR_DECAY;
+          state.update(pid, std::abs(residual), decay);
+          plane.row_ptr(ctx.y0 + y)[ctx.x0 + x] = value;
+          ++idx;
+        }
       }
     }
 
-    return result;
-  }
+    uint64_t estimate_residual_bits(const std::vector<int16_t> &residuals)
+    {
+      std::vector<uint8_t> tmp;
+      GolombBitStream bs(tmp);
+      compress_residuals_golomb(bs, residuals);
+      return bs.GetBitLength();
+    }
 
-} // namespace
+    struct FilterSelectionResult
+    {
+      int code = 0;
+      std::array<std::vector<int16_t>, 3> filtered;
+    };
+
+    FilterSelectionResult choose_filter_optimal(const BlockContext &ctx,
+                                                const std::vector<int16_t> &residual_b,
+                                                const std::vector<int16_t> &residual_g,
+                                                const std::vector<int16_t> &residual_r)
+    {
+      FilterSelectionResult result;
+      const bool is_full_block = (ctx.bw == BLOCK_SIZE && ctx.bh == BLOCK_SIZE);
+
+      uint64_t best_bits = std::numeric_limits<uint64_t>::max();
+
+      for (int code = 0; code < 32; ++code)
+      {
+        std::array<std::vector<int16_t>, 3> candidate = {residual_b, residual_g, residual_r};
+        apply_color_filter(code, candidate[0], candidate[1], candidate[2]);
+
+        uint64_t total_bits = 0;
+        for (int c = 0; c < 3; ++c)
+        {
+          std::vector<int16_t> tmp = candidate[c];
+          if (is_full_block)
+            reorder_to_hilbert(tmp);
+          total_bits += estimate_residual_bits(tmp);
+        }
+
+        if (total_bits < best_bits)
+        {
+          best_bits = total_bits;
+          result.code = code;
+          result.filtered = std::move(candidate);
+        }
+      }
+
+      return result;
+    }
+
+  } // namespace
 
   bool decode_stream(FILE *fp, PixelBuffer &out, std::string &err)
   {

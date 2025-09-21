@@ -51,6 +51,7 @@ struct TlgOptions
   int version = 6;                     // 5 or 6
   ImageFormat fmt = ImageFormat::Auto; // decided by input if Auto
   bool tlg7_fast_mode = false;         // use fast heuristic filter selection for TLG7
+  std::string tlg7_golomb_table_path;  // optional override for TLG7 Golomb table
 };
 
 bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err);

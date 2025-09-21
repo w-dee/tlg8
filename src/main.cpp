@@ -1,4 +1,5 @@
 #include "image_io.h"
+#include "tlg7_io.h"
 
 #include <algorithm>
 #include <cctype>
@@ -26,7 +27,8 @@ bool has_ext(const std::string &path, const char *extLowerNoDot)
 static void print_usage()
 {
   std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|png|bmp)>"
-            << " [--tlg-version=5|6|7] [--pixel-format=auto|R8G8B8|A8R8G8B8] [--tlg7-fast]\n";
+            << " [--tlg-version=5|6|7] [--pixel-format=auto|R8G8B8|A8R8G8B8] [--tlg7-fast]"
+            << " [--tlg7-golomb-table=<path>]\n";
 }
 
 int main(int argc, char **argv)
@@ -80,6 +82,10 @@ int main(int argc, char **argv)
     {
       tlgopt.tlg7_fast_mode = true;
     }
+    else if (arg.rfind("--tlg7-golomb-table=", 0) == 0)
+    {
+      tlgopt.tlg7_golomb_table_path = arg.substr(20);
+    }
     else if (arg == "-h" || arg == "--help")
     {
       print_usage();
@@ -90,6 +96,13 @@ int main(int argc, char **argv)
       std::cerr << "Unknown option: " << arg << "\n";
       return 2;
     }
+  }
+
+  std::string cfg_err;
+  if (!tlg::v7::configure_golomb_table(tlgopt.tlg7_golomb_table_path, cfg_err))
+  {
+    std::cerr << cfg_err << "\n";
+    return 1;
   }
 
   // Load input image

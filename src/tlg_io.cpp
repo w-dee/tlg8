@@ -101,6 +101,13 @@ bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions 
   bool ok = false;
   if (opt.version == 7)
   {
+    std::string cfg_err;
+    if (!tlg::v7::configure_golomb_table(opt.tlg7_golomb_table_path, cfg_err))
+    {
+      err = cfg_err;
+      std::fclose(fp);
+      return false;
+    }
     ok = tlg::v7::enc::write_raw(fp, src, desired_colors, opt.tlg7_fast_mode, err);
   }
   else if (opt.version == 6)
