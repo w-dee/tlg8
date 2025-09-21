@@ -437,9 +437,9 @@ namespace tlg::v7
     case 23:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<int16_t>(r[i] + g[i]);
-        b[i] = static_cast<int16_t>(b[i] + r[i]);
         g[i] = static_cast<int16_t>(g[i] + b[i]);
+        b[i] = static_cast<int16_t>(b[i] + r[i]);
+        r[i] = static_cast<int16_t>(r[i] + g[i]);
       }
       break;
     case 24:
