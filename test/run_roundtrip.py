@@ -51,7 +51,15 @@ def roundtrip(bmp_path: Path, tlgconv: Path, temp_dir: Path, version: str) -> No
         str(recon_bmp),
     ])
 
-    cmp_proc = subprocess.run(["cmp", "-s", str(bmp_path), str(recon_bmp)])
+    try:
+        cmp_proc = subprocess.run(
+            ["compare", str(bmp_path), str(recon_bmp), "null:"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit("ImageMagick 'compare' command not found: " + str(exc)) from exc
+
     if cmp_proc.returncode != 0:
         raise SystemExit(
             f"Mismatch detected for {bmp_path.name} (tlg{version} round-trip)"
