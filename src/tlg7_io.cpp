@@ -607,10 +607,11 @@ namespace
     return img.row_ptr(uy)[ux];
   }
 
+  template <typename T>
   void apply_color_filter(int code,
-                          std::vector<uint8_t> &b,
-                          std::vector<uint8_t> &g,
-                          std::vector<uint8_t> &r)
+                          std::vector<T> &b,
+                          std::vector<T> &g,
+                          std::vector<T> &r)
   {
     const std::size_t n = b.size();
     switch (code)
@@ -620,203 +621,204 @@ namespace
     case 1:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] - g[i]);
-        b[i] = static_cast<uint8_t>(b[i] - g[i]);
+        r[i] = static_cast<T>(r[i] - g[i]);
+        b[i] = static_cast<T>(b[i] - g[i]);
       }
       break;
     case 2:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] - g[i]);
-        g[i] = static_cast<uint8_t>(g[i] - b[i]);
+        r[i] = static_cast<T>(r[i] - g[i]);
+        g[i] = static_cast<T>(g[i] - b[i]);
       }
       break;
     case 3:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] - g[i]);
-        g[i] = static_cast<uint8_t>(g[i] - r[i]);
+        b[i] = static_cast<T>(b[i] - g[i]);
+        g[i] = static_cast<T>(g[i] - r[i]);
       }
       break;
     case 4:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] - g[i]);
-        g[i] = static_cast<uint8_t>(g[i] - b[i]);
-        b[i] = static_cast<uint8_t>(b[i] - r[i]);
+        r[i] = static_cast<T>(r[i] - g[i]);
+        g[i] = static_cast<T>(g[i] - b[i]);
+        b[i] = static_cast<T>(b[i] - r[i]);
       }
       break;
     case 5:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] - b[i]);
-        b[i] = static_cast<uint8_t>(b[i] - r[i]);
+        g[i] = static_cast<T>(g[i] - b[i]);
+        b[i] = static_cast<T>(b[i] - r[i]);
       }
       break;
     case 6:
       for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<uint8_t>(b[i] - g[i]);
+        b[i] = static_cast<T>(b[i] - g[i]);
       break;
     case 7:
       for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<uint8_t>(g[i] - b[i]);
+        g[i] = static_cast<T>(g[i] - b[i]);
       break;
     case 8:
       for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<uint8_t>(r[i] - g[i]);
+        r[i] = static_cast<T>(r[i] - g[i]);
       break;
     case 9:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] - g[i]);
-        g[i] = static_cast<uint8_t>(g[i] - r[i]);
-        r[i] = static_cast<uint8_t>(r[i] - b[i]);
+        b[i] = static_cast<T>(b[i] - g[i]);
+        g[i] = static_cast<T>(g[i] - r[i]);
+        r[i] = static_cast<T>(r[i] - b[i]);
       }
       break;
     case 10:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] - r[i]);
-        b[i] = static_cast<uint8_t>(b[i] - r[i]);
+        g[i] = static_cast<T>(g[i] - r[i]);
+        b[i] = static_cast<T>(b[i] - r[i]);
       }
       break;
     case 11:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] - b[i]);
-        g[i] = static_cast<uint8_t>(g[i] - b[i]);
+        r[i] = static_cast<T>(r[i] - b[i]);
+        g[i] = static_cast<T>(g[i] - b[i]);
       }
       break;
     case 12:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] - r[i]);
-        r[i] = static_cast<uint8_t>(r[i] - b[i]);
+        g[i] = static_cast<T>(g[i] - r[i]);
+        r[i] = static_cast<T>(r[i] - b[i]);
       }
       break;
     case 13:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] - r[i]);
-        r[i] = static_cast<uint8_t>(r[i] - b[i]);
-        b[i] = static_cast<uint8_t>(b[i] - g[i]);
+        g[i] = static_cast<T>(g[i] - r[i]);
+        r[i] = static_cast<T>(r[i] - b[i]);
+        b[i] = static_cast<T>(b[i] - g[i]);
       }
       break;
     case 14:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] - b[i]);
-        b[i] = static_cast<uint8_t>(b[i] - g[i]);
-        g[i] = static_cast<uint8_t>(g[i] - r[i]);
+        r[i] = static_cast<T>(r[i] - b[i]);
+        b[i] = static_cast<T>(b[i] - g[i]);
+        g[i] = static_cast<T>(g[i] - r[i]);
       }
       break;
     case 15:
       for (std::size_t i = 0; i < n; ++i)
       {
-        const uint8_t t = static_cast<uint8_t>(b[i] << 1);
-        r[i] = static_cast<uint8_t>(r[i] - t);
-        g[i] = static_cast<uint8_t>(g[i] - t);
+        const T t = static_cast<T>(b[i] << 1);
+        r[i] = static_cast<T>(r[i] - t);
+        g[i] = static_cast<T>(g[i] - t);
       }
       break;
     case 16:
       for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<uint8_t>(g[i] - r[i]);
+        g[i] = static_cast<T>(g[i] - r[i]);
       break;
     case 17:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] - b[i]);
-        b[i] = static_cast<uint8_t>(b[i] - g[i]);
+        r[i] = static_cast<T>(r[i] - b[i]);
+        b[i] = static_cast<T>(b[i] - g[i]);
       }
       break;
     case 18:
       for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<uint8_t>(r[i] - b[i]);
+        r[i] = static_cast<T>(r[i] - b[i]);
       break;
     case 19:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] - r[i]);
-        r[i] = static_cast<uint8_t>(r[i] - g[i]);
+        b[i] = static_cast<T>(b[i] - r[i]);
+        r[i] = static_cast<T>(r[i] - g[i]);
       }
       break;
     case 20:
       for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<uint8_t>(b[i] - r[i]);
+        b[i] = static_cast<T>(b[i] - r[i]);
       break;
     case 21:
       for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<uint8_t>(b[i] - (g[i] >> 1));
+        b[i] = static_cast<T>(b[i] - (g[i] >> 1));
       break;
     case 22:
       for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<uint8_t>(g[i] - (b[i] >> 1));
+        g[i] = static_cast<T>(g[i] - (b[i] >> 1));
       break;
     case 23:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] - b[i]);
-        b[i] = static_cast<uint8_t>(b[i] - r[i]);
-        r[i] = static_cast<uint8_t>(r[i] - g[i]);
+        g[i] = static_cast<T>(g[i] - b[i]);
+        b[i] = static_cast<T>(b[i] - r[i]);
+        r[i] = static_cast<T>(r[i] - g[i]);
       }
       break;
     case 24:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] - r[i]);
-        r[i] = static_cast<uint8_t>(r[i] - g[i]);
-        g[i] = static_cast<uint8_t>(g[i] - b[i]);
+        b[i] = static_cast<T>(b[i] - r[i]);
+        r[i] = static_cast<T>(r[i] - g[i]);
+        g[i] = static_cast<T>(g[i] - b[i]);
       }
       break;
     case 25:
       for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<uint8_t>(g[i] - (r[i] >> 1));
+        g[i] = static_cast<T>(g[i] - (r[i] >> 1));
       break;
     case 26:
       for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<uint8_t>(r[i] - (g[i] >> 1));
+        r[i] = static_cast<T>(r[i] - (g[i] >> 1));
       break;
     case 27:
       for (std::size_t i = 0; i < n; ++i)
       {
-        const uint8_t t = static_cast<uint8_t>(r[i] >> 1);
-        g[i] = static_cast<uint8_t>(g[i] - t);
-        b[i] = static_cast<uint8_t>(b[i] - t);
+        const T t = static_cast<T>(r[i] >> 1);
+        g[i] = static_cast<T>(g[i] - t);
+        b[i] = static_cast<T>(b[i] - t);
       }
       break;
     case 28:
       for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<uint8_t>(r[i] - (b[i] >> 1));
+        r[i] = static_cast<T>(r[i] - (b[i] >> 1));
       break;
     case 29:
       for (std::size_t i = 0; i < n; ++i)
       {
-        const uint8_t t = static_cast<uint8_t>(g[i] >> 1);
-        r[i] = static_cast<uint8_t>(r[i] - t);
-        b[i] = static_cast<uint8_t>(b[i] - t);
+        const T t = static_cast<T>(g[i] >> 1);
+        r[i] = static_cast<T>(r[i] - t);
+        b[i] = static_cast<T>(b[i] - t);
       }
       break;
     case 30:
       for (std::size_t i = 0; i < n; ++i)
       {
-        const uint8_t t = static_cast<uint8_t>(b[i] >> 1);
-        r[i] = static_cast<uint8_t>(r[i] - t);
-        g[i] = static_cast<uint8_t>(g[i] - t);
+        const T t = static_cast<T>(b[i] >> 1);
+        r[i] = static_cast<T>(r[i] - t);
+        g[i] = static_cast<T>(g[i] - t);
       }
       break;
     case 31:
       for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<uint8_t>(b[i] - (r[i] >> 1));
+        b[i] = static_cast<T>(b[i] - (r[i] >> 1));
       break;
     default:
       break;
     }
   }
 
+  template <typename T>
   void undo_color_filter(int code,
-                         std::vector<uint8_t> &b,
-                         std::vector<uint8_t> &g,
-                         std::vector<uint8_t> &r)
+                         std::vector<T> &b,
+                         std::vector<T> &g,
+                         std::vector<T> &r)
   {
     const std::size_t n = b.size();
     switch (code)
@@ -826,224 +828,227 @@ namespace
     case 1:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] + g[i]);
-        r[i] = static_cast<uint8_t>(r[i] + g[i]);
+        b[i] = static_cast<T>(b[i] + g[i]);
+        r[i] = static_cast<T>(r[i] + g[i]);
       }
       break;
     case 2:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] + b[i]);
-        r[i] = static_cast<uint8_t>(r[i] + g[i]);
+        g[i] = static_cast<T>(g[i] + b[i]);
+        r[i] = static_cast<T>(r[i] + g[i]);
       }
       break;
     case 3:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] + r[i]);
-        b[i] = static_cast<uint8_t>(b[i] + g[i]);
+        g[i] = static_cast<T>(g[i] + r[i]);
+        b[i] = static_cast<T>(b[i] + g[i]);
       }
       break;
     case 4:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] + r[i]);
-        g[i] = static_cast<uint8_t>(g[i] + b[i]);
-        r[i] = static_cast<uint8_t>(r[i] + g[i]);
+        b[i] = static_cast<T>(b[i] + r[i]);
+        g[i] = static_cast<T>(g[i] + b[i]);
+        r[i] = static_cast<T>(r[i] + g[i]);
       }
       break;
     case 5:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] + r[i]);
-        g[i] = static_cast<uint8_t>(g[i] + b[i]);
+        b[i] = static_cast<T>(b[i] + r[i]);
+        g[i] = static_cast<T>(g[i] + b[i]);
       }
       break;
     case 6:
       for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<uint8_t>(b[i] + g[i]);
+        b[i] = static_cast<T>(b[i] + g[i]);
       break;
     case 7:
       for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<uint8_t>(g[i] + b[i]);
+        g[i] = static_cast<T>(g[i] + b[i]);
       break;
     case 8:
       for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<uint8_t>(r[i] + g[i]);
+        r[i] = static_cast<T>(r[i] + g[i]);
       break;
     case 9:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] + b[i]);
-        g[i] = static_cast<uint8_t>(g[i] + r[i]);
-        b[i] = static_cast<uint8_t>(b[i] + g[i]);
+        r[i] = static_cast<T>(r[i] + b[i]);
+        g[i] = static_cast<T>(g[i] + r[i]);
+        b[i] = static_cast<T>(b[i] + g[i]);
       }
       break;
     case 10:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] + r[i]);
-        g[i] = static_cast<uint8_t>(g[i] + r[i]);
+        b[i] = static_cast<T>(b[i] + r[i]);
+        g[i] = static_cast<T>(g[i] + r[i]);
       }
       break;
     case 11:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] + b[i]);
-        r[i] = static_cast<uint8_t>(r[i] + b[i]);
+        g[i] = static_cast<T>(g[i] + b[i]);
+        r[i] = static_cast<T>(r[i] + b[i]);
       }
       break;
     case 12:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] + b[i]);
-        g[i] = static_cast<uint8_t>(g[i] + r[i]);
+        r[i] = static_cast<T>(r[i] + b[i]);
+        g[i] = static_cast<T>(g[i] + r[i]);
       }
       break;
     case 13:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] + g[i]);
-        r[i] = static_cast<uint8_t>(r[i] + b[i]);
-        g[i] = static_cast<uint8_t>(g[i] + r[i]);
+        b[i] = static_cast<T>(b[i] + g[i]);
+        r[i] = static_cast<T>(r[i] + b[i]);
+        g[i] = static_cast<T>(g[i] + r[i]);
       }
       break;
     case 14:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] + r[i]);
-        b[i] = static_cast<uint8_t>(b[i] + g[i]);
-        r[i] = static_cast<uint8_t>(r[i] + b[i]);
+        g[i] = static_cast<T>(g[i] + r[i]);
+        b[i] = static_cast<T>(b[i] + g[i]);
+        r[i] = static_cast<T>(r[i] + b[i]);
       }
       break;
     case 15:
       for (std::size_t i = 0; i < n; ++i)
       {
-        const uint8_t t = static_cast<uint8_t>(b[i] << 1);
-        g[i] = static_cast<uint8_t>(g[i] + t);
-        r[i] = static_cast<uint8_t>(r[i] + t);
+        const T t = static_cast<T>(b[i] << 1);
+        g[i] = static_cast<T>(g[i] + t);
+        r[i] = static_cast<T>(r[i] + t);
       }
       break;
     case 16:
       for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<uint8_t>(g[i] + r[i]);
+        g[i] = static_cast<T>(g[i] + r[i]);
       break;
     case 17:
       for (std::size_t i = 0; i < n; ++i)
       {
-        b[i] = static_cast<uint8_t>(b[i] + g[i]);
-        r[i] = static_cast<uint8_t>(r[i] + b[i]);
+        b[i] = static_cast<T>(b[i] + g[i]);
+        r[i] = static_cast<T>(r[i] + b[i]);
       }
       break;
     case 18:
       for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<uint8_t>(r[i] + b[i]);
+        r[i] = static_cast<T>(r[i] + b[i]);
       break;
     case 19:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] + g[i]);
-        b[i] = static_cast<uint8_t>(b[i] + r[i]);
+        r[i] = static_cast<T>(r[i] + g[i]);
+        b[i] = static_cast<T>(b[i] + r[i]);
       }
       break;
     case 20:
       for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<uint8_t>(b[i] + r[i]);
+        b[i] = static_cast<T>(b[i] + r[i]);
       break;
     case 21:
       for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<uint8_t>(b[i] + (g[i] >> 1));
+        b[i] = static_cast<T>(b[i] + (g[i] >> 1));
       break;
     case 22:
       for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<uint8_t>(g[i] + (b[i] >> 1));
+        g[i] = static_cast<T>(g[i] + (b[i] >> 1));
       break;
     case 23:
       for (std::size_t i = 0; i < n; ++i)
       {
-        r[i] = static_cast<uint8_t>(r[i] + g[i]);
-        b[i] = static_cast<uint8_t>(b[i] + r[i]);
-        g[i] = static_cast<uint8_t>(g[i] + b[i]);
+        r[i] = static_cast<T>(r[i] + g[i]);
+        b[i] = static_cast<T>(b[i] + r[i]);
+        g[i] = static_cast<T>(g[i] + b[i]);
       }
       break;
     case 24:
       for (std::size_t i = 0; i < n; ++i)
       {
-        g[i] = static_cast<uint8_t>(g[i] + b[i]);
-        r[i] = static_cast<uint8_t>(r[i] + g[i]);
-        b[i] = static_cast<uint8_t>(b[i] + r[i]);
+        g[i] = static_cast<T>(g[i] + b[i]);
+        r[i] = static_cast<T>(r[i] + g[i]);
+        b[i] = static_cast<T>(b[i] + r[i]);
       }
       break;
     case 25:
       for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<uint8_t>(g[i] + (r[i] >> 1));
+        g[i] = static_cast<T>(g[i] + (r[i] >> 1));
       break;
     case 26:
       for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<uint8_t>(r[i] + (g[i] >> 1));
+        r[i] = static_cast<T>(r[i] + (g[i] >> 1));
       break;
     case 27:
       for (std::size_t i = 0; i < n; ++i)
       {
-        const uint8_t t = static_cast<uint8_t>(r[i] >> 1);
-        b[i] = static_cast<uint8_t>(b[i] + t);
-        g[i] = static_cast<uint8_t>(g[i] + t);
+        const T t = static_cast<T>(r[i] >> 1);
+        b[i] = static_cast<T>(b[i] + t);
+        g[i] = static_cast<T>(g[i] + t);
       }
       break;
     case 28:
       for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<uint8_t>(r[i] + (b[i] >> 1));
+        r[i] = static_cast<T>(r[i] + (b[i] >> 1));
       break;
     case 29:
       for (std::size_t i = 0; i < n; ++i)
       {
-        const uint8_t t = static_cast<uint8_t>(g[i] >> 1);
-        b[i] = static_cast<uint8_t>(b[i] + t);
-        r[i] = static_cast<uint8_t>(r[i] + t);
+        const T t = static_cast<T>(g[i] >> 1);
+        b[i] = static_cast<T>(b[i] + t);
+        r[i] = static_cast<T>(r[i] + t);
       }
       break;
     case 30:
       for (std::size_t i = 0; i < n; ++i)
       {
-        const uint8_t t = static_cast<uint8_t>(b[i] >> 1);
-        g[i] = static_cast<uint8_t>(g[i] + t);
-        r[i] = static_cast<uint8_t>(r[i] + t);
+        const T t = static_cast<T>(b[i] >> 1);
+        g[i] = static_cast<T>(g[i] + t);
+        r[i] = static_cast<T>(r[i] + t);
       }
       break;
     case 31:
       for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<uint8_t>(b[i] + (r[i] >> 1));
+        b[i] = static_cast<T>(b[i] + (r[i] >> 1));
       break;
     default:
       break;
     }
   }
 
-  std::int64_t estimate_sequence_cost(const std::vector<uint8_t> &seq)
+  template <typename T>
+  std::int64_t estimate_sequence_cost(const std::vector<T> &seq)
   {
     if (seq.empty())
       return 0;
     std::int64_t cost = 0;
-    uint8_t prev = seq[0];
+    std::int64_t prev = static_cast<std::int64_t>(seq[0]);
     for (std::size_t i = 1; i < seq.size(); ++i)
     {
-      int diff = static_cast<int>(seq[i]) - static_cast<int>(prev);
+      const std::int64_t cur = static_cast<std::int64_t>(seq[i]);
+      const std::int64_t diff = cur - prev;
       cost += diff * diff;
-      prev = seq[i];
+      prev = cur;
     }
     return cost;
   }
 
-  int choose_filter_fast(const std::vector<uint8_t> &src_b,
-                         const std::vector<uint8_t> &src_g,
-                         const std::vector<uint8_t> &src_r,
-                         std::vector<uint8_t> &dst_b,
-                         std::vector<uint8_t> &dst_g,
-                         std::vector<uint8_t> &dst_r)
+  template <typename T>
+  int choose_filter_fast(const std::vector<T> &src_b,
+                         const std::vector<T> &src_g,
+                         const std::vector<T> &src_r,
+                         std::vector<T> &dst_b,
+                         std::vector<T> &dst_g,
+                         std::vector<T> &dst_r)
   {
     int best_code = 0;
     std::int64_t best_score = std::numeric_limits<std::int64_t>::max();
-    std::vector<uint8_t> tb, tg, tr;
+    std::vector<T> tb, tg, tr;
     tb.reserve(src_b.size());
     tg.reserve(src_g.size());
     tr.reserve(src_r.size());
@@ -1391,58 +1396,38 @@ namespace tlg::v7
   struct FilterSelectionResult
   {
     int code = 0;
-    std::array<std::vector<uint8_t>, 3> filtered;
+    std::array<std::vector<int16_t>, 3> filtered;
   };
 
   FilterSelectionResult choose_filter_optimal(const BlockContext &ctx,
-                                              const std::vector<uint8_t> &block_b,
-                                              const std::vector<uint8_t> &block_g,
-                                              const std::vector<uint8_t> &block_r,
-                                              CAS8 &cas,
-                                              const std::vector<CAS8::State> &states,
-                                              std::vector<detail::image<uint8_t>> &filtered_planes,
-                                              std::vector<int16_t> &residual_scratch)
+                                              const std::vector<int16_t> &residual_b,
+                                              const std::vector<int16_t> &residual_g,
+                                              const std::vector<int16_t> &residual_r)
   {
     FilterSelectionResult result;
     const bool is_full_block = (ctx.bw == BLOCK_SIZE && ctx.bh == BLOCK_SIZE);
-    const std::size_t pixel_count = ctx.bw * ctx.bh;
-
-    std::array<std::vector<uint8_t>, 3> filtered_tmp;
-    for (auto &v : filtered_tmp)
-      v.reserve(pixel_count);
-    std::vector<uint8_t> backup_block;
-    backup_block.reserve(pixel_count);
 
     uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
     for (int code = 0; code < 32; ++code)
     {
-      filtered_tmp[0].assign(block_b.begin(), block_b.end());
-      filtered_tmp[1].assign(block_g.begin(), block_g.end());
-      filtered_tmp[2].assign(block_r.begin(), block_r.end());
-      apply_color_filter(code, filtered_tmp[0], filtered_tmp[1], filtered_tmp[2]);
+      std::array<std::vector<int16_t>, 3> candidate = {residual_b, residual_g, residual_r};
+      apply_color_filter(code, candidate[0], candidate[1], candidate[2]);
 
-      std::vector<CAS8::State> sim_states = states;
       uint64_t total_bits = 0;
-
       for (int c = 0; c < 3; ++c)
       {
-        backup_block.clear();
-        copy_block_from_plane(filtered_planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, backup_block);
-
-        encode_block_component(ctx, filtered_tmp[c], cas, sim_states[c], filtered_planes[c], residual_scratch);
+        std::vector<int16_t> tmp = candidate[c];
         if (is_full_block)
-          reorder_to_hilbert(residual_scratch);
-        total_bits += estimate_residual_bits(residual_scratch);
-
-        store_block_to_plane(filtered_planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, backup_block);
+          reorder_to_hilbert(tmp);
+        total_bits += estimate_residual_bits(tmp);
       }
 
       if (total_bits < best_bits)
       {
         best_bits = total_bits;
         result.code = code;
-        result.filtered = filtered_tmp;
+        result.filtered = std::move(candidate);
       }
     }
 
@@ -1499,8 +1484,6 @@ namespace tlg::v7
     CAS8 cas(cas_cfg, 0, 255);
 
     const std::size_t chunk_rows = (height + CHUNK_SCAN_LINES - 1) / CHUNK_SCAN_LINES;
-    std::vector<int16_t> block_buffer;
-    block_buffer.reserve(BLOCK_SIZE * BLOCK_SIZE);
 
     for (std::size_t chunk_y = 0; chunk_y < chunk_rows; ++chunk_y)
     {
@@ -1544,17 +1527,25 @@ namespace tlg::v7
           const std::size_t pixel_count = ctx.bw * ctx.bh;
           const bool is_full_block = (ctx.bw == BLOCK_SIZE && ctx.bh == BLOCK_SIZE);
 
-          std::vector<std::vector<uint8_t>> filtered_block(component_count);
+          std::vector<std::vector<int16_t>> block_residuals(component_count);
           for (std::size_t c = 0; c < component_count; ++c)
           {
-            block_buffer.assign(chunk_residuals[c].begin() + residual_cursor[c],
-                                chunk_residuals[c].begin() + residual_cursor[c] + pixel_count);
+            block_residuals[c].assign(chunk_residuals[c].begin() + residual_cursor[c],
+                                      chunk_residuals[c].begin() + residual_cursor[c] + pixel_count);
             residual_cursor[c] += pixel_count;
-
             if (is_full_block)
-              reorder_from_hilbert(block_buffer);
+              reorder_from_hilbert(block_residuals[c]);
+          }
 
-            filtered_block[c].resize(pixel_count);
+          if (component_count >= 3)
+          {
+            undo_color_filter(filter_indices[ctx.index], block_residuals[0], block_residuals[1], block_residuals[2]);
+          }
+
+          std::vector<std::vector<uint8_t>> block_pixels(component_count);
+          for (std::size_t c = 0; c < component_count; ++c)
+          {
+            block_pixels[c].resize(pixel_count);
 
             std::size_t idx = 0;
             for (std::size_t y = 0; y < ctx.bh; ++y)
@@ -1571,14 +1562,14 @@ namespace tlg::v7
                 const int f = sample_pixel(filtered_planes[c], gx, gy - 2);
 
                 auto [pred, pid] = cas.predict_and_choose<uint8_t>(a, b, cdiag, d, f, states[c]);
-                int recon = pred + block_buffer[idx];
+                int recon = pred + block_residuals[c][idx];
                 if (recon < 0)
                   recon = 0;
                 else if (recon > 255)
                   recon = 255;
 
                 filtered_planes[c].row_ptr(ctx.y0 + y)[ctx.x0 + x] = static_cast<uint8_t>(recon);
-                filtered_block[c][idx] = static_cast<uint8_t>(recon);
+                block_pixels[c][idx] = static_cast<uint8_t>(recon);
 
                 const int Dh = std::abs(a - b);
                 const int Dv = std::abs(b - cdiag);
@@ -1590,25 +1581,8 @@ namespace tlg::v7
             }
           }
 
-          if (component_count >= 3)
-          {
-            std::vector<uint8_t> block_b = filtered_block[0];
-            std::vector<uint8_t> block_g = filtered_block[1];
-            std::vector<uint8_t> block_r = filtered_block[2];
-            undo_color_filter(filter_indices[ctx.index], block_b, block_g, block_r);
-            store_block_to_plane(output_planes[0], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_b);
-            store_block_to_plane(output_planes[1], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_g);
-            store_block_to_plane(output_planes[2], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_r);
-          }
-          else
-          {
-            store_block_to_plane(output_planes[0], ctx.x0, ctx.y0, ctx.bw, ctx.bh, filtered_block[0]);
-          }
-
-          if (component_count == 4)
-          {
-            store_block_to_plane(output_planes[3], ctx.x0, ctx.y0, ctx.bw, ctx.bh, filtered_block[3]);
-          }
+          for (std::size_t c = 0; c < component_count; ++c)
+            store_block_to_plane(output_planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_pixels[c]);
         }
       }
 
@@ -1717,11 +1691,6 @@ namespace tlg::v7
       cas_cfg.enablePlanarLite = true;
       CAS8 cas(cas_cfg, 0, 255);
 
-      std::vector<int16_t> residual_block;
-      residual_block.reserve(BLOCK_SIZE * BLOCK_SIZE);
-      std::vector<int16_t> residual_scratch;
-      residual_scratch.reserve(BLOCK_SIZE * BLOCK_SIZE);
-
       for (std::size_t chunk_y = 0; chunk_y < chunk_rows; ++chunk_y)
       {
         const std::size_t chunk_y0 = chunk_y * CHUNK_SCAN_LINES;
@@ -1751,33 +1720,35 @@ namespace tlg::v7
             for (std::size_t c = 0; c < component_count; ++c)
               copy_block_from_plane(planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_values[c]);
 
+            std::vector<std::vector<int16_t>> block_residuals(component_count);
+            for (std::size_t c = 0; c < component_count; ++c)
+            {
+              encode_block_component(ctx, block_values[c], cas, states[c], filtered_planes[c], block_residuals[c]);
+            }
+
             int filter_code = 0;
             if (component_count >= 3)
             {
               if (fast_mode)
               {
-                std::vector<uint8_t> filtered_b;
-                std::vector<uint8_t> filtered_g;
-                std::vector<uint8_t> filtered_r;
-                filter_code = choose_filter_fast(block_values[0], block_values[1], block_values[2], filtered_b, filtered_g, filtered_r);
-                block_values[0] = std::move(filtered_b);
-                block_values[1] = std::move(filtered_g);
-                block_values[2] = std::move(filtered_r);
+                std::vector<int16_t> filtered_b;
+                std::vector<int16_t> filtered_g;
+                std::vector<int16_t> filtered_r;
+                filter_code = choose_filter_fast(block_residuals[0], block_residuals[1], block_residuals[2], filtered_b, filtered_g, filtered_r);
+                block_residuals[0] = std::move(filtered_b);
+                block_residuals[1] = std::move(filtered_g);
+                block_residuals[2] = std::move(filtered_r);
               }
               else
               {
                 auto selection = choose_filter_optimal(ctx,
-                                                       block_values[0],
-                                                       block_values[1],
-                                                       block_values[2],
-                                                       cas,
-                                                       states,
-                                                       filtered_planes,
-                                                       residual_scratch);
+                                                       block_residuals[0],
+                                                       block_residuals[1],
+                                                       block_residuals[2]);
                 filter_code = selection.code;
-                block_values[0] = std::move(selection.filtered[0]);
-                block_values[1] = std::move(selection.filtered[1]);
-                block_values[2] = std::move(selection.filtered[2]);
+                block_residuals[0] = std::move(selection.filtered[0]);
+                block_residuals[1] = std::move(selection.filtered[1]);
+                block_residuals[2] = std::move(selection.filtered[2]);
               }
             }
 
@@ -1785,10 +1756,11 @@ namespace tlg::v7
 
             for (std::size_t c = 0; c < component_count; ++c)
             {
-              encode_block_component(ctx, block_values[c], cas, states[c], filtered_planes[c], residual_block);
               if (is_full_block)
-                reorder_to_hilbert(residual_block);
-              chunk_residuals[c].insert(chunk_residuals[c].end(), residual_block.begin(), residual_block.end());
+                reorder_to_hilbert(block_residuals[c]);
+              chunk_residuals[c].insert(chunk_residuals[c].end(),
+                                        block_residuals[c].begin(),
+                                        block_residuals[c].end());
             }
           }
         }
