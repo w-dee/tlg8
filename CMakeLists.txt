@@ -43,7 +43,10 @@ add_executable(tlgconv
     src/tlg_io_common.cpp
     src/tlg5_io.cpp
     src/tlg6_io.cpp
-    src/tlg7_io.cpp
+    src/tlg7_common.cpp
+    src/tlg7_decoder.cpp
+    src/tlg7_encoder.cpp
+    src/tlg7_entropy_codec.cpp
 )
 
 target_include_directories(tlgconv PRIVATE src)
