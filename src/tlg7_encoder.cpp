@@ -142,9 +142,7 @@ namespace tlg::v7
           residual_out[idx] = static_cast<int16_t>(residual);
           const int Dh = std::abs(a - b);
           const int Dv = std::abs(b - cdiag);
-          const int high = std::max(Dh, Dv);
-          const int decay = (high >= CAS_ADAPT_HIGH_ACTIVITY) ? std::max(1, CAS_DEFAULT_ERR_DECAY - 1) : CAS_DEFAULT_ERR_DECAY;
-          state.update(pid, std::abs(residual), decay);
+          cas.update_state(state, pid, std::abs(residual), Dh, Dv);
           plane.row_ptr(ctx.y0 + y)[ctx.x0 + x] = value;
           ++idx;
         }
@@ -230,7 +228,9 @@ namespace tlg::v7
       cas_cfg.T1 = CAS_DEFAULT_T1;
       cas_cfg.T2 = CAS_DEFAULT_T2;
       cas_cfg.errDecayShift = CAS_DEFAULT_ERR_DECAY;
-      cas_cfg.enablePlanarLite = true;
+      cas_cfg.enablePlanarLiteFlat = false;
+      cas_cfg.enablePlanarLiteDiag = true;
+      cas_cfg.zeroBiasDelta = CAS_DEFAULT_ZERO_BIAS_DELTA;
       CAS8 cas(cas_cfg, 0, 255);
 
       GolombResidualEntropyEncoder entropy_encoder;

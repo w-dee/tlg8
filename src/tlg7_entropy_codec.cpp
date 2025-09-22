@@ -21,8 +21,8 @@ namespace tlg::v7
     using GolombTable = std::array<GolombRow, GOLOMB_N_COUNT>;
 
     constexpr GolombTable DEFAULT_GOLOMB_TABLE = {
-        GolombRow{3, 7, 15, 27, 63, 108, 223, 448, 130},
-        GolombRow{3, 5, 13, 24, 51, 95, 192, 384, 257},
+        GolombRow{3, 6, 15, 23, 54, 130, 261, 518, 14},
+        GolombRow{2, 4, 9, 16, 60, 145, 269, 514, 5},
     };
 
     GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
