@@ -52,6 +52,9 @@ namespace tlg::v7
       output_planes.emplace_back(width, height, 0);
     }
 
+#ifdef TLG7_USE_MED_PREDICTOR
+    ActivePredictor predictor;
+#else
     CAS8::Config cas_cfg;
     cas_cfg.T1 = CAS_DEFAULT_T1;
     cas_cfg.T2 = CAS_DEFAULT_T2;
@@ -59,7 +62,8 @@ namespace tlg::v7
     cas_cfg.enablePlanarLiteFlat = false;
     cas_cfg.enablePlanarLiteDiag = true;
     cas_cfg.zeroBiasDelta = CAS_DEFAULT_ZERO_BIAS_DELTA;
-    CAS8 cas(cas_cfg, 0, 255);
+    ActivePredictor predictor(cas_cfg, 0, 255);
+#endif
 
     GolombResidualEntropyDecoder entropy_decoder;
     std::vector<uint8_t> encoded_stream;
@@ -91,7 +95,7 @@ namespace tlg::v7
         }
       }
 
-      std::vector<CAS8::State> states(component_count);
+      std::vector<ActivePredictor::State> states(component_count);
       std::vector<std::size_t> residual_cursor(component_count, 0);
 
       const std::size_t chunk_block_row_start = chunk_y0 / BLOCK_SIZE;
@@ -142,7 +146,7 @@ namespace tlg::v7
                 const int d = sample_pixel(filtered_planes[c], gx + 1, gy - 1);
                 const int f = sample_pixel(filtered_planes[c], gx, gy - 2);
 
-                auto [pred, pid] = cas.predict_and_choose<uint8_t>(a, b, cdiag, d, f, states[c]);
+                auto [pred, pid] = predictor.predict_and_choose<uint8_t>(a, b, cdiag, d, f, states[c]);
                 int recon = pred + block_residuals[c][idx];
                 if (recon < 0)
                   recon = 0;
@@ -154,7 +158,7 @@ namespace tlg::v7
 
                 const int Dh = std::abs(a - b);
                 const int Dv = std::abs(b - cdiag);
-                cas.update_state(states[c], pid, std::abs(recon - pred), Dh, Dv);
+                predictor.update_state(states[c], pid, std::abs(recon - pred), Dh, Dv);
                 ++idx;
               }
             }

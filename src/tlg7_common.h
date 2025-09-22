@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <utility>
 #include <vector>
 #include <string>
@@ -343,6 +344,61 @@ namespace tlg::v7
     int lo_;
     int hi_;
   };
+
+#ifdef TLG7_USE_MED_PREDICTOR
+
+  // MED predictor mirrors the TLG6 "// MED method" implementation for single-channel data.
+  class MedPredictor
+  {
+  public:
+    using PredId = uint8_t;
+    struct State
+    {
+    };
+
+    template <typename T>
+    std::pair<int, PredId> predict_and_choose(int a, int b, int c, int d, int f, const State &) const
+    {
+      return {predict_only<T>(static_cast<PredId>(0), a, b, c, d, f), static_cast<PredId>(0)};
+    }
+
+    template <typename T>
+    int predict_only(PredId, int a, int b, int c, int, int) const
+    {
+      return med_predict<T>(a, b, c);
+    }
+
+    void update_state(State &, PredId, int) const {}
+    void update_state(State &, PredId, int, int, int) const {}
+
+  private:
+    template <typename T>
+    static int med_predict(int a, int b, int c)
+    {
+      const int max_ab = std::max(a, b);
+      const int min_ab = std::min(a, b);
+      int pred;
+      if (c >= max_ab)
+        pred = min_ab;
+      else if (c <= min_ab)
+        pred = max_ab;
+      else
+        pred = a + b - c;
+      const int lo = static_cast<int>(std::numeric_limits<T>::min());
+      const int hi = static_cast<int>(std::numeric_limits<T>::max());
+      if (pred < lo)
+        pred = lo;
+      else if (pred > hi)
+        pred = hi;
+      return pred;
+    }
+  };
+
+  using ActivePredictor = MedPredictor;
+
+#else
+  using ActivePredictor = CAS8;
+#endif
 
   void apply_color_filter(int code,
                           std::vector<int16_t> &b,

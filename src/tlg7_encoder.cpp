@@ -115,8 +115,8 @@ namespace tlg::v7
 
     void encode_block_component(const BlockContext &ctx,
                                 const std::vector<uint8_t> &block_values,
-                                CAS8 &cas,
-                                CAS8::State &state,
+                                ActivePredictor &predictor,
+                                ActivePredictor::State &state,
                                 detail::image<uint8_t> &plane,
                                 std::vector<int16_t> &residual_out)
     {
@@ -137,12 +137,12 @@ namespace tlg::v7
           const int d = sample_pixel(plane, gx + 1, gy - 1);
           const int f = sample_pixel(plane, gx, gy - 2);
 
-          auto [pred, pid] = cas.predict_and_choose<uint8_t>(a, b, cdiag, d, f, state);
+          auto [pred, pid] = predictor.predict_and_choose<uint8_t>(a, b, cdiag, d, f, state);
           const int residual = static_cast<int>(value) - pred;
           residual_out[idx] = static_cast<int16_t>(residual);
           const int Dh = std::abs(a - b);
           const int Dv = std::abs(b - cdiag);
-          cas.update_state(state, pid, std::abs(residual), Dh, Dv);
+          predictor.update_state(state, pid, std::abs(residual), Dh, Dv);
           plane.row_ptr(ctx.y0 + y)[ctx.x0 + x] = value;
           ++idx;
         }
@@ -224,6 +224,9 @@ namespace tlg::v7
       for (std::size_t i = 0; i < component_count; ++i)
         filtered_planes.emplace_back(width, height, 0);
 
+#ifdef TLG7_USE_MED_PREDICTOR
+      ActivePredictor predictor;
+#else
       CAS8::Config cas_cfg;
       cas_cfg.T1 = CAS_DEFAULT_T1;
       cas_cfg.T2 = CAS_DEFAULT_T2;
@@ -231,7 +234,8 @@ namespace tlg::v7
       cas_cfg.enablePlanarLiteFlat = false;
       cas_cfg.enablePlanarLiteDiag = true;
       cas_cfg.zeroBiasDelta = CAS_DEFAULT_ZERO_BIAS_DELTA;
-      CAS8 cas(cas_cfg, 0, 255);
+      ActivePredictor predictor(cas_cfg, 0, 255);
+#endif
 
       GolombResidualEntropyEncoder entropy_encoder;
       std::vector<uint8_t> encoded_stream;
@@ -246,7 +250,7 @@ namespace tlg::v7
         for (auto &vec : chunk_residuals)
           vec.reserve(chunk_pixels);
 
-        std::vector<CAS8::State> states(component_count);
+        std::vector<ActivePredictor::State> states(component_count);
 
         const std::size_t chunk_block_row_start = chunk_y0 / BLOCK_SIZE;
         const std::size_t chunk_block_row_end = std::min<std::size_t>((chunk_y0 + chunk_height + BLOCK_SIZE - 1) / BLOCK_SIZE, blocks_y);
@@ -268,7 +272,7 @@ namespace tlg::v7
             std::vector<std::vector<int16_t>> block_residuals(component_count);
             for (std::size_t c = 0; c < component_count; ++c)
             {
-              encode_block_component(ctx, block_values[c], cas, states[c], filtered_planes[c], block_residuals[c]);
+              encode_block_component(ctx, block_values[c], predictor, states[c], filtered_planes[c], block_residuals[c]);
             }
 
             int filter_code = 0;
