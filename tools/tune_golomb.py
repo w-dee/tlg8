@@ -12,6 +12,8 @@ from typing import Iterable, List, Sequence
 DEFAULT_GOLOMB_TABLE: List[List[int]] = [
     [3, 7, 15, 27, 63, 108, 223, 448, 130],
     [3, 5, 13, 24, 51, 95, 192, 384, 257],
+    [3, 7, 15, 27, 63, 108, 223, 448, 130],
+    [3, 5, 13, 24, 51, 95, 192, 384, 257],
 ]
 GOLOMB_ROW_SUM = 1024
 GOLOMB_ROWS = len(DEFAULT_GOLOMB_TABLE)

@@ -14,13 +14,15 @@ namespace tlg::v7
 {
   namespace
   {
-    constexpr int GOLOMB_N_COUNT = 2;
+    constexpr int GOLOMB_N_COUNT = 4;
     constexpr int GOLOMB_ROW_SUM = 1024;
 
     using GolombRow = std::array<uint16_t, 9>;
     using GolombTable = std::array<GolombRow, GOLOMB_N_COUNT>;
 
     constexpr GolombTable DEFAULT_GOLOMB_TABLE = {
+        GolombRow{3, 6, 15, 23, 54, 130, 261, 518, 14},
+        GolombRow{2, 4, 9, 16, 60, 145, 269, 514, 5},
         GolombRow{3, 6, 15, 23, 54, 130, 261, 518, 14},
         GolombRow{2, 4, 9, 16, 60, 145, 269, 514, 5},
     };
@@ -168,11 +170,11 @@ namespace tlg::v7
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            a += static_cast<int>(m);
+            a += m>>1;
             if (--n < 0)
             {
-              n = GOLOMB_N_COUNT - 1;
               a >>= 1;
+              n = GOLOMB_N_COUNT - 1;
             }
           }
           i = ii - 1;
@@ -320,7 +322,7 @@ namespace tlg::v7
           int sign = (m & 1) - 1;
           int vv = m >> 1;
           int residual = (vv ^ sign) + sign + 1;
-          a += m;
+          a += m >> 1;
 
           out.push_back(static_cast<int16_t>(residual));
 
