@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -75,6 +77,43 @@ namespace tlg::v7
       int code = 0;
       std::array<std::vector<int16_t>, 3> filtered;
     };
+
+    struct FileCloser
+    {
+      void operator()(FILE *fp) const noexcept
+      {
+        if (fp)
+          std::fclose(fp);
+      }
+    };
+
+    void dump_residual_block(FILE *fp,
+                             std::size_t component_index,
+                             const BlockContext &ctx,
+                             const std::vector<int16_t> &residuals)
+    {
+      if (!fp)
+        return;
+
+      const std::size_t block_x = ctx.x0 / BLOCK_SIZE;
+      const std::size_t block_y = ctx.y0 / BLOCK_SIZE;
+      std::fprintf(fp, "# Color component %zu at block %zu,%zu\n",
+                   component_index,
+                   block_x,
+                   block_y);
+
+      for (std::size_t i = 0; i < residuals.size(); ++i)
+      {
+        std::fprintf(fp, "%4d,", static_cast<int>(residuals[i]));
+        if ((i + 1) % BLOCK_SIZE == 0)
+          std::fputc('\n', fp);
+      }
+
+      if (residuals.size() % BLOCK_SIZE != 0)
+        std::fputc('\n', fp);
+
+      std::fputc('\n', fp);
+    }
 
     FilterSelectionResult choose_filter_optimal(const BlockContext &ctx,
                                                 const std::vector<int16_t> &residual_b,
@@ -154,7 +193,12 @@ namespace tlg::v7
   namespace enc
   {
 
-    bool write_raw(FILE *fp, const PixelBuffer &src, int colors, bool fast_mode, std::string &err)
+    bool write_raw(FILE *fp,
+                   const PixelBuffer &src,
+                   int colors,
+                   bool fast_mode,
+                   const std::string &dump_residuals_path,
+                   std::string &err)
     {
       err.clear();
       if (!(colors == 1 || colors == 3 || colors == 4))
@@ -197,6 +241,18 @@ namespace tlg::v7
       hdr.height = src.height;
       hdr.block_count = static_cast<uint32_t>(block_count);
       hdr.chunk_count = static_cast<uint32_t>(chunk_rows);
+
+      std::unique_ptr<FILE, FileCloser> dump_file;
+      if (!dump_residuals_path.empty())
+      {
+        FILE *dump_fp = std::fopen(dump_residuals_path.c_str(), "w");
+        if (!dump_fp)
+        {
+          err = "tlg7: cannot open residual dump file: " + dump_residuals_path;
+          return false;
+        }
+        dump_file.reset(dump_fp);
+      }
 
       if (!detail::write_header(fp, hdr))
       {
@@ -301,6 +357,8 @@ namespace tlg::v7
             {
               if (is_full_block)
                 reorder_to_hilbert(block_residuals[c]);
+              if (dump_file)
+                dump_residual_block(dump_file.get(), c, ctx, block_residuals[c]);
               chunk_residuals[c].insert(chunk_residuals[c].end(),
                                         block_residuals[c].begin(),
                                         block_residuals[c].end());

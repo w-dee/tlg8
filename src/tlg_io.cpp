@@ -108,7 +108,12 @@ bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions 
       std::fclose(fp);
       return false;
     }
-    ok = tlg::v7::enc::write_raw(fp, src, desired_colors, opt.tlg7_fast_mode, err);
+    ok = tlg::v7::enc::write_raw(fp,
+                                 src,
+                                 desired_colors,
+                                 opt.tlg7_fast_mode,
+                                 opt.tlg7_dump_residuals_path,
+                                 err);
   }
   else if (opt.version == 6)
   {
