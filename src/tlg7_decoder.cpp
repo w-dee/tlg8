@@ -55,14 +55,8 @@ namespace tlg::v7
 #ifdef TLG7_USE_MED_PREDICTOR
     ActivePredictor predictor;
 #else
-    CAS8::Config cas_cfg;
-    cas_cfg.T1 = CAS_DEFAULT_T1;
-    cas_cfg.T2 = CAS_DEFAULT_T2;
-    cas_cfg.errDecayShift = CAS_DEFAULT_ERR_DECAY;
-    cas_cfg.enablePlanarLiteFlat = false;
-    cas_cfg.enablePlanarLiteDiag = true;
-    cas_cfg.zeroBiasDelta = CAS_DEFAULT_ZERO_BIAS_DELTA;
-    ActivePredictor predictor(cas_cfg, 0, 255);
+    ActivePredictor::Config mwr_cfg;
+    ActivePredictor predictor(mwr_cfg, 0, 255);
 #endif
 
     GolombResidualEntropyDecoder entropy_decoder;

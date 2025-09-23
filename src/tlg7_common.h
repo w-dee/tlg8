@@ -95,11 +95,9 @@ namespace tlg::v7
     return inv;
   }();
 
-  inline constexpr int CAS_DEFAULT_T1 = 3;
-  inline constexpr int CAS_DEFAULT_T2 = 7;
-  inline constexpr int CAS_DEFAULT_ERR_DECAY = 4;
-  inline constexpr int CAS_DEFAULT_ZERO_BIAS_DELTA = 3;
-  inline constexpr int CAS_ADAPT_HIGH_ACTIVITY = 128;
+  inline constexpr int MWR_DEFAULT_T2 = 100; // 7;
+  inline constexpr int MWR_DEFAULT_Td = 100; // 6;
+  inline constexpr int MWR_DEFAULT_Tc = 3;   // 3;
 
   template <typename T>
   void reorder_to_hilbert(std::vector<T> &values)
@@ -142,59 +140,36 @@ namespace tlg::v7
 
   int sample_pixel(const detail::image<uint8_t> &img, int x, int y);
 
-  class CAS8
+  class MWR
   {
   public:
-    enum class Class : uint8_t
+    enum class PredId : uint8_t
     {
-      FLAT = 0,
-      HORZ = 1,
-      VERT = 2,
-      DIAG = 3
-    };
-
-    enum PredId : uint8_t
-    {
-      P0 = 0,
-      P1,
-      P2,
-      P3,
-      P4,
-      P5,
-      P6,
-      P7,
-      Pp,
-      PRED_COUNT
+      MED = 0,
+      LEFT,
+      TOP,
+      DIAG_NE,
+      DIAG_NW
     };
 
     struct Config
     {
-      int T1 = CAS_DEFAULT_T1;
-      int T2 = CAS_DEFAULT_T2;
-      int errDecayShift = CAS_DEFAULT_ERR_DECAY;
-      bool enablePlanarLiteFlat = false;
-      bool enablePlanarLiteDiag = true;
-      int zeroBiasDelta = CAS_DEFAULT_ZERO_BIAS_DELTA;
+      int T2 = MWR_DEFAULT_T2;
+      int Td = MWR_DEFAULT_Td;
+      int Tc = MWR_DEFAULT_Tc;
     };
 
     struct State
     {
-      std::array<uint16_t, PRED_COUNT> errScore{};
-      void update(PredId pid, int abs_e, int decay)
-      {
-        const uint16_t prev = errScore[pid];
-        const uint16_t dec = static_cast<uint16_t>(prev - (prev >> decay));
-        errScore[pid] = static_cast<uint16_t>(dec + std::min(abs_e, 0xFFFF));
-      }
     };
 
-    CAS8(Config cfg, int lo, int hi) : cfg_(cfg), lo_(lo), hi_(hi) {}
+    MWR() : cfg_{}, lo_(0), hi_(255) {}
+    MWR(Config cfg, int lo, int hi) : cfg_(cfg), lo_(lo), hi_(hi) {}
 
     template <typename T>
-    std::pair<int, PredId> predict_and_choose(int a, int b, int c, int d, int f, const State &st) const
+    std::pair<int, PredId> predict_and_choose(int a, int b, int c, int d, int f, const State &) const
     {
-      const Class cl = classify_(a, b, c);
-      const PredId pid = select_(st, cl, a, b);
+      const PredId pid = select_(a, b, c, d, f);
       return {predict_<T>(pid, a, b, c, d, f), pid};
     }
 
@@ -204,96 +179,42 @@ namespace tlg::v7
       return predict_<T>(pid, a, b, c, d, f);
     }
 
-    void update_state(State &st, PredId pid, int abs_e) const
-    {
-      st.update(pid, abs_e, cfg_.errDecayShift);
-    }
-
-    void update_state(State &st, PredId pid, int abs_e, int Dh, int Dv) const
-    {
-      const int high = std::max(Dh, Dv);
-      const int shift = (high >= CAS_ADAPT_HIGH_ACTIVITY) ? std::max(1, cfg_.errDecayShift - 1) : cfg_.errDecayShift;
-      st.update(pid, abs_e, shift);
-    }
+    void update_state(State &, PredId, int) const {}
+    void update_state(State &, PredId, int, int, int) const {}
 
   private:
-    static inline int iabs_(int v) { return v < 0 ? -v : v; }
-
-    Class classify_(int a, int b, int c) const
+    static inline int abs_diff_(int x, int y)
     {
-      const int Dh = iabs_(a - b);
-      const int Dv = iabs_(b - c);
-      if (Dh <= cfg_.T1 && Dv <= cfg_.T1)
-        return Class::FLAT;
+      return (x >= y) ? (x - y) : (y - x);
+    }
+
+    PredId select_(int a, int b, int c, int d, int f) const
+    {
+      const int Dh = abs_diff_(a, b);
+      const int Dv = abs_diff_(b, c);
+      const int Dc = abs_diff_(a, c);
+
       if ((Dh - Dv) >= cfg_.T2)
-        return Class::VERT;
+      {
+        if (abs_diff_(d, b) <= cfg_.Tc)
+          return PredId::LEFT;
+      }
+
       if ((Dv - Dh) >= cfg_.T2)
-        return Class::HORZ;
-      return Class::DIAG;
-    }
+      {
+        if (abs_diff_(f, b) <= cfg_.Tc)
+          return PredId::TOP;
+      }
 
-    PredId select_(const State &st, Class cl, int a, int b) const
-    {
-      switch (cl)
+      if (Dc >= cfg_.Td)
       {
-      case Class::FLAT:
-      {
-        if (iabs_(a - b) <= 1)
-          return P2;
-        const bool allow_planar = cfg_.enablePlanarLiteFlat;
-        const PredId secondary = (allow_planar && st.errScore[Pp] < st.errScore[P3]) ? Pp : P3;
-        return tie_break_zero_friendly_(st, P2, secondary);
+        if (abs_diff_(d, b) <= cfg_.Tc)
+          return PredId::DIAG_NE;
+        if (abs_diff_(f, a) <= cfg_.Tc)
+          return PredId::DIAG_NW;
       }
-      case Class::VERT:
-      {
-        if (iabs_(a - b) <= 1)
-          return P0;
-        return tie_break_zero_friendly_(st, P0, P6);
-      }
-      case Class::HORZ:
-      {
-        if (iabs_(a - b) <= 1)
-          return P1;
-        return tie_break_zero_friendly_(st, P1, P7);
-      }
-      case Class::DIAG:
-      default:
-      {
-        const PredId tilt = (st.errScore[P4] <= st.errScore[P5]) ? P4 : P5;
-        PredId primary = P3;
-        if (cfg_.enablePlanarLiteDiag && st.errScore[Pp] < st.errScore[primary])
-          primary = Pp;
-        return tie_break_zero_friendly_(st, primary, tilt);
-      }
-      }
-    }
 
-    PredId tie_break_zero_friendly_(const State &st, PredId first, PredId second) const
-    {
-      const uint16_t ef = st.errScore[first];
-      const uint16_t es = st.errScore[second];
-      if (ef == es)
-      {
-        if (is_zero_friendly_(first))
-          return first;
-        if (is_zero_friendly_(second))
-          return second;
-        return first;
-      }
-      const int diff = static_cast<int>(ef) - static_cast<int>(es);
-      if (iabs_(diff) <= cfg_.zeroBiasDelta)
-      {
-        const bool first_zero = is_zero_friendly_(first);
-        const bool second_zero = is_zero_friendly_(second);
-        if (first_zero != second_zero)
-          return first_zero ? first : second;
-      }
-      return (ef < es) ? first : second;
-    }
-
-    static inline bool is_zero_friendly_(PredId pid)
-    {
-      return pid == P2 || pid == P0 || pid == P1;
+      return PredId::MED;
     }
 
     template <typename T>
@@ -307,37 +228,37 @@ namespace tlg::v7
     }
 
     template <typename T>
-    int predict_(PredId pid, int a, int b, int c, int d, int f) const
+    int predict_(PredId pid, int a, int b, int c, int /*d*/, int /*f*/) const
     {
       switch (pid)
       {
-      case P0:
+      case PredId::LEFT:
         return clip_<T>(a);
-      case P1:
+      case PredId::TOP:
         return clip_<T>(b);
-      case P2:
-        return clip_<T>((a + b + 1) >> 1);
-      case P3:
-        return clip_<T>(a + b - c);
-      case P4:
-        return clip_<T>(a + ((b - c) >> 1));
-      case P5:
-        return clip_<T>(b + ((a - c) >> 1));
-      case P6:
-        return clip_<T>(((a << 1) + b - c + 2) >> 2);
-      case P7:
-        return clip_<T>((a + (b << 1) - c + 2) >> 2);
-      case Pp:
-      {
-        if (!(cfg_.enablePlanarLiteFlat || cfg_.enablePlanarLiteDiag))
-          return clip_<T>(a + b - c);
-        const int Hx = (a - c) + (b - d);
-        const int Vy = (b - c) + (f - b);
-        return clip_<T>(a + ((Hx + Vy + 2) >> 2));
-      }
+      case PredId::DIAG_NE:
+        return clip_<T>(b + (a - c));
+      case PredId::DIAG_NW:
+        return clip_<T>(a + (b - c));
+      case PredId::MED:
       default:
-        return clip_<T>(b);
+        return med_predict_<T>(a, b, c);
       }
+    }
+
+    template <typename T>
+    int med_predict_(int a, int b, int c) const
+    {
+      const int max_ab = std::max(a, b);
+      const int min_ab = std::min(a, b);
+      int pred;
+      if (c >= max_ab)
+        pred = min_ab;
+      else if (c <= min_ab)
+        pred = max_ab;
+      else
+        pred = a + b - c;
+      return clip_<T>(pred);
     }
 
     Config cfg_;
@@ -397,7 +318,7 @@ namespace tlg::v7
   using ActivePredictor = MedPredictor;
 
 #else
-  using ActivePredictor = CAS8;
+  using ActivePredictor = MWR;
 #endif
 
   void apply_color_filter(int code,
