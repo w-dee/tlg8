@@ -1,3 +1,6 @@
+# Analysis temporary
+/analysis/
+
 # Build directories
 /build/
 /build-*/
