@@ -21,10 +21,10 @@ namespace tlg::v7
     using GolombTable = std::array<GolombRow, GOLOMB_N_COUNT>;
 
     constexpr GolombTable DEFAULT_GOLOMB_TABLE = {
-        GolombRow{3, 6, 15, 23, 54, 130, 261, 518, 14},
-        GolombRow{2, 4, 9, 16, 60, 145, 269, 514, 5},
-        GolombRow{3, 6, 15, 23, 54, 130, 261, 518, 14},
-        GolombRow{2, 4, 9, 16, 60, 145, 269, 514, 5},
+        GolombRow{3, 8, 16, 30, 61, 101, 221, 455, 129},
+        GolombRow{3, 6, 16, 28, 61, 105, 221, 455, 129},
+        GolombRow{2, 6, 12, 30, 63, 102, 221, 459, 129},
+        GolombRow{2, 4, 11, 28, 64, 104, 223, 459, 129},
     };
 
     GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
@@ -170,7 +170,7 @@ namespace tlg::v7
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            a += m>>1;
+            a += m >> 1;
             if (--n < 0)
             {
               a >>= 1;
