@@ -106,7 +106,7 @@ def write_table(path: Path, table: Sequence[Sequence[int]]) -> None:
 
 def mutate_table(table: Sequence[Sequence[int]], rng: random.Random) -> List[List[int]]:
     original = [list(row) for row in table]
-    for _ in range(64):
+    for _ in range(1):
         candidate = [row[:] for row in original]
         change_count = rng.randint(1, GOLOMB_ROWS)
         changed = False
