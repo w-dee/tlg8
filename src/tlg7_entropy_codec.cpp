@@ -170,12 +170,12 @@ namespace tlg::v7
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            a += m >> 1;
             if (--n < 0)
             {
               a >>= 1;
               n = GOLOMB_N_COUNT - 1;
             }
+            a += m >> 1;
           }
           i = ii - 1;
         }
@@ -322,7 +322,6 @@ namespace tlg::v7
           int sign = (m & 1) - 1;
           int vv = m >> 1;
           int residual = (vv ^ sign) + sign + 1;
-          a += m >> 1;
 
           out.push_back(static_cast<int16_t>(residual));
 
@@ -331,6 +330,7 @@ namespace tlg::v7
             a >>= 1;
             n = GOLOMB_N_COUNT - 1;
           }
+          a += m >> 1;
         }
 
         expect_nonzero = false;
