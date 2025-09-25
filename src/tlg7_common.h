@@ -207,8 +207,7 @@ namespace tlg::v7
   template <typename T>
   inline int avg_predict(int a, int b, int c)
   {
-    (void)c;
-    const int pred = (a + b + 1) >> 1;
+    const int pred = (a + b + c + 2) * ((uint32_t)65536UL / 3) >> 16; // (a + b + c) / 3
     return clip_to_pixel_range<T>(pred);
   }
 
