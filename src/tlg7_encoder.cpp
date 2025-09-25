@@ -167,15 +167,15 @@ namespace tlg::v7
       return result;
     }
 
-    void encode_block_component(const BlockContext &ctx,
-                                const std::vector<uint8_t> &block_values,
-                                ActivePredictor &predictor,
-                                ActivePredictor::State &state,
-                                detail::image<uint8_t> &plane,
-                                std::vector<int16_t> &residual_out)
+    void compute_block_residuals(const BlockContext &ctx,
+                                 const std::vector<uint8_t> &block_values,
+                                 const detail::image<uint8_t> &reference_plane,
+                                 PredictorMode mode,
+                                 std::vector<int16_t> &residual_out)
     {
       const std::size_t pixel_count = ctx.bw * ctx.bh;
       residual_out.resize(pixel_count);
+      std::vector<uint8_t> local_plane(pixel_count, 0);
       std::size_t idx = 0;
       for (std::size_t y = 0; y < ctx.bh; ++y)
       {
@@ -185,23 +185,34 @@ namespace tlg::v7
           const int gy = static_cast<int>(ctx.y0 + y);
           const uint8_t value = block_values[idx];
 
-          const int a = sample_pixel(plane, gx - 1, gy);
-          const int b = sample_pixel(plane, gx, gy - 1);
-          const int cdiag = sample_pixel(plane, gx - 1, gy - 1);
-          const int d = sample_pixel(plane, gx + 1, gy - 1);
-          const int f = sample_pixel(plane, gx, gy - 2);
+          const int a = (x > 0) ? local_plane[y * ctx.bw + (x - 1)]
+                                : sample_pixel(reference_plane, gx - 1, gy);
+          const int b = (y > 0) ? local_plane[(y - 1) * ctx.bw + x]
+                                : sample_pixel(reference_plane, gx, gy - 1);
+          const int cdiag = (x > 0 && y > 0) ? local_plane[(y - 1) * ctx.bw + (x - 1)]
+                                             : sample_pixel(reference_plane, gx - 1, gy - 1);
 
-          auto [pred, pid] = predictor.predict_and_choose<uint8_t>(a, b, cdiag, d, f, state);
-          const int residual = static_cast<int>(value) - pred;
-          residual_out[idx] = static_cast<int16_t>(residual);
-          const int Dh = std::abs(a - b);
-          const int Dv = std::abs(b - cdiag);
-          predictor.update_state(state, pid, std::abs(residual), Dh, Dv);
-          plane.row_ptr(ctx.y0 + y)[ctx.x0 + x] = value;
+          const int pred = apply_predictor<uint8_t>(mode, a, b, cdiag);
+          residual_out[idx] = static_cast<int16_t>(static_cast<int>(value) - pred);
+          local_plane[y * ctx.bw + x] = value;
           ++idx;
         }
       }
     }
+
+    inline uint8_t pack_filter_predictor(int filter_code, PredictorMode mode)
+    {
+      const int predictor_bit = (mode == PredictorMode::AVG) ? 1 : 0;
+      return static_cast<uint8_t>((filter_code << 1) | predictor_bit);
+    }
+
+    struct BlockCandidate
+    {
+      PredictorMode mode = PredictorMode::MED;
+      int filter_code = 0;
+      uint64_t bit_cost = std::numeric_limits<uint64_t>::max();
+      std::vector<std::vector<int16_t>> residuals;
+    };
 
   } // namespace
 
@@ -295,13 +306,6 @@ namespace tlg::v7
       for (std::size_t i = 0; i < component_count; ++i)
         filtered_planes.emplace_back(width, height, 0);
 
-#ifdef TLG7_USE_MED_PREDICTOR
-      ActivePredictor predictor;
-#else
-      ActivePredictor::Config mwr_cfg;
-      ActivePredictor predictor(mwr_cfg, 0, 255);
-#endif
-
       GolombResidualEntropyEncoder entropy_encoder;
       std::vector<uint8_t> encoded_stream;
 
@@ -314,8 +318,6 @@ namespace tlg::v7
         std::vector<std::vector<int16_t>> chunk_residuals(component_count);
         for (auto &vec : chunk_residuals)
           vec.reserve(chunk_pixels);
-
-        std::vector<ActivePredictor::State> states(component_count);
 
         const std::size_t chunk_block_row_start = chunk_y0 / BLOCK_SIZE;
         const std::size_t chunk_block_row_end = std::min<std::size_t>((chunk_y0 + chunk_height + BLOCK_SIZE - 1) / BLOCK_SIZE, blocks_y);
@@ -334,50 +336,85 @@ namespace tlg::v7
             for (std::size_t c = 0; c < component_count; ++c)
               copy_block_from_plane(planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_values[c]);
 
-            std::vector<std::vector<int16_t>> block_residuals(component_count);
-            for (std::size_t c = 0; c < component_count; ++c)
+            BlockCandidate best_candidate;
+            bool has_candidate = false;
+
+            for (PredictorMode mode : PREDICTOR_CANDIDATES)
             {
-              encode_block_component(ctx, block_values[c], predictor, states[c], filtered_planes[c], block_residuals[c]);
+              BlockCandidate cand;
+              cand.mode = mode;
+              cand.residuals.resize(component_count);
+
+              for (std::size_t c = 0; c < component_count; ++c)
+                compute_block_residuals(ctx, block_values[c], filtered_planes[c], mode, cand.residuals[c]);
+
+              int filter_code = 0;
+              if (component_count >= 3)
+              {
+                if (fast_mode)
+                {
+                  std::vector<int16_t> filtered_b;
+                  std::vector<int16_t> filtered_g;
+                  std::vector<int16_t> filtered_r;
+                  filter_code = choose_filter_fast(cand.residuals[0], cand.residuals[1], cand.residuals[2], filtered_b, filtered_g, filtered_r);
+                  cand.residuals[0] = std::move(filtered_b);
+                  cand.residuals[1] = std::move(filtered_g);
+                  cand.residuals[2] = std::move(filtered_r);
+                }
+                else
+                {
+                  auto selection = choose_filter_optimal(ctx,
+                                                         cand.residuals[0],
+                                                         cand.residuals[1],
+                                                         cand.residuals[2]);
+                  filter_code = selection.code;
+                  cand.residuals[0] = std::move(selection.filtered[0]);
+                  cand.residuals[1] = std::move(selection.filtered[1]);
+                  cand.residuals[2] = std::move(selection.filtered[2]);
+                }
+              }
+
+              cand.filter_code = filter_code;
+
+              uint64_t total_bits = 0;
+              for (std::size_t c = 0; c < component_count; ++c)
+              {
+                std::vector<int16_t> tmp = cand.residuals[c];
+                if (is_full_block)
+                  reorder_to_hilbert(tmp);
+                total_bits += estimate_residual_bits(tmp, c);
+                if (total_bits >= std::numeric_limits<uint64_t>::max())
+                  break;
+              }
+              cand.bit_cost = total_bits;
+
+              if (!has_candidate || cand.bit_cost < best_candidate.bit_cost)
+              {
+                best_candidate = std::move(cand);
+                has_candidate = true;
+              }
             }
 
-            int filter_code = 0;
-            if (component_count >= 3)
+            if (!has_candidate)
             {
-              if (fast_mode)
-              {
-                std::vector<int16_t> filtered_b;
-                std::vector<int16_t> filtered_g;
-                std::vector<int16_t> filtered_r;
-                filter_code = choose_filter_fast(block_residuals[0], block_residuals[1], block_residuals[2], filtered_b, filtered_g, filtered_r);
-                block_residuals[0] = std::move(filtered_b);
-                block_residuals[1] = std::move(filtered_g);
-                block_residuals[2] = std::move(filtered_r);
-              }
-              else
-              {
-                auto selection = choose_filter_optimal(ctx,
-                                                       block_residuals[0],
-                                                       block_residuals[1],
-                                                       block_residuals[2]);
-                filter_code = selection.code;
-                block_residuals[0] = std::move(selection.filtered[0]);
-                block_residuals[1] = std::move(selection.filtered[1]);
-                block_residuals[2] = std::move(selection.filtered[2]);
-              }
+              err = "tlg7: predictor evaluation failed";
+              return false;
             }
 
-            filter_indices[ctx.index] = static_cast<uint8_t>(filter_code);
+            filter_indices[ctx.index] = pack_filter_predictor(best_candidate.filter_code, best_candidate.mode);
 
             for (std::size_t c = 0; c < component_count; ++c)
             {
+              std::vector<int16_t> residual = std::move(best_candidate.residuals[c]);
               if (is_full_block)
-                reorder_to_hilbert(block_residuals[c]);
+                reorder_to_hilbert(residual);
               if (dump_file)
-                dump_residual_block(dump_file.get(), c, ctx, block_residuals[c]);
-              chunk_residuals[c].insert(chunk_residuals[c].end(),
-                                        block_residuals[c].begin(),
-                                        block_residuals[c].end());
+                dump_residual_block(dump_file.get(), c, ctx, residual);
+              chunk_residuals[c].insert(chunk_residuals[c].end(), residual.begin(), residual.end());
             }
+
+            for (std::size_t c = 0; c < component_count; ++c)
+              store_block_to_plane(filtered_planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_values[c]);
           }
         }
 

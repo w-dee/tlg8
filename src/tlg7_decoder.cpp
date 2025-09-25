@@ -52,13 +52,6 @@ namespace tlg::v7
       output_planes.emplace_back(width, height, 0);
     }
 
-#ifdef TLG7_USE_MED_PREDICTOR
-    ActivePredictor predictor;
-#else
-    ActivePredictor::Config mwr_cfg;
-    ActivePredictor predictor(mwr_cfg, 0, 255);
-#endif
-
     GolombResidualEntropyDecoder entropy_decoder;
     std::vector<uint8_t> encoded_stream;
 
@@ -90,7 +83,6 @@ namespace tlg::v7
         }
       }
 
-      std::vector<ActivePredictor::State> states(component_count);
       std::vector<std::size_t> residual_cursor(component_count, 0);
 
       const std::size_t chunk_block_row_start = chunk_y0 / BLOCK_SIZE;
@@ -117,9 +109,13 @@ namespace tlg::v7
               reorder_from_hilbert(block_residuals[c]);
           }
 
+          const uint8_t packed_filter = filter_indices.empty() ? 0 : filter_indices[ctx.index];
+          const PredictorMode predictor_mode = (packed_filter & 1) ? PredictorMode::AVG : PredictorMode::MED;
+          const int filter_code = packed_filter >> 1;
+
           if (component_count >= 3)
           {
-            undo_color_filter(filter_indices[ctx.index], block_residuals[0], block_residuals[1], block_residuals[2]);
+            undo_color_filter(filter_code, block_residuals[0], block_residuals[1], block_residuals[2]);
           }
 
           std::vector<std::vector<uint8_t>> block_pixels(component_count);
@@ -138,10 +134,7 @@ namespace tlg::v7
                 const int a = sample_pixel(filtered_planes[c], gx - 1, gy);
                 const int b = sample_pixel(filtered_planes[c], gx, gy - 1);
                 const int cdiag = sample_pixel(filtered_planes[c], gx - 1, gy - 1);
-                const int d = sample_pixel(filtered_planes[c], gx + 1, gy - 1);
-                const int f = sample_pixel(filtered_planes[c], gx, gy - 2);
-
-                auto [pred, pid] = predictor.predict_and_choose<uint8_t>(a, b, cdiag, d, f, states[c]);
+                const int pred = apply_predictor<uint8_t>(predictor_mode, a, b, cdiag);
                 int recon = pred + block_residuals[c][idx];
                 if (recon < 0)
                   recon = 0;
@@ -150,10 +143,6 @@ namespace tlg::v7
 
                 filtered_planes[c].row_ptr(ctx.y0 + y)[ctx.x0 + x] = static_cast<uint8_t>(recon);
                 block_pixels[c][idx] = static_cast<uint8_t>(recon);
-
-                const int Dh = std::abs(a - b);
-                const int Dv = std::abs(b - cdiag);
-                predictor.update_state(states[c], pid, std::abs(recon - pred), Dh, Dv);
                 ++idx;
               }
             }

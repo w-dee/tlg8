@@ -22,7 +22,7 @@ namespace tlg::v7
   inline constexpr int COLOR_FILTER_PRIMARY_PREDICTORS = 4;
   inline constexpr int COLOR_FILTER_SECONDARY_PREDICTORS = 4;
   inline constexpr int COLOR_FILTER_CODE_COUNT = COLOR_FILTER_PERMUTATIONS * COLOR_FILTER_PRIMARY_PREDICTORS *
-                                                COLOR_FILTER_SECONDARY_PREDICTORS;
+                                                 COLOR_FILTER_SECONDARY_PREDICTORS;
 
   inline constexpr std::array<uint8_t, 64> HILBERT8x8 = {
 
@@ -101,9 +101,15 @@ namespace tlg::v7
     return inv;
   }();
 
-  inline constexpr int MWR_DEFAULT_T2 = 100; // 7;
-  inline constexpr int MWR_DEFAULT_Td = 100; // 6;
-  inline constexpr int MWR_DEFAULT_Tc = 3;   // 3;
+  enum class PredictorMode : uint8_t
+  {
+    MED = 0,
+    AVG = 1
+  };
+
+  inline constexpr std::array<PredictorMode, 2> PREDICTOR_CANDIDATES = {
+      PredictorMode::MED,
+      PredictorMode::AVG};
 
   template <typename T>
   void reorder_to_hilbert(std::vector<T> &values)
@@ -146,186 +152,53 @@ namespace tlg::v7
 
   int sample_pixel(const detail::image<uint8_t> &img, int x, int y);
 
-  class MWR
+  template <typename T>
+  inline int clip_to_pixel_range(int v)
   {
-  public:
-    enum class PredId : uint8_t
-    {
-      MED = 0,
-      LEFT,
-      TOP,
-      DIAG_NE,
-      DIAG_NW
-    };
+    const int lo = static_cast<int>(std::numeric_limits<T>::min());
+    const int hi = static_cast<int>(std::numeric_limits<T>::max());
+    if (v < lo)
+      return lo;
+    if (v > hi)
+      return hi;
+    return v;
+  }
 
-    struct Config
-    {
-      int T2 = MWR_DEFAULT_T2;
-      int Td = MWR_DEFAULT_Td;
-      int Tc = MWR_DEFAULT_Tc;
-    };
-
-    struct State
-    {
-    };
-
-    MWR() : cfg_{}, lo_(0), hi_(255) {}
-    MWR(Config cfg, int lo, int hi) : cfg_(cfg), lo_(lo), hi_(hi) {}
-
-    template <typename T>
-    std::pair<int, PredId> predict_and_choose(int a, int b, int c, int d, int f, const State &) const
-    {
-      const PredId pid = select_(a, b, c, d, f);
-      return {predict_<T>(pid, a, b, c, d, f), pid};
-    }
-
-    template <typename T>
-    int predict_only(PredId pid, int a, int b, int c, int d, int f) const
-    {
-      return predict_<T>(pid, a, b, c, d, f);
-    }
-
-    void update_state(State &, PredId, int) const {}
-    void update_state(State &, PredId, int, int, int) const {}
-
-  private:
-    static inline int abs_diff_(int x, int y)
-    {
-      return (x >= y) ? (x - y) : (y - x);
-    }
-
-    PredId select_(int a, int b, int c, int d, int f) const
-    {
-      const int Dh = abs_diff_(a, b);
-      const int Dv = abs_diff_(b, c);
-      const int Dc = abs_diff_(a, c);
-
-      if ((Dh - Dv) >= cfg_.T2)
-      {
-        if (abs_diff_(d, b) <= cfg_.Tc)
-          return PredId::LEFT;
-      }
-
-      if ((Dv - Dh) >= cfg_.T2)
-      {
-        if (abs_diff_(f, b) <= cfg_.Tc)
-          return PredId::TOP;
-      }
-
-      if (Dc >= cfg_.Td)
-      {
-        if (abs_diff_(d, b) <= cfg_.Tc)
-          return PredId::DIAG_NE;
-        if (abs_diff_(f, a) <= cfg_.Tc)
-          return PredId::DIAG_NW;
-      }
-
-      return PredId::MED;
-    }
-
-    template <typename T>
-    int clip_(int v) const
-    {
-      if (v < lo_)
-        v = lo_;
-      else if (v > hi_)
-        v = hi_;
-      return static_cast<int>(static_cast<T>(v));
-    }
-
-    template <typename T>
-    int predict_(PredId pid, int a, int b, int c, int /*d*/, int /*f*/) const
-    {
-      switch (pid)
-      {
-      case PredId::LEFT:
-        return clip_<T>(a);
-      case PredId::TOP:
-        return clip_<T>(b);
-      case PredId::DIAG_NE:
-        return clip_<T>(b + (a - c));
-      case PredId::DIAG_NW:
-        return clip_<T>(a + (b - c));
-      case PredId::MED:
-      default:
-        return med_predict_<T>(a, b, c);
-      }
-    }
-
-    template <typename T>
-    int med_predict_(int a, int b, int c) const
-    {
-      const int max_ab = std::max(a, b);
-      const int min_ab = std::min(a, b);
-      int pred;
-      if (c >= max_ab)
-        pred = min_ab;
-      else if (c <= min_ab)
-        pred = max_ab;
-      else
-        pred = a + b - c;
-      return clip_<T>(pred);
-    }
-
-    Config cfg_;
-    int lo_;
-    int hi_;
-  };
-
-#ifdef TLG7_USE_MED_PREDICTOR
-
-  // MED predictor mirrors the TLG6 "// MED method" implementation for single-channel data.
-  class MedPredictor
+  template <typename T>
+  inline int med_predict(int a, int b, int c)
   {
-  public:
-    using PredId = uint8_t;
-    struct State
-    {
-    };
+    const int max_ab = std::max(a, b);
+    const int min_ab = std::min(a, b);
+    int pred;
+    if (c >= max_ab)
+      pred = min_ab;
+    else if (c <= min_ab)
+      pred = max_ab;
+    else
+      pred = a + b - c;
+    return clip_to_pixel_range<T>(pred);
+  }
 
-    template <typename T>
-    std::pair<int, PredId> predict_and_choose(int a, int b, int c, int d, int f, const State &) const
-    {
-      return {predict_only<T>(static_cast<PredId>(0), a, b, c, d, f), static_cast<PredId>(0)};
-    }
+  template <typename T>
+  inline int avg_predict(int a, int b)
+  {
+    const int pred = (a + b + 1) >> 1;
+    return clip_to_pixel_range<T>(pred);
+  }
 
-    template <typename T>
-    int predict_only(PredId, int a, int b, int c, int, int) const
+  template <typename T>
+  inline int apply_predictor(PredictorMode mode, int a, int b, int c)
+  {
+    switch (mode)
     {
+    case PredictorMode::MED:
+      return med_predict<T>(a, b, c);
+    case PredictorMode::AVG:
+      return avg_predict<T>(a, b);
+    default:
       return med_predict<T>(a, b, c);
     }
-
-    void update_state(State &, PredId, int) const {}
-    void update_state(State &, PredId, int, int, int) const {}
-
-  private:
-    template <typename T>
-    static int med_predict(int a, int b, int c)
-    {
-      const int max_ab = std::max(a, b);
-      const int min_ab = std::min(a, b);
-      int pred;
-      if (c >= max_ab)
-        pred = min_ab;
-      else if (c <= min_ab)
-        pred = max_ab;
-      else
-        pred = a + b - c;
-      const int lo = static_cast<int>(std::numeric_limits<T>::min());
-      const int hi = static_cast<int>(std::numeric_limits<T>::max());
-      if (pred < lo)
-        pred = lo;
-      else if (pred > hi)
-        pred = hi;
-      return pred;
-    }
-  };
-
-  using ActivePredictor = MedPredictor;
-
-#else
-  using ActivePredictor = MWR;
-#endif
+  }
 
   void apply_color_filter(int code,
                           std::vector<int16_t> &b,
