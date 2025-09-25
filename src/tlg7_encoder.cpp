@@ -54,20 +54,27 @@ namespace tlg::v7
       tb.reserve(src_b.size());
       tg.reserve(src_g.size());
       tr.reserve(src_r.size());
-      for (int code = 0; code < 32; ++code)
+      for (int perm = 0; perm < COLOR_FILTER_PERMUTATIONS; ++perm)
       {
-        tb.assign(src_b.begin(), src_b.end());
-        tg.assign(src_g.begin(), src_g.end());
-        tr.assign(src_r.begin(), src_r.end());
-        apply_color_filter(code, tb, tg, tr);
-        const std::int64_t score = estimate_sequence_cost(tb) + estimate_sequence_cost(tg) + estimate_sequence_cost(tr);
-        if (score < best_score)
+        for (int primary = 0; primary < COLOR_FILTER_PRIMARY_PREDICTORS; ++primary)
         {
-          best_score = score;
-          best_code = code;
-          dst_b = tb;
-          dst_g = tg;
-          dst_r = tr;
+          for (int secondary = 0; secondary < COLOR_FILTER_SECONDARY_PREDICTORS; ++secondary)
+          {
+            const int code = (perm << 4) | (primary << 2) | secondary;
+            tb.assign(src_b.begin(), src_b.end());
+            tg.assign(src_g.begin(), src_g.end());
+            tr.assign(src_r.begin(), src_r.end());
+            apply_color_filter(code, tb, tg, tr);
+            const std::int64_t score = estimate_sequence_cost(tb) + estimate_sequence_cost(tg) + estimate_sequence_cost(tr);
+            if (score < best_score)
+            {
+              best_score = score;
+              best_code = code;
+              dst_b = tb;
+              dst_g = tg;
+              dst_r = tr;
+            }
+          }
         }
       }
       return best_code;
@@ -126,27 +133,34 @@ namespace tlg::v7
 
       uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
-      for (int code = 0; code < 32; ++code)
+      for (int perm = 0; perm < COLOR_FILTER_PERMUTATIONS; ++perm)
       {
-        std::array<std::vector<int16_t>, 3> candidate = {residual_b, residual_g, residual_r};
-        apply_color_filter(code, candidate[0], candidate[1], candidate[2]);
-
-        uint64_t total_bits = 0;
-        for (std::size_t c = 0; c < candidate.size(); ++c)
+        for (int primary = 0; primary < COLOR_FILTER_PRIMARY_PREDICTORS; ++primary)
         {
-          std::vector<int16_t> tmp = candidate[c];
-          if (is_full_block)
-            reorder_to_hilbert(tmp);
-          total_bits += estimate_residual_bits(tmp, c);
-          if (total_bits >= best_bits)
-            break;
-        }
+          for (int secondary = 0; secondary < COLOR_FILTER_SECONDARY_PREDICTORS; ++secondary)
+          {
+            const int code = (perm << 4) | (primary << 2) | secondary;
+            std::array<std::vector<int16_t>, 3> candidate = {residual_b, residual_g, residual_r};
+            apply_color_filter(code, candidate[0], candidate[1], candidate[2]);
 
-        if (total_bits < best_bits)
-        {
-          best_bits = total_bits;
-          result.code = code;
-          result.filtered = std::move(candidate);
+            uint64_t total_bits = 0;
+            for (std::size_t c = 0; c < candidate.size(); ++c)
+            {
+              std::vector<int16_t> tmp = candidate[c];
+              if (is_full_block)
+                reorder_to_hilbert(tmp);
+              total_bits += estimate_residual_bits(tmp, c);
+              if (total_bits >= best_bits)
+                break;
+            }
+
+            if (total_bits < best_bits)
+            {
+              best_bits = total_bits;
+              result.code = code;
+              result.filtered = std::move(candidate);
+            }
+          }
         }
       }
 

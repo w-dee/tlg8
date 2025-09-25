@@ -18,6 +18,12 @@ namespace tlg::v7
   inline constexpr std::size_t BLOCK_SIZE = 8;
   inline constexpr std::size_t CHUNK_SCAN_LINES = 64;
 
+  inline constexpr int COLOR_FILTER_PERMUTATIONS = 6;
+  inline constexpr int COLOR_FILTER_PRIMARY_PREDICTORS = 4;
+  inline constexpr int COLOR_FILTER_SECONDARY_PREDICTORS = 4;
+  inline constexpr int COLOR_FILTER_CODE_COUNT = COLOR_FILTER_PERMUTATIONS * COLOR_FILTER_PRIMARY_PREDICTORS *
+                                                COLOR_FILTER_SECONDARY_PREDICTORS;
+
   inline constexpr std::array<uint8_t, 64> HILBERT8x8 = {
 
       /* 0*/ 8 * 0 + 0,

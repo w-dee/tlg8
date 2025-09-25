@@ -83,209 +83,115 @@ namespace tlg::v7
     return img.row_ptr(uy)[ux];
   }
 
+  namespace
+  {
+    constexpr std::array<std::array<uint8_t, 3>, COLOR_FILTER_PERMUTATIONS> kColorPermutations = {
+        std::array<uint8_t, 3>{0, 1, 2},
+        std::array<uint8_t, 3>{0, 2, 1},
+        std::array<uint8_t, 3>{1, 0, 2},
+        std::array<uint8_t, 3>{1, 2, 0},
+        std::array<uint8_t, 3>{2, 0, 1},
+        std::array<uint8_t, 3>{2, 1, 0},
+    };
+
+    struct ColorFilterParams
+    {
+      int perm = 0;
+      int primary = 0;
+      int secondary = 0;
+    };
+
+    [[maybe_unused]] constexpr int make_color_filter_code(int perm, int primary, int secondary)
+    {
+      return (perm << 4) | (primary << 2) | secondary;
+    }
+
+    inline ColorFilterParams decode_color_filter_code(int code)
+    {
+      if (code < 0)
+        code = 0;
+      if (code >= COLOR_FILTER_CODE_COUNT)
+        code %= COLOR_FILTER_CODE_COUNT;
+
+      const int perm_raw = (code >> 4) & 0x7;
+      const int primary = (code >> 2) & 0x3;
+      const int secondary = code & 0x3;
+      const int perm = (perm_raw < COLOR_FILTER_PERMUTATIONS)
+                           ? perm_raw
+                           : (perm_raw % COLOR_FILTER_PERMUTATIONS);
+
+      return {perm,
+              primary % COLOR_FILTER_PRIMARY_PREDICTORS,
+              secondary % COLOR_FILTER_SECONDARY_PREDICTORS};
+    }
+
+    inline int predict_primary(int mode, int c0)
+    {
+      switch (mode & 0x3)
+      {
+      case 0:
+        return 0;
+      case 1:
+        return c0;
+      case 2:
+        return c0 / 2;
+      case 3:
+        return (3 * c0) / 2;
+      default:
+        return 0;
+      }
+    }
+
+    inline int predict_secondary(int mode, int c0, int reference1)
+    {
+      switch (mode & 0x3)
+      {
+      case 0:
+        return 0;
+      case 1:
+        return c0;
+      case 2:
+        return reference1;
+      case 3:
+        return (c0 + reference1) / 2;
+      default:
+        return 0;
+      }
+    }
+  } // namespace
+
   void apply_color_filter(int code,
                           std::vector<int16_t> &b,
                           std::vector<int16_t> &g,
                           std::vector<int16_t> &r)
   {
     const std::size_t n = b.size();
-    switch (code)
-    {
-    case 0:
+    if (n == 0 || g.size() != n || r.size() != n)
       return;
-    case 1:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] - g[i]);
-        b[i] = static_cast<int16_t>(b[i] - g[i]);
-      }
-      break;
-    case 2:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] - g[i]);
-        g[i] = static_cast<int16_t>(g[i] - b[i]);
-      }
-      break;
-    case 3:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] - g[i]);
-        g[i] = static_cast<int16_t>(g[i] - r[i]);
-      }
-      break;
-    case 4:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] - g[i]);
-        g[i] = static_cast<int16_t>(g[i] - b[i]);
-        b[i] = static_cast<int16_t>(b[i] - r[i]);
-      }
-      break;
-    case 5:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] - b[i]);
-        b[i] = static_cast<int16_t>(b[i] - r[i]);
-      }
-      break;
-    case 6:
-      for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<int16_t>(b[i] - g[i]);
-      break;
-    case 7:
-      for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<int16_t>(g[i] - b[i]);
-      break;
-    case 8:
-      for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<int16_t>(r[i] - g[i]);
-      break;
-    case 9:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] - g[i]);
-        g[i] = static_cast<int16_t>(g[i] - r[i]);
-        r[i] = static_cast<int16_t>(r[i] - b[i]);
-      }
-      break;
-    case 10:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] - r[i]);
-        b[i] = static_cast<int16_t>(b[i] - r[i]);
-      }
-      break;
-    case 11:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] - b[i]);
-        g[i] = static_cast<int16_t>(g[i] - b[i]);
-      }
-      break;
-    case 12:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] - r[i]);
-        r[i] = static_cast<int16_t>(r[i] - b[i]);
-      }
-      break;
-    case 13:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] - r[i]);
-        r[i] = static_cast<int16_t>(r[i] - b[i]);
-        b[i] = static_cast<int16_t>(b[i] - g[i]);
-      }
-      break;
-    case 14:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] - b[i]);
-        b[i] = static_cast<int16_t>(b[i] - g[i]);
-        g[i] = static_cast<int16_t>(g[i] - r[i]);
-      }
-      break;
-    case 15:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        const int16_t t = static_cast<int16_t>(b[i] << 1);
-        r[i] = static_cast<int16_t>(r[i] - t);
-        g[i] = static_cast<int16_t>(g[i] - t);
-      }
-      break;
-    case 16:
-      for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<int16_t>(g[i] - r[i]);
-      break;
-    case 17:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] - b[i]);
-        b[i] = static_cast<int16_t>(b[i] - g[i]);
-      }
-      break;
-    case 18:
-      for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<int16_t>(r[i] - b[i]);
-      break;
-    case 19:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] - r[i]);
-        r[i] = static_cast<int16_t>(r[i] - g[i]);
-      }
-      break;
-    case 20:
-      for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<int16_t>(b[i] - r[i]);
-      break;
-    case 21:
-      for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<int16_t>(b[i] - (g[i] >> 1));
-      break;
-    case 22:
-      for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<int16_t>(g[i] - (b[i] >> 1));
-      break;
-    case 23:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] - g[i]);
-        b[i] = static_cast<int16_t>(b[i] - r[i]);
-        g[i] = static_cast<int16_t>(g[i] - b[i]);
-      }
-      break;
-    case 24:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] - b[i]);
-        r[i] = static_cast<int16_t>(r[i] - g[i]);
-        b[i] = static_cast<int16_t>(b[i] - r[i]);
-      }
-      break;
-    case 25:
-      for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<int16_t>(g[i] - (r[i] >> 1));
-      break;
-    case 26:
-      for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<int16_t>(r[i] - (g[i] >> 1));
-      break;
-    case 27:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        const int16_t t = static_cast<int16_t>(r[i] >> 1);
-        b[i] = static_cast<int16_t>(b[i] - t);
-        g[i] = static_cast<int16_t>(g[i] - t);
-      }
-      break;
-    case 28:
-      for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<int16_t>(r[i] - (b[i] >> 1));
-      break;
-    case 29:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        const int16_t t = static_cast<int16_t>(g[i] >> 1);
-        b[i] = static_cast<int16_t>(b[i] - t);
-        r[i] = static_cast<int16_t>(r[i] - t);
-      }
-      break;
-    case 30:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        const int16_t t = static_cast<int16_t>(b[i] >> 1);
-        g[i] = static_cast<int16_t>(g[i] - t);
-        r[i] = static_cast<int16_t>(r[i] - t);
-      }
-      break;
-    case 31:
-      for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<int16_t>(b[i] - (r[i] >> 1));
-      break;
-    default:
-      break;
+
+    const ColorFilterParams params = decode_color_filter_code(code);
+    const auto &perm = kColorPermutations[static_cast<std::size_t>(params.perm)];
+
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      const std::array<int, 3> source = {
+          static_cast<int>(b[i]),
+          static_cast<int>(g[i]),
+          static_cast<int>(r[i])};
+
+      const int d0 = source[perm[0]];
+      const int d1 = source[perm[1]];
+      const int d2 = source[perm[2]];
+
+      const int predicted1 = predict_primary(params.primary, d0);
+      const int predicted2 = predict_secondary(params.secondary, d0, d1);
+
+      const int residual1 = d1 - predicted1;
+      const int residual2 = d2 - predicted2;
+
+      b[i] = static_cast<int16_t>(d0);
+      g[i] = static_cast<int16_t>(residual1);
+      r[i] = static_cast<int16_t>(residual2);
     }
   }
 
@@ -295,203 +201,30 @@ namespace tlg::v7
                          std::vector<int16_t> &r)
   {
     const std::size_t n = b.size();
-    switch (code)
-    {
-    case 0:
+    if (n == 0 || g.size() != n || r.size() != n)
       return;
-    case 1:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] + g[i]);
-        r[i] = static_cast<int16_t>(r[i] + g[i]);
-      }
-      break;
-    case 2:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] + b[i]);
-        r[i] = static_cast<int16_t>(r[i] + g[i]);
-      }
-      break;
-    case 3:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] + r[i]);
-        b[i] = static_cast<int16_t>(b[i] + g[i]);
-      }
-      break;
-    case 4:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] + r[i]);
-        g[i] = static_cast<int16_t>(g[i] + b[i]);
-        r[i] = static_cast<int16_t>(r[i] + g[i]);
-      }
-      break;
-    case 5:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] + r[i]);
-        g[i] = static_cast<int16_t>(g[i] + b[i]);
-      }
-      break;
-    case 6:
-      for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<int16_t>(b[i] + g[i]);
-      break;
-    case 7:
-      for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<int16_t>(g[i] + b[i]);
-      break;
-    case 8:
-      for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<int16_t>(r[i] + g[i]);
-      break;
-    case 9:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] + b[i]);
-        g[i] = static_cast<int16_t>(g[i] + r[i]);
-        b[i] = static_cast<int16_t>(b[i] + g[i]);
-      }
-      break;
-    case 10:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] + r[i]);
-        g[i] = static_cast<int16_t>(g[i] + r[i]);
-      }
-      break;
-    case 11:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] + b[i]);
-        r[i] = static_cast<int16_t>(r[i] + b[i]);
-      }
-      break;
-    case 12:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] + b[i]);
-        g[i] = static_cast<int16_t>(g[i] + r[i]);
-      }
-      break;
-    case 13:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] + g[i]);
-        r[i] = static_cast<int16_t>(r[i] + b[i]);
-        g[i] = static_cast<int16_t>(g[i] + r[i]);
-      }
-      break;
-    case 14:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] + r[i]);
-        b[i] = static_cast<int16_t>(b[i] + g[i]);
-        r[i] = static_cast<int16_t>(r[i] + b[i]);
-      }
-      break;
-    case 15:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        const int16_t t = static_cast<int16_t>(b[i] << 1);
-        g[i] = static_cast<int16_t>(g[i] + t);
-        r[i] = static_cast<int16_t>(r[i] + t);
-      }
-      break;
-    case 16:
-      for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<int16_t>(g[i] + r[i]);
-      break;
-    case 17:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] + g[i]);
-        r[i] = static_cast<int16_t>(r[i] + b[i]);
-      }
-      break;
-    case 18:
-      for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<int16_t>(r[i] + b[i]);
-      break;
-    case 19:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        r[i] = static_cast<int16_t>(r[i] + g[i]);
-        b[i] = static_cast<int16_t>(b[i] + r[i]);
-      }
-      break;
-    case 20:
-      for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<int16_t>(b[i] + r[i]);
-      break;
-    case 21:
-      for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<int16_t>(b[i] + (g[i] >> 1));
-      break;
-    case 22:
-      for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<int16_t>(g[i] + (b[i] >> 1));
-      break;
-    case 23:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        g[i] = static_cast<int16_t>(g[i] + b[i]);
-        b[i] = static_cast<int16_t>(b[i] + r[i]);
-        r[i] = static_cast<int16_t>(r[i] + g[i]);
-      }
-      break;
-    case 24:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        b[i] = static_cast<int16_t>(b[i] + r[i]);
-        r[i] = static_cast<int16_t>(r[i] + g[i]);
-        g[i] = static_cast<int16_t>(g[i] + b[i]);
-      }
-      break;
-    case 25:
-      for (std::size_t i = 0; i < n; ++i)
-        g[i] = static_cast<int16_t>(g[i] + (r[i] >> 1));
-      break;
-    case 26:
-      for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<int16_t>(r[i] + (g[i] >> 1));
-      break;
-    case 27:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        const int16_t t = static_cast<int16_t>(r[i] >> 1);
-        b[i] = static_cast<int16_t>(b[i] + t);
-        g[i] = static_cast<int16_t>(g[i] + t);
-      }
-      break;
-    case 28:
-      for (std::size_t i = 0; i < n; ++i)
-        r[i] = static_cast<int16_t>(r[i] + (b[i] >> 1));
-      break;
-    case 29:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        const int16_t t = static_cast<int16_t>(g[i] >> 1);
-        b[i] = static_cast<int16_t>(b[i] + t);
-        r[i] = static_cast<int16_t>(r[i] + t);
-      }
-      break;
-    case 30:
-      for (std::size_t i = 0; i < n; ++i)
-      {
-        const int16_t t = static_cast<int16_t>(b[i] >> 1);
-        g[i] = static_cast<int16_t>(g[i] + t);
-        r[i] = static_cast<int16_t>(r[i] + t);
-      }
-      break;
-    case 31:
-      for (std::size_t i = 0; i < n; ++i)
-        b[i] = static_cast<int16_t>(b[i] + (r[i] >> 1));
-      break;
-    default:
-      break;
+
+    const ColorFilterParams params = decode_color_filter_code(code);
+    const auto &perm = kColorPermutations[static_cast<std::size_t>(params.perm)];
+
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      const int c0 = static_cast<int>(b[i]);
+      const int c1 = static_cast<int>(g[i]);
+      const int c2 = static_cast<int>(r[i]);
+
+      const int restored0 = c0;
+      const int restored1 = c1 + predict_primary(params.primary, restored0);
+      const int restored2 = c2 + predict_secondary(params.secondary, restored0, restored1);
+
+      std::array<int, 3> destination = {0, 0, 0};
+      destination[perm[0]] = restored0;
+      destination[perm[1]] = restored1;
+      destination[perm[2]] = restored2;
+
+      b[i] = static_cast<int16_t>(destination[0]);
+      g[i] = static_cast<int16_t>(destination[1]);
+      r[i] = static_cast<int16_t>(destination[2]);
     }
   }
 
