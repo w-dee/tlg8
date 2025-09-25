@@ -180,8 +180,9 @@ namespace tlg::v7
   }
 
   template <typename T>
-  inline int avg_predict(int a, int b)
+  inline int avg_predict(int a, int b, int c)
   {
+    (void)c;
     const int pred = (a + b + 1) >> 1;
     return clip_to_pixel_range<T>(pred);
   }
@@ -194,7 +195,7 @@ namespace tlg::v7
     case PredictorMode::MED:
       return med_predict<T>(a, b, c);
     case PredictorMode::AVG:
-      return avg_predict<T>(a, b);
+      return avg_predict<T>(a, b, c);
     default:
       return med_predict<T>(a, b, c);
     }

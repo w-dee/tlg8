@@ -98,17 +98,19 @@ namespace tlg::v7
     void dump_residual_block(FILE *fp,
                              std::size_t component_index,
                              const BlockContext &ctx,
-                             const std::vector<int16_t> &residuals)
+                             const std::vector<int16_t> &residuals,
+                             const uint16_t sideinfo)
     {
       if (!fp)
         return;
 
       const std::size_t block_x = ctx.x0 / BLOCK_SIZE;
       const std::size_t block_y = ctx.y0 / BLOCK_SIZE;
-      std::fprintf(fp, "# Color component %zu at block %zu,%zu\n",
+      std::fprintf(fp, "# Color component %zu at block %zu,%zu sideinfo:0x%02x\n",
                    component_index,
                    block_x,
-                   block_y);
+                   block_y,
+                   sideinfo);
 
       for (std::size_t i = 0; i < residuals.size(); ++i)
       {
@@ -411,11 +413,11 @@ namespace tlg::v7
             {
               std::vector<int16_t> residual = std::move(best_candidate.residuals[c]);
               if (dump_file && dump_before_hilbert)
-                dump_residual_block(dump_file.get(), c, ctx, residual);
+                dump_residual_block(dump_file.get(), c, ctx, residual, static_cast<uint16_t>(filter_indices[ctx.index]));
               if (is_full_block)
                 reorder_to_hilbert(residual);
               if (dump_file && dump_after_hilbert)
-                dump_residual_block(dump_file.get(), c, ctx, residual);
+                dump_residual_block(dump_file.get(), c, ctx, residual, static_cast<uint16_t>(filter_indices[ctx.index]));
               chunk_residuals[c].insert(chunk_residuals[c].end(), residual.begin(), residual.end());
             }
 
