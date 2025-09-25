@@ -93,6 +93,31 @@ namespace tlg::v7
 
   };
 
+  inline constexpr std::array<uint8_t, 64> ZIGZAG8x8_NW = {
+      0, 1, 8, 16, 9, 2, 3, 10,
+      17, 24, 32, 25, 18, 11, 4, 5, 12,
+      19, 26, 33, 40, 48, 41, 34, 27, 20,
+      13, 6, 7, 14, 21, 28, 35, 42, 49,
+      56, 57, 50, 43, 36, 29, 22,
+      15, 23, 30, 37, 44, 51, 58,
+      59, 52, 45, 38, 31,
+      39, 46, 53, 60,
+      61, 54, 47,
+      55, 62, 63};
+
+  // mirror of ZIGZAG8x8_NW
+  inline constexpr std::array<uint8_t, 64> ZIGZAG8x8_NE = []
+  {
+    std::array<uint8_t, 64> mirror{};
+    for (uint8_t i = 0; i < 64; ++i)
+    {
+      int x = i % 8;
+      int y = i / 8;
+      mirror[i] = ZIGZAG8x8_NW[y * 8 + (7 - x)];
+    }
+    return mirror;
+  }();
+
   inline constexpr std::array<uint8_t, 64> HILBERT8x8_INV = []
   {
     std::array<uint8_t, 64> inv{};
