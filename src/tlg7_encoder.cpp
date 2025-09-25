@@ -18,9 +18,10 @@ namespace tlg::v7
   namespace
   {
 
-    uint64_t estimate_residual_bits(const std::vector<int16_t> &residuals)
+    uint64_t estimate_residual_bits(const std::vector<int16_t> &residuals, std::size_t component_index)
     {
       static thread_local GolombResidualEntropyEncoder encoder;
+      encoder.set_component_index(component_index);
       return encoder.estimate_bits(residuals);
     }
 
@@ -131,12 +132,12 @@ namespace tlg::v7
         apply_color_filter(code, candidate[0], candidate[1], candidate[2]);
 
         uint64_t total_bits = 0;
-        for (auto &component : candidate)
+        for (std::size_t c = 0; c < candidate.size(); ++c)
         {
-          std::vector<int16_t> tmp = component;
+          std::vector<int16_t> tmp = candidate[c];
           if (is_full_block)
             reorder_to_hilbert(tmp);
-          total_bits += estimate_residual_bits(tmp);
+          total_bits += estimate_residual_bits(tmp, c);
           if (total_bits >= best_bits)
             break;
         }
@@ -378,6 +379,7 @@ namespace tlg::v7
         for (std::size_t c = 0; c < component_count; ++c)
         {
           uint32_t bit_length = 0;
+          entropy_encoder.set_component_index(c);
           entropy_encoder.encode(chunk_residuals[c], encoded_stream, bit_length);
           tlg::detail::write_u32le(fp, bit_length);
           const std::size_t byte_count = (bit_length + 7u) / 8u;

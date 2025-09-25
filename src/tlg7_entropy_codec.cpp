@@ -14,13 +14,24 @@ namespace tlg::v7
 {
   namespace
   {
-    constexpr int GOLOMB_N_COUNT = 2;
+    constexpr int GOLOMB_N_COUNT = 6;
+    constexpr int GOLOMB_ROWS_PER_COMPONENT = 2;
+    constexpr int GOLOMB_COMPONENT_PAIR_COUNT = GOLOMB_N_COUNT / GOLOMB_ROWS_PER_COMPONENT;
     constexpr int GOLOMB_ROW_SUM = 1024;
 
     using GolombRow = std::array<uint16_t, 9>;
     using GolombTable = std::array<GolombRow, GOLOMB_N_COUNT>;
 
+    static_assert(GOLOMB_ROWS_PER_COMPONENT > 0, "invalid Golomb rows per component");
+    static_assert(GOLOMB_COMPONENT_PAIR_COUNT > 0, "invalid Golomb component pair count");
+    static_assert(GOLOMB_COMPONENT_PAIR_COUNT * GOLOMB_ROWS_PER_COMPONENT == GOLOMB_N_COUNT,
+                  "Golomb row constants inconsistent");
+
     constexpr GolombTable DEFAULT_GOLOMB_TABLE = {
+        GolombRow{3, 8, 16, 30, 61, 101, 221, 455, 129},
+        GolombRow{3, 6, 16, 28, 61, 105, 221, 455, 129},
+        GolombRow{3, 8, 16, 30, 61, 101, 221, 455, 129},
+        GolombRow{3, 6, 16, 28, 61, 105, 221, 455, 129},
         GolombRow{3, 8, 16, 30, 61, 101, 221, 455, 129},
         GolombRow{3, 6, 16, 28, 61, 105, 221, 455, 129},
     };
@@ -28,6 +39,14 @@ namespace tlg::v7
     GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
     unsigned char GolombBitLengthTable[GOLOMB_ROW_SUM][GOLOMB_N_COUNT];
     bool golomb_tables_ready = false;
+
+    inline int component_row_base(std::size_t component_index)
+    {
+      const std::size_t pair_index = (component_index < static_cast<std::size_t>(GOLOMB_COMPONENT_PAIR_COUNT))
+                                         ? component_index
+                                         : static_cast<std::size_t>(GOLOMB_COMPONENT_PAIR_COUNT - 1);
+      return static_cast<int>(pair_index * static_cast<std::size_t>(GOLOMB_ROWS_PER_COMPONENT));
+    }
 
     inline void init_golomb_tables()
     {
@@ -125,7 +144,9 @@ namespace tlg::v7
       int bit_pos_ = 0;
     };
 
-    void compress_residuals_golomb(GolombBitStream &bs, const std::vector<int16_t> &buf)
+    void compress_residuals_golomb(GolombBitStream &bs,
+                                   const std::vector<int16_t> &buf,
+                                   std::size_t component_index)
     {
       if (buf.empty())
         return;
@@ -133,7 +154,9 @@ namespace tlg::v7
       init_golomb_tables();
 
       bs.PutValue(buf[0] ? 1 : 0, 1);
-      int n = GOLOMB_N_COUNT - 1;
+      const int row_base = component_row_base(component_index);
+      const int row_max = row_base + (GOLOMB_ROWS_PER_COMPONENT - 1);
+      int n = row_max;
       int a = 0;
       int count = 0;
       const size_t size = buf.size();
@@ -168,10 +191,10 @@ namespace tlg::v7
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            if (--n < 0)
+            if (--n < row_base)
             {
               a >>= 1;
-              n = GOLOMB_N_COUNT - 1;
+              n = row_max;
             }
             a += m >> 1;
           }
@@ -260,7 +283,8 @@ namespace tlg::v7
     bool decode_residuals_golomb(const uint8_t *data,
                                  size_t size,
                                  size_t expected_count,
-                                 std::vector<int16_t> &out)
+                                 std::vector<int16_t> &out,
+                                 std::size_t component_index)
     {
       out.clear();
       out.reserve(expected_count);
@@ -279,7 +303,9 @@ namespace tlg::v7
 
       bool expect_nonzero = (first_bit != 0);
       int a = 0;
-      int n = GOLOMB_N_COUNT - 1;
+      const int row_base = component_row_base(component_index);
+      const int row_max = row_base + (GOLOMB_ROWS_PER_COMPONENT - 1);
+      int n = row_max;
 
       while (out.size() < expected_count)
       {
@@ -323,10 +349,10 @@ namespace tlg::v7
 
           out.push_back(static_cast<int16_t>(residual));
 
-          if (--n < 0)
+          if (--n < row_base)
           {
             a >>= 1;
-            n = GOLOMB_N_COUNT - 1;
+            n = row_max;
           }
           a += m >> 1;
         }
@@ -345,7 +371,7 @@ namespace tlg::v7
   {
     out.clear();
     GolombBitStream bs(out);
-    compress_residuals_golomb(bs, residuals);
+    compress_residuals_golomb(bs, residuals, component_index_);
     bit_length = static_cast<uint32_t>(bs.GetBitLength());
     bs.Flush();
     const std::size_t expected_bytes = (bit_length + 7u) / 8u;
@@ -357,7 +383,7 @@ namespace tlg::v7
   {
     std::vector<uint8_t> tmp;
     GolombBitStream bs(tmp);
-    compress_residuals_golomb(bs, residuals);
+    compress_residuals_golomb(bs, residuals, component_index_);
     return bs.GetBitLength();
   }
 
@@ -366,7 +392,7 @@ namespace tlg::v7
                                             std::size_t expected_count,
                                             std::vector<int16_t> &out)
   {
-    return decode_residuals_golomb(data, size, expected_count, out);
+    return decode_residuals_golomb(data, size, expected_count, out, component_index_);
   }
 
   bool configure_golomb_table(const std::string &path, std::string &err)
@@ -389,11 +415,10 @@ namespace tlg::v7
       return false;
     }
 
-    GolombTable candidate{};
-    std::size_t row = 0;
-
     std::string line;
     std::size_t line_number = 0;
+    std::vector<GolombRow> parsed_rows;
+    parsed_rows.reserve(static_cast<std::size_t>(GOLOMB_N_COUNT));
 
     while (std::getline(in, line))
     {
@@ -405,12 +430,13 @@ namespace tlg::v7
       if (line.find_first_not_of(" \t\r\n") == std::string::npos)
         continue;
 
-      if (row >= GOLOMB_N_COUNT)
+      if (parsed_rows.size() >= static_cast<std::size_t>(GOLOMB_N_COUNT))
       {
         err = "tlg7: extra data in Golomb table '" + path + "' at line " + std::to_string(line_number);
         return false;
       }
 
+      const std::size_t row_index = parsed_rows.size();
       std::istringstream iss(line);
       GolombRow row_values{};
       int sum = 0;
@@ -420,12 +446,12 @@ namespace tlg::v7
       {
         if (value < 0)
         {
-          err = "tlg7: negative value in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+          err = "tlg7: negative value in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
           return false;
         }
         if (value > std::numeric_limits<uint16_t>::max())
         {
-          err = "tlg7: value too large in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+          err = "tlg7: value too large in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
           return false;
         }
         row_values[col++] = static_cast<uint16_t>(value);
@@ -440,31 +466,55 @@ namespace tlg::v7
         }
         else
         {
-          err = "tlg7: expected 9 values in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+          err = "tlg7: expected 9 values in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
         }
         return false;
       }
 
       if (iss >> value)
       {
-        err = "tlg7: too many values in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+        err = "tlg7: too many values in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
         return false;
       }
 
       if (sum != GOLOMB_ROW_SUM)
       {
-        err = "tlg7: row sum must be 1024 in Golomb table '" + path + "' at row " + std::to_string(row + 1);
+        err = "tlg7: row sum must be 1024 in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
         return false;
       }
 
-      candidate[row++] = row_values;
+      parsed_rows.push_back(row_values);
     }
 
-    if (row != GOLOMB_N_COUNT)
+    if (parsed_rows.empty())
     {
-      err = "tlg7: Golomb table '" + path + "' must contain " + std::to_string(GOLOMB_N_COUNT) + " rows";
+      err = "tlg7: Golomb table '" + path + "' must contain at least one row";
       return false;
     }
+
+    std::vector<GolombRow> expanded_rows;
+    const std::size_t parsed_count = parsed_rows.size();
+    if (parsed_count == static_cast<std::size_t>(GOLOMB_N_COUNT))
+    {
+      expanded_rows = parsed_rows;
+    }
+    else if (static_cast<std::size_t>(GOLOMB_N_COUNT) % parsed_count == 0)
+    {
+      const std::size_t repeat = static_cast<std::size_t>(GOLOMB_N_COUNT) / parsed_count;
+      expanded_rows.reserve(static_cast<std::size_t>(GOLOMB_N_COUNT));
+      for (std::size_t i = 0; i < repeat; ++i)
+        expanded_rows.insert(expanded_rows.end(), parsed_rows.begin(), parsed_rows.end());
+    }
+    else
+    {
+      err = "tlg7: Golomb table '" + path + "' must contain " + std::to_string(GOLOMB_N_COUNT) +
+            " rows or a divisor of that count";
+      return false;
+    }
+
+    GolombTable candidate{};
+    for (std::size_t i = 0; i < static_cast<std::size_t>(GOLOMB_N_COUNT); ++i)
+      candidate[i] = expanded_rows[i];
 
     if (candidate != g_golomb_table)
     {

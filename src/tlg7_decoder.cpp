@@ -82,6 +82,7 @@ namespace tlg::v7
           err = "tlg7: read residual stream";
           return false;
         }
+        entropy_decoder.set_component_index(c);
         if (!entropy_decoder.decode(encoded_stream.data(), encoded_stream.size(), chunk_pixels, chunk_residuals[c]))
         {
           err = "tlg7: residual decode error";

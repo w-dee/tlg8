@@ -14,6 +14,8 @@ DEFAULT_GOLOMB_TABLE: List[List[int]] = [
     [3, 5, 13, 24, 51, 95, 192, 384, 257],
     [3, 7, 15, 27, 63, 108, 223, 448, 130],
     [3, 5, 13, 24, 51, 95, 192, 384, 257],
+    [3, 7, 15, 27, 63, 108, 223, 448, 130],
+    [3, 5, 13, 24, 51, 95, 192, 384, 257],
 ]
 GOLOMB_ROW_SUM = 1024
 GOLOMB_ROWS = len(DEFAULT_GOLOMB_TABLE)
@@ -91,9 +93,23 @@ def load_table(path: Path) -> List[List[int]]:
             if sum(values) != GOLOMB_ROW_SUM:
                 raise ValueError(f"{path}: line {line_no}: row sum must be {GOLOMB_ROW_SUM}")
             rows.append(values)
-    if len(rows) != GOLOMB_ROWS:
-        raise ValueError(f"{path}: expected {GOLOMB_ROWS} rows, found {len(rows)}")
-    return rows
+
+    if not rows:
+        raise ValueError(f"{path}: no rows found")
+
+    if len(rows) == GOLOMB_ROWS:
+        return rows
+
+    if GOLOMB_ROWS % len(rows) == 0:
+        repeat = GOLOMB_ROWS // len(rows)
+        expanded: List[List[int]] = []
+        for _ in range(repeat):
+            expanded.extend([row[:] for row in rows])
+        return expanded
+
+    raise ValueError(
+        f"{path}: expected {GOLOMB_ROWS} rows or a divisor of that count, found {len(rows)}"
+    )
 
 
 def write_table(path: Path, table: Sequence[Sequence[int]]) -> None:
@@ -106,34 +122,40 @@ def write_table(path: Path, table: Sequence[Sequence[int]]) -> None:
 
 def mutate_table(table: Sequence[Sequence[int]], rng: random.Random) -> List[List[int]]:
     original = [list(row) for row in table]
-    for _ in range(1):
+    attempt = 0
+    while True:
         candidate = [row[:] for row in original]
         change_count = rng.randint(1, GOLOMB_ROWS)
         changed = False
         for _ in range(change_count):
             row_idx = rng.randrange(GOLOMB_ROWS)
             row = candidate[row_idx]
-            if not any(v > 0 for v in row):
+            positive_indices = [idx for idx, value in enumerate(row) if value > 0]
+            if not positive_indices:
                 continue
-            add_idx = rng.randrange(GOLOMB_COLS)
-            sub_idx = rng.randrange(GOLOMB_COLS)
-            while sub_idx == add_idx:
-                sub_idx = rng.randrange(GOLOMB_COLS)
-            if rng.choice((True, False)):
-                src_idx, dst_idx = sub_idx, add_idx
-            else:
-                src_idx, dst_idx = add_idx, sub_idx
-            if row[src_idx] == 0:
-                donors = [idx for idx, value in enumerate(row) if value > 0 and idx != dst_idx]
-                if not donors:
-                    continue
-                src_idx = rng.choice(donors)
+            src_idx = rng.choice(positive_indices)
+            dst_idx = rng.randrange(GOLOMB_COLS - 1)
+            if dst_idx >= src_idx:
+                dst_idx += 1
             row[src_idx] -= 1
             row[dst_idx] += 1
             changed = True
         if changed and candidate != original:
             return candidate
-    raise RuntimeError("failed to produce a mutated table")
+        attempt += 1
+        if attempt >= 100:
+            # Force a minimal change to guarantee progress.
+            forced = [row[:] for row in original]
+            row = forced[attempt % GOLOMB_ROWS]
+            donors = [idx for idx, value in enumerate(row) if value > 0]
+            if not donors:
+                attempt += 1
+                continue
+            src_idx = rng.choice(donors)
+            dst_idx = (src_idx + 1) % GOLOMB_COLS
+            row[src_idx] -= 1
+            row[dst_idx] += 1
+            return forced
 
 
 def evaluate_table(
@@ -213,6 +235,7 @@ def main() -> None:
 
     best_table = [row[:] for row in seed_table]
     best_size = evaluate_table(binary_path, images, best_table, work_dir, args.fast_mode)
+    search_table = [row[:] for row in best_table]
     size_initial = best_size
     write_table(best_table_path, best_table)
 
@@ -226,7 +249,7 @@ def main() -> None:
                 iteration += 1
                 futures = []
                 for _ in range(args.threads):
-                    candidate_table = mutate_table(best_table, rng)
+                    candidate_table = mutate_table(search_table, rng)
                     futures.append((executor.submit(
                         evaluate_table,
                         binary_path,
@@ -236,23 +259,29 @@ def main() -> None:
                         args.fast_mode,
                     ), candidate_table))
 
-                best_attempt = None
+                evaluated = []
                 for future, candidate_table in futures:
                     try:
                         candidate_size = future.result()
                     except Exception as exc:
                         print(f"[iter {iteration}] candidate failed: {exc}")
                         continue
-                    if best_attempt is None or candidate_size < best_attempt[0]:
-                        best_attempt = (candidate_size, candidate_table)
+                    evaluated.append((candidate_size, candidate_table))
 
-                if best_attempt is None:
+                if not evaluated:
                     raise RuntimeError("All candidate evaluations failed in this iteration")
 
-                candidate_size, candidate_table = best_attempt
-                if candidate_size < best_size:
+                evaluated.sort(key=lambda item: item[0])
+                best_attempt_size, best_attempt_table = evaluated[0]
+
+                improvements = [entry for entry in evaluated if entry[0] < best_size]
+                non_worse = [entry for entry in evaluated if entry[0] <= best_size]
+
+                if improvements:
+                    candidate_size, candidate_table = min(improvements, key=lambda item: item[0])
                     best_size = candidate_size
                     best_table = [row[:] for row in candidate_table]
+                    search_table = [row[:] for row in candidate_table]
                     write_table(best_table_path, best_table)
                     print(
                         f"[iter {iteration}] improvement: best={best_size} "
@@ -260,8 +289,18 @@ def main() -> None:
                     )
                 else:
                     print(
-                        f"[iter {iteration}] no improvement (candidate={candidate_size}, best={best_size})"
+                        f"[iter {iteration}] no improvement (best_candidate={best_attempt_size}, best={best_size})"
                     )
+                    if non_worse:
+                        candidate_size, candidate_table = rng.choice(non_worse)
+                        best_table = [row[:] for row in candidate_table]
+                        search_table = [row[:] for row in candidate_table]
+                        write_table(best_table_path, best_table)
+                        print(
+                            f"[iter {iteration}] adopting equal-size candidate as new seed (size={candidate_size})"
+                        )
+                    else:
+                        search_table = [row[:] for row in best_table]
 
                 print(
                     f"[iter {iteration}] size_initial={size_initial}, current_best={best_size}"
