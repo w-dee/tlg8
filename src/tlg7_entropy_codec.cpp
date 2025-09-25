@@ -14,7 +14,7 @@ namespace tlg::v7
 {
   namespace
   {
-    constexpr int GOLOMB_N_COUNT = 4;
+    constexpr int GOLOMB_N_COUNT = 2;
     constexpr int GOLOMB_ROW_SUM = 1024;
 
     using GolombRow = std::array<uint16_t, 9>;
@@ -23,8 +23,6 @@ namespace tlg::v7
     constexpr GolombTable DEFAULT_GOLOMB_TABLE = {
         GolombRow{3, 8, 16, 30, 61, 101, 221, 455, 129},
         GolombRow{3, 6, 16, 28, 61, 105, 221, 455, 129},
-        GolombRow{2, 6, 12, 30, 63, 102, 221, 459, 129},
-        GolombRow{2, 4, 11, 28, 64, 104, 223, 459, 129},
     };
 
     GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
