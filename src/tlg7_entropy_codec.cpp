@@ -22,20 +22,85 @@ namespace tlg::v7
     using GolombRow = std::array<uint16_t, 9>;
     using GolombTable = std::array<GolombRow, GOLOMB_N_COUNT>;
 
+    struct ParsedGolombTable
+    {
+      GolombTable table{};
+      bool filled = false;
+    };
+
+    constexpr bool is_whitespace(char c)
+    {
+      return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+    }
+
+    constexpr bool is_digit(char c)
+    {
+      return c >= '0' && c <= '9';
+    }
+
+    constexpr ParsedGolombTable parse_default_golomb_table()
+    {
+      constexpr char data[] = R"(
+1 4 7 18 55 103 238 476 122
+1 3 5 12 70 116 235 449 133
+2 3 8 30 76 86 230 452 137
+2 2 6 22 67 109 224 458 134
+2 4 9 29 62 91 242 455 130
+2 2 7 21 57 110 232 453 140
+
+)";
+
+      ParsedGolombTable result{};
+      std::size_t row = 0;
+      std::size_t col = 0;
+      std::size_t index = 0;
+      bool overflow = false;
+
+      while (index < sizeof(data) - 1)
+      {
+        while (index < sizeof(data) - 1 && is_whitespace(data[index]))
+          ++index;
+        if (index >= sizeof(data) - 1)
+          break;
+
+        uint16_t value = 0;
+        while (index < sizeof(data) - 1 && is_digit(data[index]))
+        {
+          value = static_cast<uint16_t>(value * 10 + static_cast<uint16_t>(data[index] - '0'));
+          ++index;
+        }
+
+        if (row < result.table.size())
+        {
+          result.table[row][col] = value;
+          ++col;
+          if (col == result.table[row].size())
+          {
+            col = 0;
+            ++row;
+          }
+        }
+        else
+        {
+          overflow = true;
+        }
+      }
+
+      result.filled = (row == result.table.size() && col == 0 && !overflow);
+      return result;
+    }
+
     static_assert(GOLOMB_ROWS_PER_COMPONENT > 0, "invalid Golomb rows per component");
     static_assert(GOLOMB_COMPONENT_PAIR_COUNT > 0, "invalid Golomb component pair count");
     static_assert(GOLOMB_COMPONENT_PAIR_COUNT * GOLOMB_ROWS_PER_COMPONENT == GOLOMB_N_COUNT,
                   "Golomb row constants inconsistent");
 
-    constexpr GolombTable DEFAULT_GOLOMB_TABLE = {
-        GolombRow{1, 4, 9, 24, 61, 100, 234, 464, 127},
-        GolombRow{1, 3, 7, 22, 70, 118, 225, 448, 130},
-        GolombRow{2, 4, 8, 31, 72, 91, 230, 457, 129},
-        GolombRow{2, 2, 6, 23, 67, 109, 220, 463, 132},
-        GolombRow{3, 4, 13, 33, 58, 90, 242, 451, 130},
-        GolombRow{2, 3, 11, 20, 60, 114, 227, 458, 129},
-
-    };
+    inline constexpr GolombTable DEFAULT_GOLOMB_TABLE = []() constexpr
+    {
+      constexpr auto parsed = parse_default_golomb_table();
+      static_assert(parsed.filled, "DEFAULT_GOLOMB_TABLE data is incomplete");
+      return parsed.table;
+    }();
 
     GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
     unsigned char GolombBitLengthTable[GOLOMB_ROW_SUM][GOLOMB_N_COUNT];
