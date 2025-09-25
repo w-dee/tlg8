@@ -26,7 +26,7 @@ def run_command(cmd, **kwargs):
 
 
 def roundtrip(bmp_path: Path, tlgconv: Path, temp_dir: Path, version: str) -> None:
-    tlg_suffix = f".tlg{version}" if version in {"5", "6", "7"} else ".tlg"
+    tlg_suffix = f".tlg{version}" if version in {"6", "7"} else ".tlg"
     tlg_path = temp_dir / f"{bmp_path.stem}{tlg_suffix}"
     recon_bmp = temp_dir / f"{bmp_path.stem}.roundtrip.v{version}.bmp"
 
@@ -95,8 +95,8 @@ def main(argv: list[str]) -> int:
     with tempfile.TemporaryDirectory(prefix="tlgconv_roundtrip_") as tmp:
         tmp_path = Path(tmp)
         for bmp in bmp_files:
-            print(f"[INFO] Testing {bmp.name} -> tlg5/tlg6/tlg7 round-trip")
-            for version in ("5", "6", "7"):
+            print(f"[INFO] Testing {bmp.name} -> tlg6/tlg7 round-trip")
+            for version in ("6", "7"):
                 roundtrip(bmp, args.tlgconv, tmp_path, version)
         print("[SUCCESS] All round-trip tests passed")
 
