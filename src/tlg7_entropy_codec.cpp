@@ -28,12 +28,12 @@ namespace tlg::v7
                   "Golomb row constants inconsistent");
 
     constexpr GolombTable DEFAULT_GOLOMB_TABLE = {
-        GolombRow{1, 4, 9, 26, 62, 102, 231, 463, 126},
-        GolombRow{1, 3, 6, 26, 68, 119, 226, 449, 126},
-        GolombRow{2, 4, 8, 33, 75, 90, 228, 456, 128},
-        GolombRow{2, 3, 7, 23, 64, 115, 219, 464, 127},
-        GolombRow{3, 5, 13, 31, 62, 90, 239, 452, 129},
-        GolombRow{2, 3, 10, 21, 64, 111, 232, 456, 125},
+        GolombRow{1, 4, 9, 24, 61, 100, 234, 464, 127},
+        GolombRow{1, 3, 7, 22, 70, 118, 225, 448, 130},
+        GolombRow{2, 4, 8, 31, 72, 91, 230, 457, 129},
+        GolombRow{2, 2, 6, 23, 67, 109, 220, 463, 132},
+        GolombRow{3, 4, 13, 33, 58, 90, 242, 451, 130},
+        GolombRow{2, 3, 11, 20, 60, 114, 227, 458, 129},
 
     };
 
