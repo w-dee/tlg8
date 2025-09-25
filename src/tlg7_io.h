@@ -197,6 +197,7 @@ namespace tlg::v7
                    int colors,
                    bool fast_mode,
                    const std::string &dump_residuals_path,
+                   TlgOptions::DumpResidualsOrder dump_residuals_order,
                    std::string &err);
 
   } // namespace enc

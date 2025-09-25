@@ -28,7 +28,8 @@ static void print_usage()
 {
   std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|png|bmp)>"
             << " [--tlg-version=5|6|7] [--pixel-format=auto|R8G8B8|A8R8G8B8] [--tlg7-fast]"
-            << " [--tlg7-golomb-table=<path>] [-tlg7-dump-residuals=<path>]\n";
+            << " [--tlg7-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
+            << " [--tlg7-dump-residuals-order=before|after]\n";
 }
 
 int main(int argc, char **argv)
@@ -95,6 +96,27 @@ int main(int argc, char **argv)
         return 2;
       }
       tlgopt.tlg7_dump_residuals_path = arg.substr(eq + 1);
+    }
+    else if ((arg.rfind("--tlg7-dump-residuals-order=", 0) == 0) ||
+             (arg.rfind("-tlg7-dump-residuals-order=", 0) == 0))
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg7-dump-residuals-order option\n";
+        return 2;
+      }
+      std::string order = arg.substr(eq + 1);
+      to_lower_inplace(order);
+      if (order == "before")
+        tlgopt.tlg7_dump_residuals_order = TlgOptions::DumpResidualsOrder::BeforeHilbert;
+      else if (order == "after")
+        tlgopt.tlg7_dump_residuals_order = TlgOptions::DumpResidualsOrder::AfterHilbert;
+      else
+      {
+        std::cerr << "Invalid --tlg7-dump-residuals-order: " << order << "\n";
+        return 2;
+      }
     }
     else if (arg == "-h" || arg == "--help")
     {

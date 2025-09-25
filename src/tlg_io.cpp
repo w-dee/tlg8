@@ -113,6 +113,7 @@ bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions 
                                  desired_colors,
                                  opt.tlg7_fast_mode,
                                  opt.tlg7_dump_residuals_path,
+                                 opt.tlg7_dump_residuals_order,
                                  err);
   }
   else if (opt.version == 6)

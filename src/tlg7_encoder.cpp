@@ -224,6 +224,7 @@ namespace tlg::v7
                    int colors,
                    bool fast_mode,
                    const std::string &dump_residuals_path,
+                   TlgOptions::DumpResidualsOrder dump_residuals_order,
                    std::string &err)
     {
       err.clear();
@@ -279,6 +280,9 @@ namespace tlg::v7
         }
         dump_file.reset(dump_fp);
       }
+
+      const bool dump_before_hilbert = (dump_residuals_order == TlgOptions::DumpResidualsOrder::BeforeHilbert);
+      const bool dump_after_hilbert = (dump_residuals_order == TlgOptions::DumpResidualsOrder::AfterHilbert);
 
       if (!detail::write_header(fp, hdr))
       {
@@ -406,9 +410,11 @@ namespace tlg::v7
             for (std::size_t c = 0; c < component_count; ++c)
             {
               std::vector<int16_t> residual = std::move(best_candidate.residuals[c]);
+              if (dump_file && dump_before_hilbert)
+                dump_residual_block(dump_file.get(), c, ctx, residual);
               if (is_full_block)
                 reorder_to_hilbert(residual);
-              if (dump_file)
+              if (dump_file && dump_after_hilbert)
                 dump_residual_block(dump_file.get(), c, ctx, residual);
               chunk_residuals[c].insert(chunk_residuals[c].end(), residual.begin(), residual.end());
             }
