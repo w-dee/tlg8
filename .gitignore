@@ -1,3 +1,6 @@
+# non-redistributable files
+/test/images/test*
+
 # Analysis temporary
 /analysis/
 
