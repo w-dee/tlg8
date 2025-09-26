@@ -25,7 +25,9 @@ def run_command(cmd, **kwargs):
     return result
 
 
-def roundtrip(bmp_path: Path, tlgconv: Path, temp_dir: Path, version: str) -> None:
+def roundtrip(
+    bmp_path: Path, tlgconv: Path, temp_dir: Path, version: str
+) -> tuple[bool, str | None]:
     tlg_suffix = f".tlg{version}" if version in {"6", "7"} else ".tlg"
     tlg_path = temp_dir / f"{bmp_path.stem}{tlg_suffix}"
     recon_bmp = temp_dir / f"{bmp_path.stem}.roundtrip.v{version}.bmp"
@@ -61,9 +63,12 @@ def roundtrip(bmp_path: Path, tlgconv: Path, temp_dir: Path, version: str) -> No
         raise SystemExit("ImageMagick 'compare' command not found: " + str(exc)) from exc
 
     if cmp_proc.returncode != 0:
-        raise SystemExit(
-            f"Mismatch detected for {bmp_path.name} (tlg{version} round-trip)"
+        return (
+            False,
+            f"Mismatch detected for {bmp_path.name} (tlg{version} round-trip)",
         )
+
+    return True, None
 
 
 
@@ -92,13 +97,25 @@ def main(argv: list[str]) -> int:
     if not bmp_files:
         raise SystemExit(f"No BMP files found in {args.images}")
 
+    mismatches: list[str] = []
+
     with tempfile.TemporaryDirectory(prefix="tlgconv_roundtrip_") as tmp:
         tmp_path = Path(tmp)
         for bmp in bmp_files:
             print(f"[INFO] Testing {bmp.name} -> tlg6/tlg7 round-trip")
             for version in ("6", "7"):
-                roundtrip(bmp, args.tlgconv, tmp_path, version)
-        print("[SUCCESS] All round-trip tests passed")
+                success, message = roundtrip(bmp, args.tlgconv, tmp_path, version)
+                if not success and message:
+                    print(f"[ERROR] {message}")
+                    mismatches.append(message)
+
+    if mismatches:
+        print("[FAILURE] Round-trip mismatches detected:")
+        for message in mismatches:
+            print(f"    - {message}")
+        return 1
+
+    print("[SUCCESS] All round-trip tests passed")
 
     return 0
 
