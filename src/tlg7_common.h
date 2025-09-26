@@ -153,7 +153,14 @@ namespace tlg::v7
 
   inline constexpr int SIDEINFO_BITS_PER_BLOCK = 11;
 
-  uint16_t pack_block_sideinfo(int filter_code, PredictorMode mode, int diff_index);
+  struct side_info
+  {
+    int filter_code;
+    PredictorMode mode;
+    int diff_index;
+  };
+
+  uint16_t pack_block_sideinfo(const side_info &info);
   int unpack_filter_code(uint16_t sideinfo);
   PredictorMode unpack_predictor_mode(uint16_t sideinfo);
   DiffFilterType unpack_diff_filter(uint16_t sideinfo);

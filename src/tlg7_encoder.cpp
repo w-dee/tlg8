@@ -17,6 +17,65 @@ namespace tlg::v7
 {
   namespace
   {
+    constexpr std::array<const char *, COLOR_FILTER_PERMUTATIONS> kPermutationNames = {
+        "BGR",
+        "BRG",
+        "GBR",
+        "GRB",
+        "RBG",
+        "RGB"};
+
+    constexpr std::array<const char *, COLOR_FILTER_PRIMARY_PREDICTORS> kPrimaryDescriptions = {
+        "0",
+        "c0",
+        "c0/2",
+        "3*c0/2"};
+
+    constexpr std::array<const char *, COLOR_FILTER_SECONDARY_PREDICTORS> kSecondaryDescriptions = {
+        "0",
+        "c0",
+        "r1",
+        "(c0+r1)/2"};
+
+    std::size_t wrap_index(int value, int modulo)
+    {
+      if (modulo <= 0)
+        return 0;
+      const int mod = value % modulo;
+      return static_cast<std::size_t>((mod < 0) ? mod + modulo : mod);
+    }
+
+    const char *describe_mode(PredictorMode mode)
+    {
+      switch (mode)
+      {
+      case PredictorMode::AVG:
+        return "AVG";
+      case PredictorMode::MED:
+      default:
+        return "MED";
+      }
+    }
+
+    const char *describe_diff(int diff_index)
+    {
+      switch (static_cast<DiffFilterType>(diff_index))
+      {
+      case DiffFilterType::NWSE:
+        return "NWSE";
+      case DiffFilterType::NESW:
+        return "NESW";
+      case DiffFilterType::HORZ:
+        return "HORZ";
+      case DiffFilterType::VERT:
+        return "VERT";
+      case DiffFilterType::None:
+        return "None";
+      case DiffFilterType::Count:
+      default:
+        return "Unknown";
+      }
+    }
 
     uint64_t estimate_residual_bits(const std::vector<int16_t> &residuals, std::size_t component_index)
     {
@@ -97,6 +156,7 @@ namespace tlg::v7
     struct FilterSelectionResult
     {
       int code = 0;
+      int total_bits = 0;
       std::array<std::vector<int16_t>, 3> filtered;
     };
 
@@ -113,18 +173,40 @@ namespace tlg::v7
                              std::size_t component_index,
                              const BlockContext &ctx,
                              const std::vector<int16_t> &residuals,
-                             const uint16_t sideinfo)
+                             const side_info &info,
+                             uint64_t bit_cost)
     {
       if (!fp)
         return;
 
       const std::size_t block_x = ctx.x0 / BLOCK_SIZE;
       const std::size_t block_y = ctx.y0 / BLOCK_SIZE;
-      std::fprintf(fp, "# Color component %zu at block %zu,%zu sideinfo:0x%03x\n",
+      const uint16_t packed = pack_block_sideinfo(info);
+      const int filter_code = info.filter_code;
+      const int perm_raw = (filter_code >> 4) & 0x7;
+      const int primary_idx = (filter_code >> 2) & 0x3;
+      const int secondary_idx = filter_code & 0x3;
+      const std::size_t perm_idx = wrap_index(perm_raw, COLOR_FILTER_PERMUTATIONS);
+      const char *perm_name = kPermutationNames[perm_idx];
+      const char *p0_desc = kPrimaryDescriptions[static_cast<std::size_t>(primary_idx) % kPrimaryDescriptions.size()];
+      const char *p1_desc = kSecondaryDescriptions[static_cast<std::size_t>(secondary_idx) % kSecondaryDescriptions.size()];
+      const char *mode_desc = describe_mode(info.mode);
+      const char *diff_desc = describe_diff(info.diff_index);
+
+      std::fprintf(fp, "# Color component %zu at block %zu,%zu\n",
                    component_index,
                    block_x,
-                   block_y,
-                   sideinfo);
+                   block_y);
+      std::fprintf(fp, "# filter_code: 0x%02X(perm=%s, P0=%s, P1=%s)\n",
+                   static_cast<unsigned>(filter_code & 0xFF),
+                   perm_name,
+                   p0_desc,
+                   p1_desc);
+      std::fprintf(fp, "# mode: %s\n", mode_desc);
+      std::fprintf(fp, "# diff: %s (packed=0x%03X, est_size=%d)\n",
+                   diff_desc,
+                   static_cast<unsigned>(packed),
+                   (int)bit_cost);
 
       for (std::size_t i = 0; i < residuals.size(); ++i)
       {
@@ -174,6 +256,7 @@ namespace tlg::v7
             {
               best_bits = total_bits;
               result.code = code;
+              result.total_bits = static_cast<int>(total_bits);
               result.filtered = std::move(candidate);
             }
           }
@@ -184,10 +267,10 @@ namespace tlg::v7
     }
 
     void compute_per_block_prediction(const BlockContext &ctx,
-                                 const std::vector<uint8_t> &block_values,
-                                 const detail::image<uint8_t> &reference_plane,
-                                 PredictorMode mode,
-                                 std::vector<int16_t> &residual_out)
+                                      const std::vector<uint8_t> &block_values,
+                                      const detail::image<uint8_t> &reference_plane,
+                                      PredictorMode mode,
+                                      std::vector<int16_t> &residual_out)
     {
       const std::size_t pixel_count = ctx.bw * ctx.bh;
       residual_out.resize(pixel_count);
@@ -451,20 +534,22 @@ namespace tlg::v7
               return false;
             }
 
-            const uint16_t sideinfo = pack_block_sideinfo(best_candidate.filter_code,
-                                                         best_candidate.mode,
-                                                         best_candidate.diff_filter_index);
-            chunk_sideinfo.push_back(sideinfo);
+            const side_info block_sideinfo{
+                best_candidate.filter_code,
+                best_candidate.mode,
+                best_candidate.diff_filter_index};
+            const uint16_t packed_sideinfo = pack_block_sideinfo(block_sideinfo);
+            chunk_sideinfo.push_back(packed_sideinfo);
 
             for (std::size_t c = 0; c < component_count; ++c)
             {
               std::vector<int16_t> residual = std::move(best_candidate.residuals[c]);
               if (dump_file && dump_before_hilbert)
-                dump_residual_block(dump_file.get(), c, ctx, residual, sideinfo);
+                dump_residual_block(dump_file.get(), c, ctx, residual, block_sideinfo, best_candidate.bit_cost);
               if (is_full_block)
                 reorder_to_hilbert(residual);
               if (dump_file && dump_after_hilbert)
-                dump_residual_block(dump_file.get(), c, ctx, residual, sideinfo);
+                dump_residual_block(dump_file.get(), c, ctx, residual, block_sideinfo, best_candidate.bit_cost);
               chunk_residuals[c].insert(chunk_residuals[c].end(), residual.begin(), residual.end());
             }
 

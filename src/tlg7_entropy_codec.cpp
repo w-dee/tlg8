@@ -184,6 +184,41 @@ namespace tlg::v7
         }
       }
 
+      // Encode zero-run lengths using a small fixed prefix table for short runs
+      // Codebook (prefix bits written in this order):
+      // 1 -> 0
+      // 2 -> 10
+      // 3 -> 110
+      // >=4 -> 111 + gamma(count-3)
+      void PutRunLength(int count)
+      {
+        if (count <= 0)
+          return;
+        if (count == 1)
+        {
+          Put1Bit(0);
+          return;
+        }
+        if (count == 2)
+        {
+          Put1Bit(1);
+          Put1Bit(0);
+          return;
+        }
+        if (count == 3)
+        {
+          Put1Bit(1);
+          Put1Bit(1);
+          Put1Bit(0);
+          return;
+        }
+        // count >= 4
+        Put1Bit(1);
+        Put1Bit(1);
+        Put1Bit(1);
+        PutGamma(count - 3);
+      }
+
       void Flush()
       {
         const size_t bytes = byte_pos_ + (bit_pos_ ? 1 : 0);
@@ -234,7 +269,7 @@ namespace tlg::v7
         {
           if (count)
           {
-            bs.PutGamma(count);
+            bs.PutRunLength(count);
             count = 0;
           }
 
@@ -273,7 +308,7 @@ namespace tlg::v7
       }
 
       if (count)
-        bs.PutGamma(count);
+        bs.PutRunLength(count);
     }
 
     struct GolombDecoder
@@ -337,6 +372,42 @@ namespace tlg::v7
         return value;
       }
 
+      // Read run-length encoded with the fixed small table defined in PutRunLength.
+      // Returns 0 on error, otherwise the decoded count.
+      int read_run_length()
+      {
+        // Peek bits to decide
+        uint32_t bit = 0;
+        if (!read_bit(bit))
+          return 0;
+        if (bit == 0)
+        {
+          // code '0' => count == 1
+          return 1;
+        }
+        // first bit was 1, need to read next two bits to distinguish 2/3/>=4
+        if (!read_bit(bit))
+          return 0;
+        if (bit == 0)
+        {
+          // '10' => count == 2
+          return 2;
+        }
+        // got '11', read one more bit
+        if (!read_bit(bit))
+          return 0;
+        if (bit == 0)
+        {
+          // '110' => count == 3
+          return 3;
+        }
+        // '111' prefix: read gamma for (count-3)
+        int v = read_gamma();
+        if (v <= 0)
+          return 0;
+        return v + 3;
+      }
+
       uint32_t bits_ = 0;
       int bit_pos_ = 0;
 
@@ -375,7 +446,16 @@ namespace tlg::v7
 
       while (out.size() < expected_count)
       {
-        int run = decoder.read_gamma();
+        int run = 0;
+        if (!expect_nonzero)
+        {
+          // zero-run when expect_nonzero == false
+          run = decoder.read_run_length();
+        }
+        else
+        {
+          run = decoder.read_gamma();
+        }
         if (run <= 0)
           return false;
 

@@ -256,11 +256,11 @@ namespace tlg::v7
     }
   } // namespace
 
-  uint16_t pack_block_sideinfo(int filter_code, PredictorMode mode, int diff_index)
+  uint16_t pack_block_sideinfo(const side_info &info)
   {
-    const uint16_t filter_bits = static_cast<uint16_t>(filter_code & 0x7F);
-    const uint16_t predictor_bit = (mode == PredictorMode::AVG) ? 1u : 0u;
-    const uint16_t diff_bits = static_cast<uint16_t>(diff_index & 0x7);
+    const uint16_t filter_bits = static_cast<uint16_t>(info.filter_code & 0x7F);
+    const uint16_t predictor_bit = (info.mode == PredictorMode::AVG) ? 1u : 0u;
+    const uint16_t diff_bits = static_cast<uint16_t>(info.diff_index & 0x7);
     return static_cast<uint16_t>(filter_bits | (predictor_bit << 7) | (diff_bits << 8));
   }
 
