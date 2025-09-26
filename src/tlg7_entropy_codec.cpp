@@ -14,9 +14,7 @@ namespace tlg::v7
 {
   namespace
   {
-    constexpr int GOLOMB_N_COUNT = 6;
-    constexpr int GOLOMB_ROWS_PER_COMPONENT = 2;
-    constexpr int GOLOMB_COMPONENT_PAIR_COUNT = GOLOMB_N_COUNT / GOLOMB_ROWS_PER_COMPONENT;
+    constexpr int GOLOMB_N_COUNT = 3;
     constexpr int GOLOMB_ROW_SUM = 1024;
 
     using GolombRow = std::array<uint16_t, 9>;
@@ -41,14 +39,11 @@ namespace tlg::v7
     constexpr ParsedGolombTable parse_default_golomb_table()
     {
       constexpr char data[] = R"(
-1 4 9 14 51 105 239 477 124
-1 3 5 10 68 115 236 450 136
-2 3 8 30 75 86 235 450 135
-2 2 6 20 71 112 221 456 134
-2 4 9 30 61 90 243 454 131
-2 2 7 19 58 109 232 455 140
+        2 2 4 7 38 104 255 483 129
+        2 2 4 17 80 92 235 453 139
+        2 2 4 28 71 92 242 458 125
 
-)";
+        )";
 
       ParsedGolombTable result{};
       std::size_t row = 0;
@@ -90,10 +85,7 @@ namespace tlg::v7
       return result;
     }
 
-    static_assert(GOLOMB_ROWS_PER_COMPONENT > 0, "invalid Golomb rows per component");
-    static_assert(GOLOMB_COMPONENT_PAIR_COUNT > 0, "invalid Golomb component pair count");
-    static_assert(GOLOMB_COMPONENT_PAIR_COUNT * GOLOMB_ROWS_PER_COMPONENT == GOLOMB_N_COUNT,
-                  "Golomb row constants inconsistent");
+    static_assert(GOLOMB_N_COUNT > 0, "invalid Golomb row count");
 
     inline constexpr GolombTable DEFAULT_GOLOMB_TABLE = []() constexpr
     {
@@ -106,12 +98,11 @@ namespace tlg::v7
     unsigned char GolombBitLengthTable[GOLOMB_ROW_SUM][GOLOMB_N_COUNT];
     bool golomb_tables_ready = false;
 
-    inline int component_row_base(std::size_t component_index)
+    inline int component_row_index(std::size_t component_index)
     {
-      const std::size_t pair_index = (component_index < static_cast<std::size_t>(GOLOMB_COMPONENT_PAIR_COUNT))
-                                         ? component_index
-                                         : static_cast<std::size_t>(GOLOMB_COMPONENT_PAIR_COUNT - 1);
-      return static_cast<int>(pair_index * static_cast<std::size_t>(GOLOMB_ROWS_PER_COMPONENT));
+      const std::size_t max_index = static_cast<std::size_t>(GOLOMB_N_COUNT - 1);
+      const std::size_t clamped = (component_index < max_index) ? component_index : max_index;
+      return static_cast<int>(clamped);
     }
 
     inline void init_golomb_tables()
@@ -255,9 +246,8 @@ namespace tlg::v7
       init_golomb_tables();
 
       bs.PutValue(buf[0] ? 1 : 0, 1);
-      const int row_base = component_row_base(component_index);
-      const int row_max = row_base;
-      int n = row_max;
+      const int row_index = component_row_index(component_index);
+      int n = row_index;
       int a = 0;
       int count = 0;
       const size_t size = buf.size();
@@ -285,14 +275,14 @@ namespace tlg::v7
             long m = ((e >= 0) ? (2 * e) : (-2 * e - 1)) - 1;
             if (m < 0)
               m = 0;
-            int k = GolombBitLengthTable[a >> 2][n];
+            int k = GolombBitLengthTable[(a + 2) >> 2][n];
             long q = (k > 0) ? (m >> k) : m;
             for (; q > 0; --q)
               bs.Put1Bit(0);
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            a = m + (a * 3 >> 2); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
+            a = m + (a - ((a + 2) >> 2)); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
           }
           i = ii - 1;
         }
@@ -435,9 +425,8 @@ namespace tlg::v7
 
       bool expect_nonzero = (first_bit != 0);
       int a = 0;
-      const int row_base = component_row_base(component_index);
-      const int row_max = row_base;
-      int n = row_max;
+      const int row_index = component_row_index(component_index);
+      int n = row_index;
 
       while (out.size() < expected_count)
       {
@@ -469,7 +458,7 @@ namespace tlg::v7
 
         for (int i = 0; i < run; ++i)
         {
-          int k = GolombBitLengthTable[a >> 2][n];
+          int k = GolombBitLengthTable[(a + 2) >> 2][n];
           int q = 0;
           while (true)
           {
@@ -489,7 +478,7 @@ namespace tlg::v7
           int residual = (vv ^ sign) + sign + 1;
 
           out.push_back(static_cast<int16_t>(residual));
-          a = m + (a * 3 >> 2); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
+          a = m + (a - ((a + 2) >> 2)); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
         }
 
         expect_nonzero = false;
