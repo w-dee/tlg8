@@ -202,18 +202,13 @@ namespace tlg::v7
       }
     }
 
-    inline uint8_t pack_filter_predictor(int filter_code, PredictorMode mode)
-    {
-      const int predictor_bit = (mode == PredictorMode::AVG) ? 1 : 0;
-      return static_cast<uint8_t>((filter_code << 1) | predictor_bit);
-    }
-
     struct BlockCandidate
     {
       PredictorMode mode = PredictorMode::MED;
       int filter_code = 0;
       uint64_t bit_cost = std::numeric_limits<uint64_t>::max();
       std::vector<std::vector<int16_t>> residuals;
+      int diff_filter_index = 0;
     };
 
   } // namespace
@@ -294,18 +289,6 @@ namespace tlg::v7
 
       const std::size_t component_count = (colors == 4) ? 4u : (colors == 3 ? 3u : 1u);
 
-      std::vector<uint8_t> filter_indices(block_count, 0);
-      if (!filter_indices.empty())
-      {
-        std::vector<uint8_t> zero(block_count, 0);
-        if (!zero.empty() && fwrite(zero.data(), 1, zero.size(), fp) != zero.size())
-        {
-          err = "tlg7: write filter placeholder";
-          return false;
-        }
-      }
-      const long filter_pos = std::ftell(fp) - static_cast<long>(filter_indices.size());
-
       auto planes = extract_planes(src, colors);
       std::vector<detail::image<uint8_t>> filtered_planes;
       filtered_planes.reserve(component_count);
@@ -327,6 +310,10 @@ namespace tlg::v7
 
         const std::size_t chunk_block_row_start = chunk_y0 / BLOCK_SIZE;
         const std::size_t chunk_block_row_end = std::min<std::size_t>((chunk_y0 + chunk_height + BLOCK_SIZE - 1) / BLOCK_SIZE, blocks_y);
+        const std::size_t chunk_block_capacity = (chunk_block_row_end - chunk_block_row_start) * blocks_x;
+
+        std::vector<uint16_t> chunk_sideinfo;
+        chunk_sideinfo.reserve(chunk_block_capacity);
 
         for (std::size_t by = chunk_block_row_start; by < chunk_block_row_end; ++by)
         {
@@ -381,18 +368,45 @@ namespace tlg::v7
               }
 
               cand.filter_code = filter_code;
+              const auto base_residuals = cand.residuals;
+              std::vector<std::vector<int16_t>> best_residuals;
+              int best_diff_index = 0;
+              uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
-              uint64_t total_bits = 0;
-              for (std::size_t c = 0; c < component_count; ++c)
+              for (int diff_idx = 0; diff_idx < static_cast<int>(DiffFilterType::Count); ++diff_idx)
               {
-                std::vector<int16_t> tmp = cand.residuals[c];
-                if (is_full_block)
-                  reorder_to_hilbert(tmp);
-                total_bits += estimate_residual_bits(tmp, c);
-                if (total_bits >= std::numeric_limits<uint64_t>::max())
-                  break;
+                const DiffFilterType diff_type = static_cast<DiffFilterType>(diff_idx);
+                std::vector<std::vector<int16_t>> diff_residuals(component_count);
+                for (std::size_t c = 0; c < component_count; ++c)
+                {
+                  if (diff_type == DiffFilterType::None)
+                    diff_residuals[c] = base_residuals[c];
+                  else
+                    diff_residuals[c] = apply_diff_filter(ctx, diff_type, base_residuals[c]);
+                }
+
+                uint64_t total_bits = 0;
+                for (std::size_t c = 0; c < component_count; ++c)
+                {
+                  std::vector<int16_t> tmp = diff_residuals[c];
+                  if (is_full_block)
+                    reorder_to_hilbert(tmp);
+                  total_bits += estimate_residual_bits(tmp, c);
+                  if (total_bits >= best_bits)
+                    break;
+                }
+
+                if (total_bits < best_bits)
+                {
+                  best_bits = total_bits;
+                  best_diff_index = diff_idx;
+                  best_residuals = std::move(diff_residuals);
+                }
               }
-              cand.bit_cost = total_bits;
+
+              cand.residuals = std::move(best_residuals);
+              cand.bit_cost = best_bits;
+              cand.diff_filter_index = best_diff_index;
 
               if (!has_candidate || cand.bit_cost < best_candidate.bit_cost)
               {
@@ -407,17 +421,20 @@ namespace tlg::v7
               return false;
             }
 
-            filter_indices[ctx.index] = pack_filter_predictor(best_candidate.filter_code, best_candidate.mode);
+            const uint16_t sideinfo = pack_block_sideinfo(best_candidate.filter_code,
+                                                         best_candidate.mode,
+                                                         best_candidate.diff_filter_index);
+            chunk_sideinfo.push_back(sideinfo);
 
             for (std::size_t c = 0; c < component_count; ++c)
             {
               std::vector<int16_t> residual = std::move(best_candidate.residuals[c]);
               if (dump_file && dump_before_hilbert)
-                dump_residual_block(dump_file.get(), c, ctx, residual, static_cast<uint16_t>(filter_indices[ctx.index]));
+                dump_residual_block(dump_file.get(), c, ctx, residual, sideinfo);
               if (is_full_block)
                 reorder_to_hilbert(residual);
               if (dump_file && dump_after_hilbert)
-                dump_residual_block(dump_file.get(), c, ctx, residual, static_cast<uint16_t>(filter_indices[ctx.index]));
+                dump_residual_block(dump_file.get(), c, ctx, residual, sideinfo);
               chunk_residuals[c].insert(chunk_residuals[c].end(), residual.begin(), residual.end());
             }
 
@@ -431,6 +448,24 @@ namespace tlg::v7
           if (chunk_residuals[c].size() != chunk_pixels)
           {
             err = "tlg7: residual size mismatch";
+            return false;
+          }
+        }
+
+        const uint32_t sideinfo_byte_count = static_cast<uint32_t>(chunk_sideinfo.size() * sizeof(uint16_t));
+        tlg::detail::write_u32le(fp, sideinfo_byte_count);
+        if (sideinfo_byte_count)
+        {
+          std::vector<uint8_t> sideinfo_bytes(sideinfo_byte_count);
+          for (std::size_t i = 0; i < chunk_sideinfo.size(); ++i)
+          {
+            const uint16_t v = chunk_sideinfo[i];
+            sideinfo_bytes[i * 2 + 0] = static_cast<uint8_t>(v & 0xFF);
+            sideinfo_bytes[i * 2 + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+          }
+          if (fwrite(sideinfo_bytes.data(), 1, sideinfo_bytes.size(), fp) != sideinfo_bytes.size())
+          {
+            err = "tlg7: write sideinfo stream";
             return false;
           }
         }
@@ -449,25 +484,6 @@ namespace tlg::v7
             err = "tlg7: write residual data";
             return false;
           }
-        }
-      }
-
-      if (!filter_indices.empty())
-      {
-        if (std::fseek(fp, filter_pos, SEEK_SET) != 0)
-        {
-          err = "tlg7: seek filter table";
-          return false;
-        }
-        if (!filter_indices.empty() && fwrite(filter_indices.data(), 1, filter_indices.size(), fp) != filter_indices.size())
-        {
-          err = "tlg7: write filter table";
-          return false;
-        }
-        if (std::fseek(fp, 0, SEEK_END) != 0)
-        {
-          err = "tlg7: seek end";
-          return false;
         }
       }
 

@@ -15,6 +15,8 @@
 namespace tlg::v7
 {
 
+  struct BlockContext;
+
   inline constexpr std::size_t BLOCK_SIZE = 8;
   inline constexpr std::size_t CHUNK_SCAN_LINES = 64;
 
@@ -135,6 +137,29 @@ namespace tlg::v7
   inline constexpr std::array<PredictorMode, 2> PREDICTOR_CANDIDATES = {
       PredictorMode::MED,
       PredictorMode::AVG};
+
+  enum class DiffFilterType : uint8_t
+  {
+    None = 0,
+    NWSE,
+    NESW,
+    HORZ,
+    VERT,
+    Count
+  };
+
+  uint16_t pack_block_sideinfo(int filter_code, PredictorMode mode, int diff_index);
+  int unpack_filter_code(uint16_t sideinfo);
+  PredictorMode unpack_predictor_mode(uint16_t sideinfo);
+  DiffFilterType unpack_diff_filter(uint16_t sideinfo);
+
+  std::vector<int16_t> apply_diff_filter(const BlockContext &ctx,
+                                         DiffFilterType type,
+                                         const std::vector<int16_t> &input);
+
+  std::vector<int16_t> undo_diff_filter(const BlockContext &ctx,
+                                        DiffFilterType type,
+                                        const std::vector<int16_t> &input);
 
   template <typename T>
   void reorder_to_hilbert(std::vector<T> &values)

@@ -228,6 +228,147 @@ namespace tlg::v7
     }
   }
 
+  namespace
+  {
+    struct DiffDirection
+    {
+      int dx = 0;
+      int dy = 0;
+    };
+
+    DiffDirection get_diff_direction(DiffFilterType type)
+    {
+      switch (type)
+      {
+      case DiffFilterType::NWSE:
+        return {-1, -1};
+      case DiffFilterType::NESW:
+        return {1, -1};
+      case DiffFilterType::HORZ:
+        return {1, 0};
+      case DiffFilterType::VERT:
+        return {0, -1};
+      case DiffFilterType::None:
+      case DiffFilterType::Count:
+      default:
+        return {0, 0};
+      }
+    }
+  } // namespace
+
+  uint16_t pack_block_sideinfo(int filter_code, PredictorMode mode, int diff_index)
+  {
+    const uint16_t filter_bits = static_cast<uint16_t>(filter_code & 0x7F);
+    const uint16_t predictor_bit = (mode == PredictorMode::AVG) ? 1u : 0u;
+    const uint16_t diff_bits = static_cast<uint16_t>(diff_index & 0x7);
+    return static_cast<uint16_t>(filter_bits | (predictor_bit << 7) | (diff_bits << 8));
+  }
+
+  int unpack_filter_code(uint16_t sideinfo)
+  {
+    return static_cast<int>(sideinfo & 0x7F);
+  }
+
+  PredictorMode unpack_predictor_mode(uint16_t sideinfo)
+  {
+    return (sideinfo & 0x80) ? PredictorMode::AVG : PredictorMode::MED;
+  }
+
+  DiffFilterType unpack_diff_filter(uint16_t sideinfo)
+  {
+    const int diff = (sideinfo >> 8) & 0x7;
+    if (diff < 0 || diff >= static_cast<int>(DiffFilterType::Count))
+      return DiffFilterType::None;
+    return static_cast<DiffFilterType>(diff);
+  }
+
+  std::vector<int16_t> apply_diff_filter(const BlockContext &ctx,
+                                         DiffFilterType type,
+                                         const std::vector<int16_t> &input)
+  {
+    if (type == DiffFilterType::None || input.empty())
+      return input;
+
+    const std::size_t width = ctx.bw;
+    const std::size_t height = ctx.bh;
+    const std::size_t expected = width * height;
+    if (width == 0 || height == 0 || input.size() != expected)
+      return input;
+
+    const DiffDirection dir = get_diff_direction(type);
+    if (dir.dx == 0 && dir.dy == 0)
+      return input;
+
+    std::vector<int16_t> output(input.size());
+    for (std::size_t y = 0; y < height; ++y)
+    {
+      for (std::size_t x = 0; x < width; ++x)
+      {
+        const std::size_t idx = y * width + x;
+        const int cur = static_cast<int>(input[idx]);
+        const int nx = static_cast<int>(x) + dir.dx;
+        const int ny = static_cast<int>(y) + dir.dy;
+        if (nx >= 0 && nx < static_cast<int>(width) && ny >= 0 && ny < static_cast<int>(height))
+        {
+          const std::size_t nidx = static_cast<std::size_t>(ny) * width + static_cast<std::size_t>(nx);
+          const int neigh = static_cast<int>(input[nidx]);
+          output[idx] = static_cast<int16_t>(cur - neigh);
+        }
+        else
+        {
+          output[idx] = static_cast<int16_t>(cur);
+        }
+      }
+    }
+
+    return output;
+  }
+
+  std::vector<int16_t> undo_diff_filter(const BlockContext &ctx,
+                                        DiffFilterType type,
+                                        const std::vector<int16_t> &input)
+  {
+    if (type == DiffFilterType::None || input.empty())
+      return input;
+
+    const std::size_t width = ctx.bw;
+    const std::size_t height = ctx.bh;
+    const std::size_t expected = width * height;
+    if (width == 0 || height == 0 || input.size() != expected)
+      return input;
+
+    const DiffDirection dir = get_diff_direction(type);
+    if (dir.dx == 0 && dir.dy == 0)
+      return input;
+
+    std::vector<int16_t> output(input.size());
+    const bool reverse_y = dir.dy > 0;
+    const bool reverse_x = dir.dx > 0;
+
+    for (std::size_t yy = 0; yy < height; ++yy)
+    {
+      const std::size_t y = reverse_y ? (height - 1 - yy) : yy;
+      for (std::size_t xx = 0; xx < width; ++xx)
+      {
+        const std::size_t x = reverse_x ? (width - 1 - xx) : xx;
+        const std::size_t idx = y * width + x;
+        int value = static_cast<int>(input[idx]);
+
+        const int nx = static_cast<int>(x) + dir.dx;
+        const int ny = static_cast<int>(y) + dir.dy;
+        if (nx >= 0 && nx < static_cast<int>(width) && ny >= 0 && ny < static_cast<int>(height))
+        {
+          const std::size_t nidx = static_cast<std::size_t>(ny) * width + static_cast<std::size_t>(nx);
+          value += static_cast<int>(output[nidx]);
+        }
+
+        output[idx] = static_cast<int16_t>(value);
+      }
+    }
+
+    return output;
+  }
+
   std::vector<detail::image<uint8_t>> extract_planes(const PixelBuffer &src, int colors)
   {
     const std::size_t width = src.width;

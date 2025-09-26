@@ -30,16 +30,6 @@ namespace tlg::v7
       return false;
     }
 
-    std::vector<uint8_t> filter_indices(hdr.block_count);
-    if (!filter_indices.empty())
-    {
-      if (!tlg::detail::read_exact(fp, filter_indices.data(), filter_indices.size()))
-      {
-        err = "tlg7: read filter indices";
-        return false;
-      }
-    }
-
     const std::size_t component_count = (hdr.colors == 4) ? 4u : (hdr.colors == 3 ? 3u : 1u);
 
     std::vector<detail::image<uint8_t>> filtered_planes;
@@ -63,6 +53,46 @@ namespace tlg::v7
       const std::size_t chunk_height = std::min<std::size_t>(CHUNK_SCAN_LINES, height - chunk_y0);
       const std::size_t chunk_pixels = chunk_height * width;
 
+      const std::size_t chunk_block_row_start = chunk_y0 / BLOCK_SIZE;
+      const std::size_t chunk_block_row_end = std::min<std::size_t>((chunk_y0 + chunk_height + BLOCK_SIZE - 1) / BLOCK_SIZE, blocks_y);
+
+      std::vector<BlockContext> chunk_contexts;
+      chunk_contexts.reserve((chunk_block_row_end - chunk_block_row_start) * blocks_x);
+      for (std::size_t by = chunk_block_row_start; by < chunk_block_row_end; ++by)
+      {
+        const std::size_t y0 = by * BLOCK_SIZE;
+        if (y0 >= height)
+          break;
+        for (std::size_t bx = 0; bx < blocks_x; ++bx)
+        {
+          chunk_contexts.push_back(make_block_context(bx, by, width, height, blocks_x));
+        }
+      }
+
+      const uint32_t sideinfo_byte_count = tlg::detail::read_u32le(fp);
+      const std::size_t expected_sideinfo_bytes = chunk_contexts.size() * sizeof(uint16_t);
+      if (sideinfo_byte_count != expected_sideinfo_bytes)
+      {
+        err = "tlg7: sideinfo size mismatch";
+        return false;
+      }
+
+      std::vector<uint16_t> chunk_sideinfo(chunk_contexts.size(), 0);
+      if (sideinfo_byte_count)
+      {
+        std::vector<uint8_t> sideinfo_bytes(sideinfo_byte_count);
+        if (!tlg::detail::read_exact(fp, sideinfo_bytes.data(), sideinfo_bytes.size()))
+        {
+          err = "tlg7: read sideinfo stream";
+          return false;
+        }
+        for (std::size_t i = 0; i < chunk_sideinfo.size(); ++i)
+        {
+          chunk_sideinfo[i] = static_cast<uint16_t>(sideinfo_bytes[i * 2 + 0]) |
+                              static_cast<uint16_t>(sideinfo_bytes[i * 2 + 1] << 8);
+        }
+      }
+
       std::vector<std::vector<int16_t>> chunk_residuals(component_count);
 
       for (std::size_t c = 0; c < component_count; ++c)
@@ -85,72 +115,69 @@ namespace tlg::v7
 
       std::vector<std::size_t> residual_cursor(component_count, 0);
 
-      const std::size_t chunk_block_row_start = chunk_y0 / BLOCK_SIZE;
-      const std::size_t chunk_block_row_end = std::min<std::size_t>((chunk_y0 + chunk_height + BLOCK_SIZE - 1) / BLOCK_SIZE, blocks_y);
-
-      for (std::size_t by = chunk_block_row_start; by < chunk_block_row_end; ++by)
+      std::size_t sideinfo_cursor = 0;
+      for (const BlockContext &ctx : chunk_contexts)
       {
-        const std::size_t y0 = by * BLOCK_SIZE;
-        if (y0 >= height)
-          break;
-        for (std::size_t bx = 0; bx < blocks_x; ++bx)
+        const std::size_t pixel_count = ctx.bw * ctx.bh;
+        const bool is_full_block = (ctx.bw == BLOCK_SIZE && ctx.bh == BLOCK_SIZE);
+
+        std::vector<std::vector<int16_t>> block_residuals(component_count);
+        for (std::size_t c = 0; c < component_count; ++c)
         {
-          const BlockContext ctx = make_block_context(bx, by, width, height, blocks_x);
-          const std::size_t pixel_count = ctx.bw * ctx.bh;
-          const bool is_full_block = (ctx.bw == BLOCK_SIZE && ctx.bh == BLOCK_SIZE);
+          block_residuals[c].assign(chunk_residuals[c].begin() + residual_cursor[c],
+                                    chunk_residuals[c].begin() + residual_cursor[c] + pixel_count);
+          residual_cursor[c] += pixel_count;
+          if (is_full_block)
+            reorder_from_hilbert(block_residuals[c]);
+        }
 
-          std::vector<std::vector<int16_t>> block_residuals(component_count);
-          for (std::size_t c = 0; c < component_count; ++c)
+        const uint16_t sideinfo = (sideinfo_cursor < chunk_sideinfo.size()) ? chunk_sideinfo[sideinfo_cursor++] : 0;
+        const PredictorMode predictor_mode = unpack_predictor_mode(sideinfo);
+        const int filter_code = unpack_filter_code(sideinfo);
+        const DiffFilterType diff_filter = unpack_diff_filter(sideinfo);
+
+        for (std::size_t c = 0; c < component_count; ++c)
+        {
+          block_residuals[c] = undo_diff_filter(ctx, diff_filter, block_residuals[c]);
+        }
+
+        if (component_count >= 3)
+        {
+          undo_color_filter(filter_code, block_residuals[0], block_residuals[1], block_residuals[2]);
+        }
+
+        std::vector<std::vector<uint8_t>> block_pixels(component_count);
+        for (std::size_t c = 0; c < component_count; ++c)
+        {
+          block_pixels[c].resize(pixel_count);
+
+          std::size_t idx = 0;
+          for (std::size_t y = 0; y < ctx.bh; ++y)
           {
-            block_residuals[c].assign(chunk_residuals[c].begin() + residual_cursor[c],
-                                      chunk_residuals[c].begin() + residual_cursor[c] + pixel_count);
-            residual_cursor[c] += pixel_count;
-            if (is_full_block)
-              reorder_from_hilbert(block_residuals[c]);
-          }
-
-          const uint8_t packed_filter = filter_indices.empty() ? 0 : filter_indices[ctx.index];
-          const PredictorMode predictor_mode = (packed_filter & 1) ? PredictorMode::AVG : PredictorMode::MED;
-          const int filter_code = packed_filter >> 1;
-
-          if (component_count >= 3)
-          {
-            undo_color_filter(filter_code, block_residuals[0], block_residuals[1], block_residuals[2]);
-          }
-
-          std::vector<std::vector<uint8_t>> block_pixels(component_count);
-          for (std::size_t c = 0; c < component_count; ++c)
-          {
-            block_pixels[c].resize(pixel_count);
-
-            std::size_t idx = 0;
-            for (std::size_t y = 0; y < ctx.bh; ++y)
+            for (std::size_t x = 0; x < ctx.bw; ++x)
             {
-              for (std::size_t x = 0; x < ctx.bw; ++x)
-              {
-                const int gx = static_cast<int>(ctx.x0 + x);
-                const int gy = static_cast<int>(ctx.y0 + y);
+              const int gx = static_cast<int>(ctx.x0 + x);
+              const int gy = static_cast<int>(ctx.y0 + y);
 
-                const int a = sample_pixel(filtered_planes[c], gx - 1, gy);
-                const int b = sample_pixel(filtered_planes[c], gx, gy - 1);
-                const int cdiag = sample_pixel(filtered_planes[c], gx - 1, gy - 1);
-                const int pred = apply_predictor<uint8_t>(predictor_mode, a, b, cdiag);
-                int recon = pred + block_residuals[c][idx];
-                if (recon < 0)
-                  recon = 0;
-                else if (recon > 255)
-                  recon = 255;
+              const int a = sample_pixel(filtered_planes[c], gx - 1, gy);
+              const int b = sample_pixel(filtered_planes[c], gx, gy - 1);
+              const int cdiag = sample_pixel(filtered_planes[c], gx - 1, gy - 1);
+              const int pred = apply_predictor<uint8_t>(predictor_mode, a, b, cdiag);
+              int recon = pred + block_residuals[c][idx];
+              if (recon < 0)
+                recon = 0;
+              else if (recon > 255)
+                recon = 255;
 
-                filtered_planes[c].row_ptr(ctx.y0 + y)[ctx.x0 + x] = static_cast<uint8_t>(recon);
-                block_pixels[c][idx] = static_cast<uint8_t>(recon);
-                ++idx;
-              }
+              filtered_planes[c].row_ptr(ctx.y0 + y)[ctx.x0 + x] = static_cast<uint8_t>(recon);
+              block_pixels[c][idx] = static_cast<uint8_t>(recon);
+              ++idx;
             }
           }
-
-          for (std::size_t c = 0; c < component_count; ++c)
-            store_block_to_plane(output_planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_pixels[c]);
         }
+
+        for (std::size_t c = 0; c < component_count; ++c)
+          store_block_to_plane(output_planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_pixels[c]);
       }
 
       for (std::size_t c = 0; c < component_count; ++c)
