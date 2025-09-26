@@ -169,7 +169,7 @@ namespace tlg::v7
       return result;
     }
 
-    void compute_block_residuals(const BlockContext &ctx,
+    void compute_per_block_prediction(const BlockContext &ctx,
                                  const std::vector<uint8_t> &block_values,
                                  const detail::image<uint8_t> &reference_plane,
                                  PredictorMode mode,
@@ -352,7 +352,7 @@ namespace tlg::v7
               cand.residuals.resize(component_count);
 
               for (std::size_t c = 0; c < component_count; ++c)
-                compute_block_residuals(ctx, block_values[c], filtered_planes[c], mode, cand.residuals[c]);
+                compute_per_block_prediction(ctx, block_values[c], filtered_planes[c], mode, cand.residuals[c]);
 
               int filter_code = 0;
               if (component_count >= 3)
