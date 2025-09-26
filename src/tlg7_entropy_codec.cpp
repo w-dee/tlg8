@@ -39,10 +39,9 @@ namespace tlg::v7
     constexpr ParsedGolombTable parse_default_golomb_table()
     {
       constexpr char data[] = R"(
-        2 2 4 7 38 104 255 483 129
-        2 2 4 17 80 92 235 453 139
-        2 2 4 28 71 92 242 458 125
-
+2 2 3 7 25 105 263 485 132
+2 2 4 13 80 94 235 456 138
+2 2 5 24 67 94 242 464 124
         )";
 
       ParsedGolombTable result{};
@@ -275,14 +274,14 @@ namespace tlg::v7
             long m = ((e >= 0) ? (2 * e) : (-2 * e - 1)) - 1;
             if (m < 0)
               m = 0;
-            int k = GolombBitLengthTable[(a + 2) >> 2][n];
+            int k = GolombBitLengthTable[a >> 2][n];
             long q = (k > 0) ? (m >> k) : m;
             for (; q > 0; --q)
               bs.Put1Bit(0);
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            a = m + (a - ((a + 2) >> 2)); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
+            a = m + (a - (a >> 2)); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
           }
           i = ii - 1;
         }
@@ -458,7 +457,7 @@ namespace tlg::v7
 
         for (int i = 0; i < run; ++i)
         {
-          int k = GolombBitLengthTable[(a + 2) >> 2][n];
+          int k = GolombBitLengthTable[a >> 2][n];
           int q = 0;
           while (true)
           {
@@ -478,7 +477,7 @@ namespace tlg::v7
           int residual = (vv ^ sign) + sign + 1;
 
           out.push_back(static_cast<int16_t>(residual));
-          a = m + (a - ((a + 2) >> 2)); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
+          a = m + (a - (a >> 2)); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
         }
 
         expect_nonzero = false;
