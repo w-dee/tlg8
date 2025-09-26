@@ -41,6 +41,20 @@ namespace tlg::v7
       return cost;
     }
 
+    double compute_squared_entropy(const std::vector<std::vector<int16_t>> &residuals)
+    {
+      long double sum = 0.0;
+      for (const auto &component : residuals)
+      {
+        for (const auto value : component)
+        {
+          const long double v = static_cast<long double>(value);
+          sum += v * v;
+        }
+      }
+      return static_cast<double>(sum);
+    }
+
     int choose_filter_fast(const std::vector<int16_t> &src_b,
                            const std::vector<int16_t> &src_g,
                            const std::vector<int16_t> &src_r,
@@ -331,6 +345,8 @@ namespace tlg::v7
 
             BlockCandidate best_candidate;
             bool has_candidate = false;
+            double best_prediction_entropy = std::numeric_limits<double>::infinity();
+            double best_color_filter_entropy = std::numeric_limits<double>::infinity();
 
             for (PredictorMode mode : PREDICTOR_CANDIDATES)
             {
@@ -340,6 +356,13 @@ namespace tlg::v7
 
               for (std::size_t c = 0; c < component_count; ++c)
                 compute_per_block_prediction(ctx, block_values[c], filtered_planes[c], mode, cand.residuals[c]);
+
+              const double predictor_entropy = compute_squared_entropy(cand.residuals);
+              if (best_prediction_entropy < std::numeric_limits<double>::infinity() &&
+                  predictor_entropy > best_prediction_entropy * PER_BLOCK_PREDICTION_EARLY_EXIT_RATIO)
+                continue;
+              if (predictor_entropy < best_prediction_entropy)
+                best_prediction_entropy = predictor_entropy;
 
               int filter_code = 0;
               if (component_count >= 3)
@@ -368,6 +391,13 @@ namespace tlg::v7
               }
 
               cand.filter_code = filter_code;
+              const double color_filter_entropy = compute_squared_entropy(cand.residuals);
+              if (best_color_filter_entropy < std::numeric_limits<double>::infinity() &&
+                  color_filter_entropy > best_color_filter_entropy * COLOR_FILTER_EARLY_EXIT_RATIO)
+                continue;
+              if (color_filter_entropy < best_color_filter_entropy)
+                best_color_filter_entropy = color_filter_entropy;
+
               const auto base_residuals = cand.residuals;
               std::vector<std::vector<int16_t>> best_residuals;
               int best_diff_index = 0;

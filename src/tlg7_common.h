@@ -26,6 +26,9 @@ namespace tlg::v7
   inline constexpr int COLOR_FILTER_CODE_COUNT = COLOR_FILTER_PERMUTATIONS * COLOR_FILTER_PRIMARY_PREDICTORS *
                                                  COLOR_FILTER_SECONDARY_PREDICTORS;
 
+  inline constexpr double PER_BLOCK_PREDICTION_EARLY_EXIT_RATIO = 1.4;
+  inline constexpr double COLOR_FILTER_EARLY_EXIT_RATIO = 1.4;
+
   inline constexpr std::array<uint8_t, 64> HILBERT8x8 = {
 
       /* 0*/ 8 * 0 + 0,
