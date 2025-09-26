@@ -106,7 +106,7 @@ namespace tlg::v7
 
       const std::size_t block_x = ctx.x0 / BLOCK_SIZE;
       const std::size_t block_y = ctx.y0 / BLOCK_SIZE;
-      std::fprintf(fp, "# Color component %zu at block %zu,%zu sideinfo:0x%02x\n",
+      std::fprintf(fp, "# Color component %zu at block %zu,%zu sideinfo:0x%03x\n",
                    component_index,
                    block_x,
                    block_y,
@@ -452,18 +452,36 @@ namespace tlg::v7
           }
         }
 
-        const uint32_t sideinfo_byte_count = static_cast<uint32_t>(chunk_sideinfo.size() * sizeof(uint16_t));
-        tlg::detail::write_u32le(fp, sideinfo_byte_count);
-        if (sideinfo_byte_count)
+        const uint32_t sideinfo_bit_length = static_cast<uint32_t>(chunk_sideinfo.size() * SIDEINFO_BITS_PER_BLOCK);
+        tlg::detail::write_u32le(fp, sideinfo_bit_length);
+        if (sideinfo_bit_length)
         {
-          std::vector<uint8_t> sideinfo_bytes(sideinfo_byte_count);
+          const std::size_t sideinfo_byte_count = (sideinfo_bit_length + 7u) / 8u;
+          std::vector<uint8_t> sideinfo_bytes(sideinfo_byte_count, 0);
+          std::size_t byte_pos = 0;
+          int bit_pos = 0;
           for (std::size_t i = 0; i < chunk_sideinfo.size(); ++i)
           {
-            const uint16_t v = chunk_sideinfo[i];
-            sideinfo_bytes[i * 2 + 0] = static_cast<uint8_t>(v & 0xFF);
-            sideinfo_bytes[i * 2 + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+            const uint16_t value = chunk_sideinfo[i];
+            for (int bit = 0; bit < SIDEINFO_BITS_PER_BLOCK; ++bit)
+            {
+              if (byte_pos >= sideinfo_bytes.size())
+              {
+                err = "tlg7: sideinfo buffer overflow";
+                return false;
+              }
+              const int bit_value = (value >> bit) & 1;
+              if (bit_value)
+                sideinfo_bytes[byte_pos] |= static_cast<uint8_t>(1u << bit_pos);
+              ++bit_pos;
+              if (bit_pos == 8)
+              {
+                bit_pos = 0;
+                ++byte_pos;
+              }
+            }
           }
-          if (fwrite(sideinfo_bytes.data(), 1, sideinfo_bytes.size(), fp) != sideinfo_bytes.size())
+          if (!sideinfo_bytes.empty() && fwrite(sideinfo_bytes.data(), 1, sideinfo_bytes.size(), fp) != sideinfo_bytes.size())
           {
             err = "tlg7: write sideinfo stream";
             return false;

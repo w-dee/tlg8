@@ -69,27 +69,47 @@ namespace tlg::v7
         }
       }
 
-      const uint32_t sideinfo_byte_count = tlg::detail::read_u32le(fp);
-      const std::size_t expected_sideinfo_bytes = chunk_contexts.size() * sizeof(uint16_t);
-      if (sideinfo_byte_count != expected_sideinfo_bytes)
+      const uint32_t sideinfo_bit_length = tlg::detail::read_u32le(fp);
+      const std::size_t expected_sideinfo_bits = chunk_contexts.size() * SIDEINFO_BITS_PER_BLOCK;
+      if (sideinfo_bit_length != expected_sideinfo_bits)
       {
         err = "tlg7: sideinfo size mismatch";
         return false;
       }
 
       std::vector<uint16_t> chunk_sideinfo(chunk_contexts.size(), 0);
-      if (sideinfo_byte_count)
+      if (sideinfo_bit_length)
       {
+        const std::size_t sideinfo_byte_count = (sideinfo_bit_length + 7u) / 8u;
         std::vector<uint8_t> sideinfo_bytes(sideinfo_byte_count);
-        if (!tlg::detail::read_exact(fp, sideinfo_bytes.data(), sideinfo_bytes.size()))
+        if (sideinfo_byte_count && !tlg::detail::read_exact(fp, sideinfo_bytes.data(), sideinfo_bytes.size()))
         {
           err = "tlg7: read sideinfo stream";
           return false;
         }
+
+        std::size_t byte_pos = 0;
+        int bit_pos = 0;
         for (std::size_t i = 0; i < chunk_sideinfo.size(); ++i)
         {
-          chunk_sideinfo[i] = static_cast<uint16_t>(sideinfo_bytes[i * 2 + 0]) |
-                              static_cast<uint16_t>(sideinfo_bytes[i * 2 + 1] << 8);
+          uint16_t value = 0;
+          for (int bit = 0; bit < SIDEINFO_BITS_PER_BLOCK; ++bit)
+          {
+            if (byte_pos >= sideinfo_bytes.size())
+            {
+              err = "tlg7: sideinfo bits underrun";
+              return false;
+            }
+            const int bit_value = (sideinfo_bytes[byte_pos] >> bit_pos) & 1;
+            value |= static_cast<uint16_t>(bit_value << bit);
+            ++bit_pos;
+            if (bit_pos == 8)
+            {
+              bit_pos = 0;
+              ++byte_pos;
+            }
+          }
+          chunk_sideinfo[i] = value;
         }
       }
 

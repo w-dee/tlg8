@@ -148,6 +148,8 @@ namespace tlg::v7
     Count
   };
 
+  inline constexpr int SIDEINFO_BITS_PER_BLOCK = 11;
+
   uint16_t pack_block_sideinfo(int filter_code, PredictorMode mode, int diff_index);
   int unpack_filter_code(uint16_t sideinfo);
   PredictorMode unpack_predictor_mode(uint16_t sideinfo);
