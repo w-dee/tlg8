@@ -256,7 +256,7 @@ namespace tlg::v7
 
       bs.PutValue(buf[0] ? 1 : 0, 1);
       const int row_base = component_row_base(component_index);
-      const int row_max = row_base + (GOLOMB_ROWS_PER_COMPONENT - 1);
+      const int row_max = row_base;
       int n = row_max;
       int a = 0;
       int count = 0;
@@ -285,19 +285,14 @@ namespace tlg::v7
             long m = ((e >= 0) ? (2 * e) : (-2 * e - 1)) - 1;
             if (m < 0)
               m = 0;
-            int k = GolombBitLengthTable[a][n];
+            int k = GolombBitLengthTable[a >> 2][n];
             long q = (k > 0) ? (m >> k) : m;
             for (; q > 0; --q)
               bs.Put1Bit(0);
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            if (--n < row_base)
-            {
-              a >>= 1;
-              n = row_max;
-            }
-            a += m >> 1;
+            a = m + (a * 3 >> 2); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
           }
           i = ii - 1;
         }
@@ -441,7 +436,7 @@ namespace tlg::v7
       bool expect_nonzero = (first_bit != 0);
       int a = 0;
       const int row_base = component_row_base(component_index);
-      const int row_max = row_base + (GOLOMB_ROWS_PER_COMPONENT - 1);
+      const int row_max = row_base;
       int n = row_max;
 
       while (out.size() < expected_count)
@@ -474,7 +469,7 @@ namespace tlg::v7
 
         for (int i = 0; i < run; ++i)
         {
-          int k = GolombBitLengthTable[a][n];
+          int k = GolombBitLengthTable[a >> 2][n];
           int q = 0;
           while (true)
           {
@@ -494,13 +489,7 @@ namespace tlg::v7
           int residual = (vv ^ sign) + sign + 1;
 
           out.push_back(static_cast<int16_t>(residual));
-
-          if (--n < row_base)
-          {
-            a >>= 1;
-            n = row_max;
-          }
-          a += m >> 1;
+          a = m + (a * 3 >> 2); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
         }
 
         expect_nonzero = false;
