@@ -27,9 +27,10 @@ bool has_ext(const std::string &path, const char *extLowerNoDot)
 static void print_usage()
 {
   std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|png|bmp)>"
-            << " [--tlg-version=5|6|7] [--pixel-format=auto|R8G8B8|A8R8G8B8] [--tlg7-fast]"
+            << " [--tlg-version=5|6|7] [--pixel-format=auto|R8G8B8|A8R8G8B8]"
             << " [--tlg7-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
-            << " [--tlg7-dump-residuals-order=before|after]\n";
+            << " [--tlg7-dump-residuals-order=before|after]"
+            << " [--tlg7-order=predictor-first|filter-first]\n";
 }
 
 int main(int argc, char **argv)
@@ -79,9 +80,19 @@ int main(int argc, char **argv)
         return 2;
       }
     }
-    else if (arg == "--tlg7-fast")
+    else if (arg.rfind("--tlg7-order=", 0) == 0)
     {
-      tlgopt.tlg7_fast_mode = true;
+      std::string order = arg.substr(13);
+      to_lower_inplace(order);
+      if (order == "predictor-first" || order == "prediction-first" || order == "predictor-then-filter")
+        tlgopt.tlg7_pipeline_order = TlgOptions::Tlg7PipelineOrder::PredictorThenFilter;
+      else if (order == "filter-first" || order == "filter-then-predictor")
+        tlgopt.tlg7_pipeline_order = TlgOptions::Tlg7PipelineOrder::FilterThenPredictor;
+      else
+      {
+        std::cerr << "Invalid --tlg7-order: " << order << "\n";
+        return 2;
+      }
     }
     else if (arg.rfind("--tlg7-golomb-table=", 0) == 0)
     {

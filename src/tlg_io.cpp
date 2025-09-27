@@ -111,7 +111,7 @@ bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions 
     ok = tlg::v7::enc::write_raw(fp,
                                  src,
                                  desired_colors,
-                                 opt.tlg7_fast_mode,
+                                 opt.tlg7_pipeline_order,
                                  opt.tlg7_dump_residuals_path,
                                  opt.tlg7_dump_residuals_order,
                                  err);

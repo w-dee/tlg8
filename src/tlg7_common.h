@@ -151,6 +151,12 @@ namespace tlg::v7
     Count
   };
 
+  enum class PipelineOrder : uint8_t
+  {
+    PredictorThenFilter = 0,
+    FilterThenPredictor = 1,
+  };
+
   inline constexpr int SIDEINFO_BITS_PER_BLOCK = 11;
 
   struct side_info
@@ -212,7 +218,17 @@ namespace tlg::v7
                                   std::size_t height,
                                   std::size_t blocks_x);
 
-  int sample_pixel(const detail::image<uint8_t> &img, int x, int y);
+  template <typename T>
+  int sample_pixel(const detail::image<T> &img, int x, int y)
+  {
+    if (x < 0 || y < 0)
+      return 0;
+    const std::size_t ux = static_cast<std::size_t>(x);
+    const std::size_t uy = static_cast<std::size_t>(y);
+    if (ux >= img.get_width() || uy >= img.get_height())
+      return 0;
+    return img.row_ptr(uy)[ux];
+  }
 
   template <typename T>
   inline int clip_to_pixel_range(int v)
@@ -244,7 +260,15 @@ namespace tlg::v7
   template <typename T>
   inline int avg_predict(int a, int b, int c)
   {
-    const int pred = (a + b + c + 2) * ((uint32_t)65536UL / 3) >> 16; // (a + b + c) / 3
+    const int sum = a + b + c;
+    int pred;
+    if (sum >= 0)
+      pred = (sum + 1) / 3;
+    else
+    {
+      const int positive = -sum;
+      pred = -((positive + 1) / 3);
+    }
     return clip_to_pixel_range<T>(pred);
   }
 
@@ -320,7 +344,8 @@ namespace tlg::v7
     struct Header
     {
       uint8_t colors = 0;
-      uint8_t reserved[3] = {0, 0, 0};
+      uint8_t flags = 0;
+      uint8_t reserved[2] = {0, 0};
       uint32_t width = 0;
       uint32_t height = 0;
       uint32_t block_count = 0;

@@ -54,12 +54,18 @@ struct TlgOptions
     BeforeHilbert,
   };
 
+  enum class Tlg7PipelineOrder
+  {
+    PredictorThenFilter,
+    FilterThenPredictor,
+  };
+
   int version = 6;                      // 5 or 6 or 7
   ImageFormat fmt = ImageFormat::Auto;  // decided by input if Auto
-  bool tlg7_fast_mode = false;          // use fast heuristic filter selection for TLG7
   std::string tlg7_golomb_table_path;   // optional override for TLG7 Golomb table
   std::string tlg7_dump_residuals_path; // optional residual dump output for TLG7 encoder
   DumpResidualsOrder tlg7_dump_residuals_order = DumpResidualsOrder::AfterHilbert;
+  Tlg7PipelineOrder tlg7_pipeline_order = Tlg7PipelineOrder::FilterThenPredictor;
 };
 
 bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err);

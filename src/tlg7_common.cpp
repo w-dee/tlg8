@@ -72,17 +72,6 @@ namespace tlg::v7
     return ctx;
   }
 
-  int sample_pixel(const detail::image<uint8_t> &img, int x, int y)
-  {
-    if (x < 0 || y < 0)
-      return 0;
-    const std::size_t ux = static_cast<std::size_t>(x);
-    const std::size_t uy = static_cast<std::size_t>(y);
-    if (ux >= img.get_width() || uy >= img.get_height())
-      return 0;
-    return img.row_ptr(uy)[ux];
-  }
-
   namespace
   {
     constexpr std::array<std::array<uint8_t, 3>, COLOR_FILTER_PERMUTATIONS> kColorPermutations = {
@@ -496,11 +485,11 @@ namespace tlg::v7
         return false;
       if (std::fputc(hdr.colors, fp) == EOF)
         return false;
+      if (std::fputc(hdr.flags, fp) == EOF)
+        return false;
       if (std::fputc(hdr.reserved[0], fp) == EOF)
         return false;
       if (std::fputc(hdr.reserved[1], fp) == EOF)
-        return false;
-      if (std::fputc(hdr.reserved[2], fp) == EOF)
         return false;
       tlg::detail::write_u32le(fp, hdr.width);
       tlg::detail::write_u32le(fp, hdr.height);
@@ -512,7 +501,8 @@ namespace tlg::v7
     bool read_header(FILE *fp, Header &hdr, std::string &err)
     {
       unsigned char colors = 0;
-      unsigned char r1 = 0, r2 = 0, r3 = 0;
+      unsigned char flags = 0;
+      unsigned char r1 = 0, r2 = 0;
       int c0 = std::fgetc(fp);
       int c1 = std::fgetc(fp);
       int c2 = std::fgetc(fp);
@@ -523,14 +513,14 @@ namespace tlg::v7
         return false;
       }
       colors = static_cast<unsigned char>(c0);
-      r1 = static_cast<unsigned char>(c1);
-      r2 = static_cast<unsigned char>(c2);
-      r3 = static_cast<unsigned char>(c3);
+      flags = static_cast<unsigned char>(c1);
+      r1 = static_cast<unsigned char>(c2);
+      r2 = static_cast<unsigned char>(c3);
 
       hdr.colors = colors;
+      hdr.flags = flags;
       hdr.reserved[0] = r1;
       hdr.reserved[1] = r2;
-      hdr.reserved[2] = r3;
 
       hdr.width = tlg::detail::read_u32le(fp);
       hdr.height = tlg::detail::read_u32le(fp);
@@ -542,9 +532,14 @@ namespace tlg::v7
         err = "tlg7: unsupported color count";
         return false;
       }
-      if (hdr.reserved[0] || hdr.reserved[1] || hdr.reserved[2])
+      if (hdr.reserved[0] || hdr.reserved[1])
       {
         err = "tlg7: reserved flags not zero";
+        return false;
+      }
+      if (hdr.flags > 1)
+      {
+        err = "tlg7: unsupported pipeline order";
         return false;
       }
       if (hdr.width == 0 || hdr.height == 0)

@@ -195,7 +195,7 @@ namespace tlg::v7
     bool write_raw(FILE *fp,
                    const PixelBuffer &src,
                    int colors,
-                   bool fast_mode,
+                   TlgOptions::Tlg7PipelineOrder pipeline_order,
                    const std::string &dump_residuals_path,
                    TlgOptions::DumpResidualsOrder dump_residuals_order,
                    std::string &err);

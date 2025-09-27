@@ -31,15 +31,32 @@ namespace tlg::v7
     }
 
     const std::size_t component_count = (hdr.colors == 4) ? 4u : (hdr.colors == 3 ? 3u : 1u);
+    const PipelineOrder order = (hdr.flags == 1)
+                                    ? PipelineOrder::FilterThenPredictor
+                                    : PipelineOrder::PredictorThenFilter;
 
-    std::vector<detail::image<uint8_t>> filtered_planes;
-    filtered_planes.reserve(component_count);
+    std::vector<detail::image<uint8_t>> prediction_planes_u8;
+    std::vector<detail::image<int16_t>> prediction_planes_i16;
     std::vector<detail::image<uint8_t>> output_planes;
     output_planes.reserve(component_count);
-    for (std::size_t i = 0; i < component_count; ++i)
+
+    if (order == PipelineOrder::PredictorThenFilter)
     {
-      filtered_planes.emplace_back(width, height, 0);
-      output_planes.emplace_back(width, height, 0);
+      prediction_planes_u8.reserve(component_count);
+      for (std::size_t i = 0; i < component_count; ++i)
+      {
+        prediction_planes_u8.emplace_back(width, height, 0);
+        output_planes.emplace_back(width, height, 0);
+      }
+    }
+    else
+    {
+      prediction_planes_i16.reserve(component_count);
+      for (std::size_t i = 0; i < component_count; ++i)
+      {
+        prediction_planes_i16.emplace_back(width, height, static_cast<int16_t>(0));
+        output_planes.emplace_back(width, height, 0);
+      }
     }
 
     GolombResidualEntropyDecoder entropy_decoder;
@@ -161,37 +178,90 @@ namespace tlg::v7
           block_residuals[c] = undo_diff_filter(ctx, diff_filter, block_residuals[c]);
         }
 
-        if (component_count >= 3)
-        {
-          undo_color_filter(filter_code, block_residuals[0], block_residuals[1], block_residuals[2]);
-        }
-
         std::vector<std::vector<uint8_t>> block_pixels(component_count);
-        for (std::size_t c = 0; c < component_count; ++c)
+
+        if (order == PipelineOrder::PredictorThenFilter)
         {
-          block_pixels[c].resize(pixel_count);
-
-          std::size_t idx = 0;
-          for (std::size_t y = 0; y < ctx.bh; ++y)
+          if (component_count >= 3)
           {
-            for (std::size_t x = 0; x < ctx.bw; ++x)
+            undo_color_filter(filter_code, block_residuals[0], block_residuals[1], block_residuals[2]);
+          }
+
+          for (std::size_t c = 0; c < component_count; ++c)
+          {
+            block_pixels[c].resize(pixel_count);
+
+            std::size_t idx = 0;
+            for (std::size_t y = 0; y < ctx.bh; ++y)
             {
-              const int gx = static_cast<int>(ctx.x0 + x);
-              const int gy = static_cast<int>(ctx.y0 + y);
+              for (std::size_t x = 0; x < ctx.bw; ++x)
+              {
+                const int gx = static_cast<int>(ctx.x0 + x);
+                const int gy = static_cast<int>(ctx.y0 + y);
 
-              const int a = sample_pixel(filtered_planes[c], gx - 1, gy);
-              const int b = sample_pixel(filtered_planes[c], gx, gy - 1);
-              const int cdiag = sample_pixel(filtered_planes[c], gx - 1, gy - 1);
-              const int pred = apply_predictor<uint8_t>(predictor_mode, a, b, cdiag);
-              int recon = pred + block_residuals[c][idx];
-              if (recon < 0)
-                recon = 0;
-              else if (recon > 255)
-                recon = 255;
+                const int a = sample_pixel(prediction_planes_u8[c], gx - 1, gy);
+                const int b = sample_pixel(prediction_planes_u8[c], gx, gy - 1);
+                const int cdiag = sample_pixel(prediction_planes_u8[c], gx - 1, gy - 1);
+                const int pred = apply_predictor<uint8_t>(predictor_mode, a, b, cdiag);
+                int recon = pred + block_residuals[c][idx];
+                if (recon < 0)
+                  recon = 0;
+                else if (recon > 255)
+                  recon = 255;
 
-              filtered_planes[c].row_ptr(ctx.y0 + y)[ctx.x0 + x] = static_cast<uint8_t>(recon);
-              block_pixels[c][idx] = static_cast<uint8_t>(recon);
-              ++idx;
+                prediction_planes_u8[c].row_ptr(ctx.y0 + y)[ctx.x0 + x] = static_cast<uint8_t>(recon);
+                block_pixels[c][idx] = static_cast<uint8_t>(recon);
+                ++idx;
+              }
+            }
+          }
+        }
+        else
+        {
+          for (std::size_t c = 0; c < component_count; ++c)
+          {
+            std::vector<int16_t> &channel = block_residuals[c];
+            std::size_t idx = 0;
+            for (std::size_t y = 0; y < ctx.bh; ++y)
+            {
+              for (std::size_t x = 0; x < ctx.bw; ++x)
+              {
+                const int gx = static_cast<int>(ctx.x0 + x);
+                const int gy = static_cast<int>(ctx.y0 + y);
+
+                const int a = sample_pixel(prediction_planes_i16[c], gx - 1, gy);
+                const int b = sample_pixel(prediction_planes_i16[c], gx, gy - 1);
+                const int cdiag = sample_pixel(prediction_planes_i16[c], gx - 1, gy - 1);
+                const int pred = apply_predictor<int16_t>(predictor_mode, a, b, cdiag);
+                int recon = pred + channel[idx];
+                if (recon < std::numeric_limits<int16_t>::min())
+                  recon = std::numeric_limits<int16_t>::min();
+                else if (recon > std::numeric_limits<int16_t>::max())
+                  recon = std::numeric_limits<int16_t>::max();
+
+                prediction_planes_i16[c].row_ptr(ctx.y0 + y)[ctx.x0 + x] = static_cast<int16_t>(recon);
+                channel[idx] = static_cast<int16_t>(recon);
+                ++idx;
+              }
+            }
+          }
+
+          if (component_count >= 3)
+          {
+            undo_color_filter(filter_code, block_residuals[0], block_residuals[1], block_residuals[2]);
+          }
+
+          for (std::size_t c = 0; c < component_count; ++c)
+          {
+            block_pixels[c].resize(pixel_count);
+            for (std::size_t idx = 0; idx < block_residuals[c].size(); ++idx)
+            {
+              int value = block_residuals[c][idx];
+              if (value < 0)
+                value = 0;
+              else if (value > 255)
+                value = 255;
+              block_pixels[c][idx] = static_cast<uint8_t>(value);
             }
           }
         }

@@ -84,22 +84,6 @@ namespace tlg::v7
       return encoder.estimate_bits(residuals);
     }
 
-    std::int64_t estimate_sequence_cost(const std::vector<int16_t> &seq)
-    {
-      if (seq.empty())
-        return 0;
-      std::int64_t cost = 0;
-      std::int64_t prev = static_cast<std::int64_t>(seq[0]);
-      for (std::size_t i = 1; i < seq.size(); ++i)
-      {
-        const std::int64_t cur = static_cast<std::int64_t>(seq[i]);
-        const std::int64_t diff = cur - prev;
-        cost += diff * diff;
-        prev = cur;
-      }
-      return cost;
-    }
-
     double compute_squared_entropy(const std::vector<std::vector<int16_t>> &residuals)
     {
       long double sum = 0.0;
@@ -112,45 +96,6 @@ namespace tlg::v7
         }
       }
       return static_cast<double>(sum);
-    }
-
-    int choose_filter_fast(const std::vector<int16_t> &src_b,
-                           const std::vector<int16_t> &src_g,
-                           const std::vector<int16_t> &src_r,
-                           std::vector<int16_t> &dst_b,
-                           std::vector<int16_t> &dst_g,
-                           std::vector<int16_t> &dst_r)
-    {
-      int best_code = 0;
-      std::int64_t best_score = std::numeric_limits<std::int64_t>::max();
-      std::vector<int16_t> tb, tg, tr;
-      tb.reserve(src_b.size());
-      tg.reserve(src_g.size());
-      tr.reserve(src_r.size());
-      for (int perm = 0; perm < COLOR_FILTER_PERMUTATIONS; ++perm)
-      {
-        for (int primary = 0; primary < COLOR_FILTER_PRIMARY_PREDICTORS; ++primary)
-        {
-          for (int secondary = 0; secondary < COLOR_FILTER_SECONDARY_PREDICTORS; ++secondary)
-          {
-            const int code = (perm << 4) | (primary << 2) | secondary;
-            tb.assign(src_b.begin(), src_b.end());
-            tg.assign(src_g.begin(), src_g.end());
-            tr.assign(src_r.begin(), src_r.end());
-            apply_color_filter(code, tb, tg, tr);
-            const std::int64_t score = estimate_sequence_cost(tb) + estimate_sequence_cost(tg) + estimate_sequence_cost(tr);
-            if (score < best_score)
-            {
-              best_score = score;
-              best_code = code;
-              dst_b = tb;
-              dst_g = tg;
-              dst_r = tr;
-            }
-          }
-        }
-      }
-      return best_code;
     }
 
     struct FilterSelectionResult
@@ -266,15 +211,16 @@ namespace tlg::v7
       return result;
     }
 
+    template <typename SampleT>
     void compute_per_block_prediction(const BlockContext &ctx,
-                                      const std::vector<uint8_t> &block_values,
-                                      const detail::image<uint8_t> &reference_plane,
+                                      const std::vector<SampleT> &block_values,
+                                      const detail::image<SampleT> &reference_plane,
                                       PredictorMode mode,
                                       std::vector<int16_t> &residual_out)
     {
       const std::size_t pixel_count = ctx.bw * ctx.bh;
       residual_out.resize(pixel_count);
-      std::vector<uint8_t> local_plane(pixel_count, 0);
+      std::vector<SampleT> local_plane(pixel_count, 0);
       std::size_t idx = 0;
       for (std::size_t y = 0; y < ctx.bh; ++y)
       {
@@ -282,16 +228,16 @@ namespace tlg::v7
         {
           const int gx = static_cast<int>(ctx.x0 + x);
           const int gy = static_cast<int>(ctx.y0 + y);
-          const uint8_t value = block_values[idx];
+          const SampleT value = block_values[idx];
 
-          const int a = (x > 0) ? local_plane[y * ctx.bw + (x - 1)]
+          const int a = (x > 0) ? static_cast<int>(local_plane[y * ctx.bw + (x - 1)])
                                 : sample_pixel(reference_plane, gx - 1, gy);
-          const int b = (y > 0) ? local_plane[(y - 1) * ctx.bw + x]
+          const int b = (y > 0) ? static_cast<int>(local_plane[(y - 1) * ctx.bw + x])
                                 : sample_pixel(reference_plane, gx, gy - 1);
-          const int cdiag = (x > 0 && y > 0) ? local_plane[(y - 1) * ctx.bw + (x - 1)]
+          const int cdiag = (x > 0 && y > 0) ? static_cast<int>(local_plane[(y - 1) * ctx.bw + (x - 1)])
                                              : sample_pixel(reference_plane, gx - 1, gy - 1);
 
-          const int pred = apply_predictor<uint8_t>(mode, a, b, cdiag);
+          const int pred = apply_predictor<SampleT>(mode, a, b, cdiag);
           residual_out[idx] = static_cast<int16_t>(static_cast<int>(value) - pred);
           local_plane[y * ctx.bw + x] = value;
           ++idx;
@@ -306,6 +252,7 @@ namespace tlg::v7
       uint64_t bit_cost = std::numeric_limits<uint64_t>::max();
       std::vector<std::vector<int16_t>> residuals;
       int diff_filter_index = 0;
+      std::vector<std::vector<int16_t>> predictor_signal;
     };
 
   } // namespace
@@ -316,7 +263,7 @@ namespace tlg::v7
     bool write_raw(FILE *fp,
                    const PixelBuffer &src,
                    int colors,
-                   bool fast_mode,
+                   TlgOptions::Tlg7PipelineOrder pipeline_order,
                    const std::string &dump_residuals_path,
                    TlgOptions::DumpResidualsOrder dump_residuals_order,
                    std::string &err)
@@ -356,8 +303,13 @@ namespace tlg::v7
         return false;
       }
 
+      const PipelineOrder order = (pipeline_order == TlgOptions::Tlg7PipelineOrder::PredictorThenFilter)
+                                      ? PipelineOrder::PredictorThenFilter
+                                      : PipelineOrder::FilterThenPredictor;
+
       detail::Header hdr;
       hdr.colors = static_cast<uint8_t>(colors);
+      hdr.flags = static_cast<uint8_t>(order == PipelineOrder::FilterThenPredictor ? 1 : 0);
       hdr.width = src.width;
       hdr.height = src.height;
       hdr.block_count = static_cast<uint32_t>(block_count);
@@ -387,10 +339,20 @@ namespace tlg::v7
       const std::size_t component_count = (colors == 4) ? 4u : (colors == 3 ? 3u : 1u);
 
       auto planes = extract_planes(src, colors);
-      std::vector<detail::image<uint8_t>> filtered_planes;
-      filtered_planes.reserve(component_count);
-      for (std::size_t i = 0; i < component_count; ++i)
-        filtered_planes.emplace_back(width, height, 0);
+      std::vector<detail::image<uint8_t>> predictor_planes_u8;
+      std::vector<detail::image<int16_t>> predictor_planes_i16;
+      if (order == PipelineOrder::PredictorThenFilter)
+      {
+        predictor_planes_u8.reserve(component_count);
+        for (std::size_t i = 0; i < component_count; ++i)
+          predictor_planes_u8.emplace_back(width, height, 0);
+      }
+      else
+      {
+        predictor_planes_i16.reserve(component_count);
+        for (std::size_t i = 0; i < component_count; ++i)
+          predictor_planes_i16.emplace_back(width, height, static_cast<int16_t>(0));
+      }
 
       GolombResidualEntropyEncoder entropy_encoder;
       std::vector<uint8_t> encoded_stream;
@@ -437,30 +399,20 @@ namespace tlg::v7
               cand.mode = mode;
               cand.residuals.resize(component_count);
 
-              for (std::size_t c = 0; c < component_count; ++c)
-                compute_per_block_prediction(ctx, block_values[c], filtered_planes[c], mode, cand.residuals[c]);
-
-              const double predictor_entropy = compute_squared_entropy(cand.residuals);
-              if (best_prediction_entropy < std::numeric_limits<double>::infinity() &&
-                  predictor_entropy > best_prediction_entropy * PER_BLOCK_PREDICTION_EARLY_EXIT_RATIO)
-                continue;
-              if (predictor_entropy < best_prediction_entropy)
-                best_prediction_entropy = predictor_entropy;
-
-              int filter_code = 0;
-              if (component_count >= 3)
+              if (order == PipelineOrder::PredictorThenFilter)
               {
-                if (fast_mode)
-                {
-                  std::vector<int16_t> filtered_b;
-                  std::vector<int16_t> filtered_g;
-                  std::vector<int16_t> filtered_r;
-                  filter_code = choose_filter_fast(cand.residuals[0], cand.residuals[1], cand.residuals[2], filtered_b, filtered_g, filtered_r);
-                  cand.residuals[0] = std::move(filtered_b);
-                  cand.residuals[1] = std::move(filtered_g);
-                  cand.residuals[2] = std::move(filtered_r);
-                }
-                else
+                for (std::size_t c = 0; c < component_count; ++c)
+                  compute_per_block_prediction(ctx, block_values[c], predictor_planes_u8[c], mode, cand.residuals[c]);
+
+                const double predictor_entropy = compute_squared_entropy(cand.residuals);
+                if (best_prediction_entropy < std::numeric_limits<double>::infinity() &&
+                    predictor_entropy > best_prediction_entropy * PER_BLOCK_PREDICTION_EARLY_EXIT_RATIO)
+                  continue;
+                if (predictor_entropy < best_prediction_entropy)
+                  best_prediction_entropy = predictor_entropy;
+
+                int filter_code = 0;
+                if (component_count >= 3)
                 {
                   auto selection = choose_filter_optimal(ctx,
                                                          cand.residuals[0],
@@ -471,15 +423,94 @@ namespace tlg::v7
                   cand.residuals[1] = std::move(selection.filtered[1]);
                   cand.residuals[2] = std::move(selection.filtered[2]);
                 }
-              }
 
-              cand.filter_code = filter_code;
-              const double color_filter_entropy = compute_squared_entropy(cand.residuals);
-              if (best_color_filter_entropy < std::numeric_limits<double>::infinity() &&
-                  color_filter_entropy > best_color_filter_entropy * COLOR_FILTER_EARLY_EXIT_RATIO)
-                continue;
-              if (color_filter_entropy < best_color_filter_entropy)
-                best_color_filter_entropy = color_filter_entropy;
+                cand.filter_code = filter_code;
+                const double color_filter_entropy = compute_squared_entropy(cand.residuals);
+                if (best_color_filter_entropy < std::numeric_limits<double>::infinity() &&
+                    color_filter_entropy > best_color_filter_entropy * COLOR_FILTER_EARLY_EXIT_RATIO)
+                  continue;
+                if (color_filter_entropy < best_color_filter_entropy)
+                  best_color_filter_entropy = color_filter_entropy;
+              }
+              else
+              {
+                std::vector<std::vector<int16_t>> base_signal(component_count);
+                for (std::size_t c = 0; c < component_count; ++c)
+                {
+                  base_signal[c].resize(block_values[c].size());
+                  std::transform(block_values[c].begin(),
+                                 block_values[c].end(),
+                                 base_signal[c].begin(),
+                                 [](uint8_t v)
+                                 { return static_cast<int16_t>(v); });
+                }
+
+                if (component_count >= 3)
+                {
+                  uint64_t best_bits_estimate = std::numeric_limits<uint64_t>::max();
+                  int best_filter_code = 0;
+                  std::vector<std::vector<int16_t>> best_signal(component_count);
+                  std::vector<std::vector<int16_t>> best_residuals(component_count);
+
+                  for (int perm = 0; perm < COLOR_FILTER_PERMUTATIONS; ++perm)
+                  {
+                    for (int primary = 0; primary < COLOR_FILTER_PRIMARY_PREDICTORS; ++primary)
+                    {
+                      for (int secondary = 0; secondary < COLOR_FILTER_SECONDARY_PREDICTORS; ++secondary)
+                      {
+                        const int code = (perm << 4) | (primary << 2) | secondary;
+                        std::array<std::vector<int16_t>, 3> filtered = {base_signal[0],
+                                                                        base_signal[1],
+                                                                        base_signal[2]};
+                        apply_color_filter(code, filtered[0], filtered[1], filtered[2]);
+
+                        std::vector<std::vector<int16_t>> candidate_signal(component_count);
+                        candidate_signal[0] = filtered[0];
+                        candidate_signal[1] = filtered[1];
+                        candidate_signal[2] = filtered[2];
+                        for (std::size_t extra = 3; extra < component_count; ++extra)
+                        {
+                          candidate_signal[extra] = base_signal[extra];
+                        }
+
+                        std::vector<std::vector<int16_t>> candidate_residuals(component_count);
+                        for (std::size_t c = 0; c < component_count; ++c)
+                          compute_per_block_prediction(ctx, candidate_signal[c], predictor_planes_i16[c], mode, candidate_residuals[c]);
+
+                        uint64_t total_bits = 0;
+                        for (std::size_t c = 0; c < component_count; ++c)
+                        {
+                          std::vector<int16_t> tmp = candidate_residuals[c];
+                          if (is_full_block)
+                            reorder_to_hilbert(tmp);
+                          total_bits += estimate_residual_bits(tmp, c);
+                          if (total_bits >= best_bits_estimate)
+                            break;
+                        }
+
+                        if (total_bits < best_bits_estimate)
+                        {
+                          best_bits_estimate = total_bits;
+                          best_filter_code = code;
+                          best_signal = candidate_signal;
+                          best_residuals = candidate_residuals;
+                        }
+                      }
+                    }
+                  }
+
+                  cand.filter_code = best_filter_code;
+                  cand.predictor_signal = std::move(best_signal);
+                  cand.residuals = std::move(best_residuals);
+                }
+                else
+                {
+                  cand.filter_code = 0;
+                  cand.predictor_signal = std::move(base_signal);
+                  for (std::size_t c = 0; c < component_count; ++c)
+                    compute_per_block_prediction(ctx, cand.predictor_signal[c], predictor_planes_i16[c], mode, cand.residuals[c]);
+                }
+              }
 
               const auto base_residuals = cand.residuals;
               std::vector<std::vector<int16_t>> best_residuals;
@@ -553,8 +584,21 @@ namespace tlg::v7
               chunk_residuals[c].insert(chunk_residuals[c].end(), residual.begin(), residual.end());
             }
 
-            for (std::size_t c = 0; c < component_count; ++c)
-              store_block_to_plane(filtered_planes[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_values[c]);
+            if (order == PipelineOrder::PredictorThenFilter)
+            {
+              for (std::size_t c = 0; c < component_count; ++c)
+                store_block_to_plane(predictor_planes_u8[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, block_values[c]);
+            }
+            else
+            {
+              if (best_candidate.predictor_signal.size() != component_count)
+              {
+                err = "tlg7: missing predictor signal";
+                return false;
+              }
+              for (std::size_t c = 0; c < component_count; ++c)
+                store_block_to_plane(predictor_planes_i16[c], ctx.x0, ctx.y0, ctx.bw, ctx.bh, best_candidate.predictor_signal[c]);
+            }
           }
         }
 
