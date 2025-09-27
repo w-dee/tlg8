@@ -65,7 +65,7 @@ struct TlgOptions
   std::string tlg7_golomb_table_path;   // optional override for TLG7 Golomb table
   std::string tlg7_dump_residuals_path; // optional residual dump output for TLG7 encoder
   DumpResidualsOrder tlg7_dump_residuals_order = DumpResidualsOrder::AfterHilbert;
-  Tlg7PipelineOrder tlg7_pipeline_order = Tlg7PipelineOrder::FilterThenPredictor;
+  Tlg7PipelineOrder tlg7_pipeline_order = Tlg7PipelineOrder::PredictorThenFilter;
 };
 
 bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err);
