@@ -451,6 +451,7 @@ namespace tlg::v7
                   int best_filter_code = 0;
                   std::vector<std::vector<int16_t>> best_signal(component_count);
                   std::vector<std::vector<int16_t>> best_residuals(component_count);
+                  bool found_candidate = false;
 
                   for (int perm = 0; perm < COLOR_FILTER_PERMUTATIONS; ++perm)
                   {
@@ -473,9 +474,24 @@ namespace tlg::v7
                           candidate_signal[extra] = base_signal[extra];
                         }
 
+                        const double color_filter_entropy = compute_squared_entropy(candidate_signal);
+                        if (best_color_filter_entropy < std::numeric_limits<double>::infinity() &&
+                            color_filter_entropy > best_color_filter_entropy * COLOR_FILTER_EARLY_EXIT_RATIO)
+                          continue;
+
                         std::vector<std::vector<int16_t>> candidate_residuals(component_count);
                         for (std::size_t c = 0; c < component_count; ++c)
                           compute_per_block_prediction(ctx, candidate_signal[c], predictor_planes_i16[c], mode, candidate_residuals[c]);
+
+                        const double predictor_entropy = compute_squared_entropy(candidate_residuals);
+                        if (best_prediction_entropy < std::numeric_limits<double>::infinity() &&
+                            predictor_entropy > best_prediction_entropy * PER_BLOCK_PREDICTION_EARLY_EXIT_RATIO)
+                          continue;
+                        if (predictor_entropy < best_prediction_entropy)
+                          best_prediction_entropy = predictor_entropy;
+
+                        if (color_filter_entropy < best_color_filter_entropy)
+                          best_color_filter_entropy = color_filter_entropy;
 
                         uint64_t total_bits = 0;
                         for (std::size_t c = 0; c < component_count; ++c)
@@ -492,12 +508,16 @@ namespace tlg::v7
                         {
                           best_bits_estimate = total_bits;
                           best_filter_code = code;
-                          best_signal = candidate_signal;
-                          best_residuals = candidate_residuals;
+                          best_signal = std::move(candidate_signal);
+                          best_residuals = std::move(candidate_residuals);
+                          found_candidate = true;
                         }
                       }
                     }
                   }
+
+                  if (!found_candidate)
+                    continue;
 
                   cand.filter_code = best_filter_code;
                   cand.predictor_signal = std::move(best_signal);
@@ -506,9 +526,24 @@ namespace tlg::v7
                 else
                 {
                   cand.filter_code = 0;
+                  const double color_filter_entropy = compute_squared_entropy(base_signal);
+                  if (best_color_filter_entropy < std::numeric_limits<double>::infinity() &&
+                      color_filter_entropy > best_color_filter_entropy * COLOR_FILTER_EARLY_EXIT_RATIO)
+                    continue;
+
                   cand.predictor_signal = std::move(base_signal);
                   for (std::size_t c = 0; c < component_count; ++c)
                     compute_per_block_prediction(ctx, cand.predictor_signal[c], predictor_planes_i16[c], mode, cand.residuals[c]);
+
+                  const double predictor_entropy = compute_squared_entropy(cand.residuals);
+                  if (best_prediction_entropy < std::numeric_limits<double>::infinity() &&
+                      predictor_entropy > best_prediction_entropy * PER_BLOCK_PREDICTION_EARLY_EXIT_RATIO)
+                    continue;
+                  if (predictor_entropy < best_prediction_entropy)
+                    best_prediction_entropy = predictor_entropy;
+
+                  if (color_filter_entropy < best_color_filter_entropy)
+                    best_color_filter_entropy = color_filter_entropy;
                 }
               }
 
