@@ -274,14 +274,14 @@ namespace tlg::v7
             long m = ((e >= 0) ? (2 * e) : (-2 * e - 1)) - 1;
             if (m < 0)
               m = 0;
-            int k = GolombBitLengthTable[a >> 2][n];
+            int k = GolombBitLengthTable[a][n];
             long q = (k > 0) ? (m >> k) : m;
             for (; q > 0; --q)
               bs.Put1Bit(0);
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            a = m + (a - (a >> 2)); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
+            a = (m + a + 1) >> 1; // mix 50% of m and 50% of previous a
           }
           i = ii - 1;
         }
@@ -457,7 +457,7 @@ namespace tlg::v7
 
         for (int i = 0; i < run; ++i)
         {
-          int k = GolombBitLengthTable[a >> 2][n];
+          int k = GolombBitLengthTable[a][n];
           int q = 0;
           while (true)
           {
@@ -477,7 +477,7 @@ namespace tlg::v7
           int residual = (vv ^ sign) + sign + 1;
 
           out.push_back(static_cast<int16_t>(residual));
-          a = m + (a - (a >> 2)); // a is Q2 fixed-point; mix 25% of m and 75% of previous a
+          a = (m + a + 1) >> 1;
         }
 
         expect_nonzero = false;
