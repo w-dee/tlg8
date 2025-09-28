@@ -2,7 +2,7 @@
 """
 Round-trip tests for tlgconv using the sample BMP images in test/images.
 
-For each *.bmp file, the script converts it to TLG5, TLG6 and TLG7 into a temporary
+For each *.bmp file, the script converts it to PNG, TLG6 and TLG7 into a temporary
 folder, converts back to BMP, and checks the reconstructed BMP matches the
 original via the `cmp` command.
 
@@ -13,7 +13,9 @@ import argparse
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+from typing import NamedTuple, Sequence
 
 
 def run_command(cmd, **kwargs):
@@ -25,33 +27,48 @@ def run_command(cmd, **kwargs):
     return result
 
 
-def roundtrip(
-    bmp_path: Path, tlgconv: Path, temp_dir: Path, version: str
-) -> tuple[bool, str | None]:
-    tlg_suffix = f".tlg{version}" if version in {"6", "7"} else ".tlg"
-    tlg_path = temp_dir / f"{bmp_path.stem}{tlg_suffix}"
-    recon_bmp = temp_dir / f"{bmp_path.stem}.roundtrip.v{version}.bmp"
+class FormatSpec(NamedTuple):
+    name: str
+    extension: str
+    encode_args: Sequence[str]
 
-    run_command([
-        str(tlgconv),
-        str(bmp_path),
-        str(tlg_path),
-        f"--tlg-version={version}",
-    ])
+
+def run_timed_command(cmd: Sequence[str], **kwargs) -> float:
+    start = time.perf_counter()
+    run_command(cmd, **kwargs)
+    return time.perf_counter() - start
+
+
+def roundtrip(
+    bmp_path: Path,
+    tlgconv: Path,
+    temp_dir: Path,
+    spec: FormatSpec,
+    stats: dict[str, dict[str, float]],
+) -> tuple[bool, str | None]:
+    compressed_path = temp_dir / f"{bmp_path.stem}{spec.extension}"
+    recon_bmp = temp_dir / f"{bmp_path.stem}.roundtrip.{spec.name}.bmp"
+
+    encode_cmd = [str(tlgconv), str(bmp_path), str(compressed_path), *spec.encode_args]
+    encode_time = run_timed_command(encode_cmd)
 
     original_size = bmp_path.stat().st_size
-    compressed_size = tlg_path.stat().st_size
+    compressed_size = compressed_path.stat().st_size
     compression_ratio = (compressed_size / original_size * 100) if original_size else 0.0
+
+    decode_cmd = [str(tlgconv), str(compressed_path), str(recon_bmp)]
+    decode_time = run_timed_command(decode_cmd)
+
     print(
-        f"    tlg{version}: pre={original_size} bytes, post={compressed_size} bytes, "
-        f"ratio={compression_ratio:.2f}%"
+        f"    {spec.name}: pre={original_size} bytes, post={compressed_size} bytes, "
+        f"ratio={compression_ratio:.2f}%, enc={encode_time:.3f}s, dec={decode_time:.3f}s"
     )
 
-    run_command([
-        str(tlgconv),
-        str(tlg_path),
-        str(recon_bmp),
-    ])
+    stat = stats[spec.name]
+    stat["original"] += original_size
+    stat["compressed"] += compressed_size
+    stat["compress_time"] += encode_time
+    stat["decompress_time"] += decode_time
 
     try:
         cmp_proc = subprocess.run(
@@ -65,11 +82,18 @@ def roundtrip(
     if cmp_proc.returncode != 0:
         return (
             False,
-            f"Mismatch detected for {bmp_path.name} (tlg{version} round-trip)",
+            f"Mismatch detected for {bmp_path.name} ({spec.name} round-trip)",
         )
 
     return True, None
 
+
+
+FORMATS: tuple[FormatSpec, ...] = (
+    FormatSpec("png", ".png", ()),
+    FormatSpec("tlg6", ".tlg6", ("--tlg-version=6",)),
+    FormatSpec("tlg7", ".tlg7", ("--tlg-version=7",)),
+)
 
 
 def main(argv: list[str]) -> int:
@@ -98,16 +122,39 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"No BMP files found in {args.images}")
 
     mismatches: list[str] = []
+    stats = {
+        spec.name: {
+            "original": 0.0,
+            "compressed": 0.0,
+            "compress_time": 0.0,
+            "decompress_time": 0.0,
+        }
+        for spec in FORMATS
+    }
+
+    format_names = "/".join(spec.name for spec in FORMATS)
 
     with tempfile.TemporaryDirectory(prefix="tlgconv_roundtrip_") as tmp:
         tmp_path = Path(tmp)
         for bmp in bmp_files:
-            print(f"[INFO] Testing {bmp.name} -> tlg6/tlg7 round-trip")
-            for version in ("6", "7"):
-                success, message = roundtrip(bmp, args.tlgconv, tmp_path, version)
+            print(f"[INFO] Testing {bmp.name} -> {format_names} round-trip")
+            for spec in FORMATS:
+                success, message = roundtrip(bmp, args.tlgconv, tmp_path, spec, stats)
                 if not success and message:
                     print(f"[ERROR] {message}")
                     mismatches.append(message)
+
+    print("[SUMMARY] Round-trip totals by format:")
+    for spec in FORMATS:
+        stat = stats[spec.name]
+        original_total = stat["original"]
+        compressed_total = stat["compressed"]
+        ratio = (compressed_total / original_total * 100) if original_total else 0.0
+        print(
+            f"    {spec.name}: bmp_total={int(original_total)} bytes, "
+            f"compressed_total={int(compressed_total)} bytes, ratio={ratio:.2f}%, "
+            f"enc_total={stat['compress_time']:.3f}s, dec_total={stat['decompress_time']:.3f}s"
+        )
 
     if mismatches:
         print("[FAILURE] Round-trip mismatches detected:")
