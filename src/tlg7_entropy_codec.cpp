@@ -39,9 +39,9 @@ namespace tlg::v7
     constexpr ParsedGolombTable parse_default_golomb_table()
     {
       constexpr char data[] = R"(
-2 2 3 9 18 107 267 486 130
-2 2 4 10 81 91 231 467 136
-2 2 5 13 70 93 241 458 140
+2 2 3 7 22 92 271 484 141
+2 2 4 12 71 93 231 479 130
+3 1 4 15 73 98 240 460 130
         )";
 
       ParsedGolombTable result{};
