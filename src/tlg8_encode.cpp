@@ -162,7 +162,8 @@ namespace tlg::v8::enc
     entropy_encode_context entropy_ctx{};
     std::vector<uint8_t> reconstructed_tile(static_cast<size_t>(tile_w) * tile_h * components, 0);
 
-    auto compute_energy = [](const component_colors &colors, uint32_t comp_count, uint32_t value_count) {
+    auto compute_energy = [](const component_colors &colors, uint32_t comp_count, uint32_t value_count)
+    {
       double energy = 0.0;
       for (uint32_t comp = 0; comp < comp_count; ++comp)
       {
@@ -259,34 +260,10 @@ namespace tlg::v8::enc
         // reorder は固定だが、filter やエントロピー符号化方式と同じ基準で
         // 比較する設計とし、将来的に並び替え候補を増やしても流用できるよう
         // にしている。
-        if (!writer.write_u8(static_cast<uint8_t>(best_predictor)))
-        {
-          err = "tlg8: 予測器インデックスの書き込みに失敗しました";
-          return false;
-        }
-        if (!writer.write_u8(static_cast<uint8_t>(best_filter)))
-        {
-          err = "tlg8: カラーフィルターインデックスの書き込みに失敗しました";
-          return false;
-        }
-        if (!writer.write_u8(static_cast<uint8_t>(best_entropy)))
-        {
-          err = "tlg8: エントロピーインデックスの書き込みに失敗しました";
-          return false;
-        }
-        // ブロックの実寸法は現状 8x8 固定だが、タイル端では縮むため
-        // 明示的に記録している。将来 reorder がブロックサイズ依存になる
-        // 場合にもこの情報を利用する想定。
-        if (!writer.write_u8(static_cast<uint8_t>(block_w)))
-        {
-          err = "tlg8: ブロック幅の書き込みに失敗しました";
-          return false;
-        }
-        if (!writer.write_u8(static_cast<uint8_t>(block_h)))
-        {
-          err = "tlg8: ブロック高さの書き込みに失敗しました";
-          return false;
-        }
+        writer.put_upto8(best_predictor, 3);
+        writer.put_upto8(best_filter, 3 + 2 + 2);
+        writer.put_upto8(best_entropy, 1);
+
         for (uint32_t by = 0; by < block_h; ++by)
         {
           for (uint32_t bx = 0; bx < block_w; ++bx)

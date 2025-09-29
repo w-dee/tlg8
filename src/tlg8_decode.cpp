@@ -80,55 +80,30 @@ namespace tlg::v8
       {
         const uint32_t block_w = std::min(enc::kBlockSize, tile_w - block_x);
         block_info info{};
-        if (!reader.read_u8(info.predictor))
-        {
-          err = "tlg8: タイルデータが不足しています";
-          return false;
-        }
+
+        info.predictor = reader.get_upto8(3);
         if (info.predictor >= enc::kNumPredictors)
         {
           err = "tlg8: 不正な予測器インデックスです";
           return false;
         }
 
-        if (!reader.read_u8(info.filter))
-        {
-          err = "tlg8: タイルデータが不足しています";
-          return false;
-        }
+        info.filter = reader.get_upto8(3 + 2 + 2);
         if (info.filter >= enc::kColorFilterCodeCount)
         {
           err = "tlg8: 不正なカラーフィルターインデックスです";
           return false;
         }
 
-        if (!reader.read_u8(info.entropy))
-        {
-          err = "tlg8: タイルデータが不足しています";
-          return false;
-        }
+        info.entropy = reader.get_upto8(1);
         if (info.entropy >= enc::kNumEntropyEncoders)
         {
           err = "tlg8: 不正なエントロピーインデックスです";
           return false;
         }
 
-        if (!reader.read_u8(info.block_w) || !reader.read_u8(info.block_h))
-        {
-          err = "tlg8: タイルデータが不足しています";
-          return false;
-        }
-        if (info.block_w == 0 || info.block_h == 0)
-        {
-          err = "tlg8: 不正なブロック寸法です";
-          return false;
-        }
-        if (info.block_w != block_w || info.block_h != block_h)
-        {
-          err = "tlg8: ブロック寸法が一致しません";
-          return false;
-        }
-
+        info.block_w = static_cast<uint8_t>(block_w);
+        info.block_h = static_cast<uint8_t>(block_h);
         blocks.push_back(info);
       }
     }
@@ -188,7 +163,9 @@ namespace tlg::v8
               value = std::clamp(value, 0, 255);
               const size_t dst_index =
                   (static_cast<size_t>(origin_y + static_cast<uint32_t>(ty)) * image_width +
-                   static_cast<size_t>(origin_x + static_cast<uint32_t>(tx))) * components + comp;
+                   static_cast<size_t>(origin_x + static_cast<uint32_t>(tx))) *
+                      components +
+                  comp;
               if (dst_index >= decoded.size())
               {
                 err = "tlg8: 出力バッファ範囲外に書き込もうとしました";
