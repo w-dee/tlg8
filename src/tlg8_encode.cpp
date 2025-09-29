@@ -155,7 +155,8 @@ namespace tlg::v8::enc
     const auto &entropy_encoders = entropy_encoder_table();
     // 将来的にはここで並び替え候補も列挙し、
     // predictor × filter × reorder × entropy の全組み合わせを評価する。
-    // 現段階では reorder 段を除いた predictor × filter × entropy を探索している。
+    // 現状は reorder をヒルベルト固定とし、predictor × filter × entropy の
+    // 組み合わせを探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
     entropy_encode_context entropy_ctx{};
     std::vector<uint8_t> reconstructed_tile(static_cast<size_t>(tile_w) * tile_h * components, 0);
@@ -219,7 +220,9 @@ namespace tlg::v8::enc
         }
 
         // 最小の推定ビット長を与えた組み合わせを採用する。
-        // 今後 filter / reorder を導入した際も同じ基準で比較する予定。
+        // reorder は固定だが、filter やエントロピー符号化方式と同じ基準で
+        // 比較する設計とし、将来的に並び替え候補を増やしても流用できるよう
+        // にしている。
         if (!writer.write_u8(static_cast<uint8_t>(best_predictor)))
         {
           err = "tlg8: 予測器インデックスの書き込みに失敗しました";
