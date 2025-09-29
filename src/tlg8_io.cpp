@@ -164,6 +164,13 @@ namespace tlg::v8
     }
   }
 
+  bool decode_for_tile(detail::bitio::BitReader &reader,
+                       uint32_t tile_w,
+                       uint32_t components,
+                       size_t row_offset,
+                       std::vector<uint8_t> &decoded,
+                       std::string &err);
+
   bool decode_stream(FILE *fp, PixelBuffer &out, std::string &err)
   {
     err.clear();
@@ -271,19 +278,8 @@ namespace tlg::v8
         for (uint32_t dy = 0; dy < tile_h; ++dy)
         {
           const size_t row_offset = (static_cast<size_t>(origin_y + dy) * width + origin_x) * components;
-          for (uint32_t dx = 0; dx < tile_w; ++dx)
-          {
-            for (uint32_t c = 0; c < components; ++c)
-            {
-              uint8_t value = 0;
-              if (!reader.read_u8(value))
-              {
-                err = "tlg8: tile payload truncated";
-                return false;
-              }
-              decoded[row_offset + static_cast<size_t>(dx) * components + c] = value;
-            }
-          }
+          if (!decode_for_tile(reader, tile_w, components, row_offset, decoded, err))
+            return false;
         }
       }
     }
@@ -300,6 +296,12 @@ namespace tlg::v8
 
   namespace enc
   {
+    bool encode_for_tile(detail::bitio::BitWriter &writer,
+                         const uint8_t *row_ptr,
+                         uint32_t tile_w,
+                         uint32_t components,
+                         std::string &err);
+
     bool write_raw(FILE *fp, const PixelBuffer &src, int desired_colors, std::string &err)
     {
       err.clear();
@@ -378,18 +380,8 @@ namespace tlg::v8
           {
             const size_t row_offset = (static_cast<size_t>(origin_y + dy) * width + origin_x) * components;
             const uint8_t *row_ptr = packed_ptr + row_offset;
-            for (uint32_t dx = 0; dx < tile_w; ++dx)
-            {
-              const size_t pixel_base = static_cast<size_t>(dx) * components;
-              for (uint32_t c = 0; c < components; ++c)
-              {
-                if (!writer.write_u8(row_ptr[pixel_base + c]))
-                {
-                  err = "tlg8: tile buffer overflow";
-                  return false;
-                }
-              }
-            }
+            if (!encode_for_tile(writer, row_ptr, tile_w, components, err))
+              return false;
           }
           if (!writer.align_to_u32_zero() || !writer.finish())
           {

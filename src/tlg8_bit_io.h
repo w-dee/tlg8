@@ -32,7 +32,7 @@ namespace tlg::v8::detail::bitio
 {
 
 #if BITIO_HAVE_UINT128
-    using acc_t = unsigned __int128; // 128-bit accumulator
+    __extension__ using acc_t = unsigned __int128; // 128-bit accumulator
     static inline constexpr unsigned ACC_BITS = 128;
 #else
     using acc_t = unsigned long long; // 64-bit accumulator fallback

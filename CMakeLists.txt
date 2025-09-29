@@ -48,6 +48,8 @@ add_executable(tlgconv
     src/tlg7_encoder.cpp
     src/tlg7_entropy_codec.cpp
     src/tlg8_io.cpp
+    src/tlg8_decode.cpp
+    src/tlg8_encode.cpp
 )
 
 target_include_directories(tlgconv PRIVATE src)
