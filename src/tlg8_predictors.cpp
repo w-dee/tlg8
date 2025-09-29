@@ -4,6 +4,8 @@ namespace
 {
   using tlg::v8::enc::predictor_fn;
 
+  // JPEG-LS 同様の MED 関数。今後 predictor の差し替えが必要になっても
+  // ここを通じて共有できるため、無名名前空間内で保持する。
   constexpr uint8_t med(uint8_t a, uint8_t b, uint8_t c) noexcept
   {
     const uint8_t max_a_b = a > b ? a : b;

@@ -10,6 +10,10 @@
 
 namespace
 {
+  // タイル全体を 8x8 ブロックへ分割し、予測→（今後追加予定の）
+  // カラー相関フィルター→並び替え→エントロピー符号と流すパイプライン。
+  // 現段階では予測器とエントロピー符号器のみを実装しており、残りの段は
+  // 別タスクで追加する前提でコメントにて意図を残している。
   struct tile_accessor
   {
     const uint8_t *base;
@@ -52,6 +56,9 @@ namespace
     }
   };
 
+  // TODO: predictor の出力をこの後にカラー相関フィルターへ渡し、
+  // ブロック内の並び替え（haar など）を適用する予定。現時点では
+  // それら未実装のため、純粋な予測残差のみを component_colors に詰める。
   void compute_residual_block(const tile_accessor &accessor,
                               tlg::v8::enc::component_colors &out,
                               tlg::v8::enc::predictor_fn predictor,
@@ -107,6 +114,9 @@ namespace tlg::v8::enc
 
     const auto &predictors = predictor_table();
     const auto &entropy_encoders = entropy_encoder_table();
+    // 将来的にはここでカラー相関フィルターや並び替え候補も列挙し、
+    // predictor × filter × reorder × entropy の全組み合わせを評価する。
+    // 現段階では predictor × entropy のみ探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
 
     for (uint32_t block_y = 0; block_y < tile_h; block_y += kBlockSize)
@@ -139,6 +149,8 @@ namespace tlg::v8::enc
           }
         }
 
+        // 最小の推定ビット長を与えた組み合わせを採用する。
+        // 今後 filter / reorder を導入した際も同じ基準で比較する予定。
         if (!writer.write_u8(static_cast<uint8_t>(best_predictor)))
         {
           err = "tlg8: 予測器インデックスの書き込みに失敗しました";
@@ -149,6 +161,9 @@ namespace tlg::v8::enc
           err = "tlg8: エントロピーインデックスの書き込みに失敗しました";
           return false;
         }
+        // ブロックの実寸法は現状 8x8 固定だが、タイル端では縮むため
+        // 明示的に記録している。将来 reorder がブロックサイズ依存になる
+        // 場合にもこの情報を利用する想定。
         if (!writer.write_u8(static_cast<uint8_t>(block_w)))
         {
           err = "tlg8: ブロック幅の書き込みに失敗しました";

@@ -5,6 +5,9 @@
 
 namespace tlg::v8::enc
 {
+  // 予測器は JPEG-LS 互換の 8 通りを当面利用する。
+  // 後段のフィルター／エントロピーとの組み合わせ最適化の際に
+  // インデックスで参照するため、順序は固定する。
   constexpr uint32_t kNumPredictors = 8;
 
   using predictor_fn = uint8_t (*)(uint8_t, uint8_t, uint8_t, uint8_t);

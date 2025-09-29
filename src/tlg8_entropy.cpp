@@ -33,6 +33,9 @@ namespace
     return true;
   }
 
+  // TODO: 実際には 2 種類のエントロピー符号器（たとえばハフマン系と
+  // ゴロム系など）をここで切り替える予定。現状は組み合わせ探索の流れを
+  // 確認するため、双方とも同じ "dumb" 実装を差し込んでいる。
   constexpr std::array<tlg::v8::enc::entropy_encoder, tlg::v8::enc::kNumEntropyEncoders> kEncoders = {
       tlg::v8::enc::entropy_encoder{&estimate_dumb, &encode_dumb},
       tlg::v8::enc::entropy_encoder{&estimate_dumb, &encode_dumb}};
