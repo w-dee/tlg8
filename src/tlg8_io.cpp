@@ -270,13 +270,6 @@ namespace tlg::v8
           err = "tlg8: failed to read tile payload";
           return false;
         }
-        const size_t expected_bytes = static_cast<size_t>(tile_w) * tile_h * components;
-        if (tile_size < expected_bytes)
-        {
-          err = "tlg8: tile payload too small";
-          return false;
-        }
-
         detail::bitio::BitReader reader(tile_buffer.data(), tile_size);
         if (!decode_for_tile(reader,
                              tile_w,

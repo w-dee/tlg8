@@ -4,9 +4,11 @@
 #include "tlg8_predictors.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -60,7 +62,11 @@ namespace
   // ブロック内の並び替え（haar など）を適用する予定。現時点では
   // それら未実装のため、純粋な予測残差のみを component_colors に詰める。
   void compute_residual_block(const tile_accessor &accessor,
+                              const std::vector<uint8_t> &reconstructed_tile,
+                              uint32_t tile_w,
+                              uint32_t tile_h,
                               tlg::v8::enc::component_colors &out,
+                              std::array<std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels>, 4> &reconstructed_block,
                               tlg::v8::enc::predictor_fn predictor,
                               uint32_t components,
                               uint32_t block_x,
@@ -69,6 +75,8 @@ namespace
                               uint32_t block_h)
   {
     for (auto &component : out.values)
+      component.fill(0);
+    for (auto &component : reconstructed_block)
       component.fill(0);
 
     uint32_t index = 0;
@@ -80,13 +88,44 @@ namespace
         const int32_t ty = static_cast<int32_t>(block_y + by);
         for (uint32_t comp = 0; comp < components; ++comp)
         {
-          const uint8_t a = accessor.sample(tx - 1, ty, comp);
-          const uint8_t b = accessor.sample(tx, ty - 1, comp);
-          const uint8_t c = accessor.sample(tx - 1, ty - 1, comp);
-          const uint8_t d = accessor.sample(tx + 1, ty - 1, comp);
+          auto sample_from_state = [&](int32_t sx, int32_t sy, uint32_t sc) -> uint8_t
+          {
+            if (sx < 0 || sy < 0)
+              return 0;
+            if (sx >= static_cast<int32_t>(tile_w) || sy >= static_cast<int32_t>(tile_h))
+              return 0;
+            const bool inside_block = (sx >= static_cast<int32_t>(block_x) &&
+                                       sx < static_cast<int32_t>(block_x + block_w) &&
+                                       sy >= static_cast<int32_t>(block_y) &&
+                                       sy < static_cast<int32_t>(block_y + block_h));
+            if (inside_block)
+            {
+              const int local_y = sy - static_cast<int32_t>(block_y);
+              const int local_x = sx - static_cast<int32_t>(block_x);
+              if (local_y < static_cast<int32_t>(by) ||
+                  (local_y == static_cast<int32_t>(by) && local_x < static_cast<int32_t>(bx)))
+              {
+                const size_t local_index = static_cast<size_t>(local_y) * block_w + static_cast<size_t>(local_x);
+                return reconstructed_block[sc][local_index];
+              }
+              return 0;
+            }
+            const size_t offset = (static_cast<size_t>(sy) * tile_w + static_cast<size_t>(sx)) * components + sc;
+            if (offset >= reconstructed_tile.size())
+              return 0;
+            return reconstructed_tile[offset];
+          };
+
+          const uint8_t a = sample_from_state(tx - 1, ty, comp);
+          const uint8_t b = sample_from_state(tx, ty - 1, comp);
+          const uint8_t c = sample_from_state(tx - 1, ty - 1, comp);
+          const uint8_t d = sample_from_state(tx + 1, ty - 1, comp);
           const uint8_t predicted = predictor(a, b, c, d);
           const uint8_t actual = accessor.sample(tx, ty, comp);
           out.values[comp][index] = static_cast<int16_t>(static_cast<int32_t>(actual) - static_cast<int32_t>(predicted));
+          int32_t reconstructed = static_cast<int32_t>(predicted) + static_cast<int32_t>(out.values[comp][index]);
+          reconstructed = std::clamp(reconstructed, 0, 255);
+          reconstructed_block[comp][index] = static_cast<uint8_t>(reconstructed);
         }
         ++index;
       }
@@ -118,6 +157,8 @@ namespace tlg::v8::enc
     // predictor × filter × reorder × entropy の全組み合わせを評価する。
     // 現段階では predictor × entropy のみ探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
+    entropy_encode_context entropy_ctx{};
+    std::vector<uint8_t> reconstructed_tile(static_cast<size_t>(tile_w) * tile_h * components, 0);
 
     for (uint32_t block_y = 0; block_y < tile_h; block_y += kBlockSize)
     {
@@ -128,14 +169,27 @@ namespace tlg::v8::enc
         const uint32_t value_count = block_w * block_h;
 
         component_colors best_block{};
+        std::array<std::array<uint8_t, enc::kMaxBlockPixels>, 4> best_reconstructed{};
         uint32_t best_predictor = 0;
         uint32_t best_entropy = 0;
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
         component_colors candidate{};
+        std::array<std::array<uint8_t, enc::kMaxBlockPixels>, 4> candidate_reconstructed{};
         for (uint32_t predictor_index = 0; predictor_index < kNumPredictors; ++predictor_index)
         {
-          compute_residual_block(accessor, candidate, predictors[predictor_index], components, block_x, block_y, block_w, block_h);
+          compute_residual_block(accessor,
+                                 reconstructed_tile,
+                                 tile_w,
+                                 tile_h,
+                                 candidate,
+                                 candidate_reconstructed,
+                                 predictors[predictor_index],
+                                 components,
+                                 block_x,
+                                 block_y,
+                                 block_w,
+                                 block_h);
           for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
           {
             const uint64_t estimated_bits = entropy_encoders[entropy_index].estimate_bits(candidate, components, value_count);
@@ -145,6 +199,7 @@ namespace tlg::v8::enc
               best_predictor = predictor_index;
               best_entropy = entropy_index;
               best_block = candidate;
+              best_reconstructed = candidate_reconstructed;
             }
           }
         }
@@ -174,10 +229,31 @@ namespace tlg::v8::enc
           err = "tlg8: ブロック高さの書き込みに失敗しました";
           return false;
         }
-        if (!entropy_encoders[best_entropy].encode_block(writer, best_block, components, value_count, err))
+        for (uint32_t by = 0; by < block_h; ++by)
+        {
+          for (uint32_t bx = 0; bx < block_w; ++bx)
+          {
+            const uint32_t value_index = by * block_w + bx;
+            for (uint32_t comp = 0; comp < components; ++comp)
+            {
+              const size_t offset =
+                  (static_cast<size_t>(block_y + by) * tile_w + static_cast<size_t>(block_x + bx)) * components + comp;
+              if (offset < reconstructed_tile.size())
+                reconstructed_tile[offset] = best_reconstructed[comp][value_index];
+            }
+          }
+        }
+
+        if (!entropy_encoders[best_entropy].encode_block(entropy_ctx, best_block, components, value_count, err))
+        {
+          err = "tlg8: エントロピー書き込みに失敗しました";
           return false;
+        }
       }
     }
+
+    if (!flush_entropy_contexts(entropy_ctx, writer, err))
+      return false;
 
     return true;
   }

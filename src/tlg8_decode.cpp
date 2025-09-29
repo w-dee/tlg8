@@ -55,8 +55,20 @@ namespace tlg::v8
     }
 
     const auto &predictors = enc::predictor_table();
+    const auto &entropy_encoders = enc::entropy_encoder_table();
 
-    enc::component_colors residuals{};
+    struct block_info
+    {
+      uint8_t predictor = 0;
+      uint8_t entropy = 0;
+      uint8_t block_w = 0;
+      uint8_t block_h = 0;
+    };
+
+    const uint32_t blocks_x = (tile_w + enc::kBlockSize - 1u) / enc::kBlockSize;
+    const uint32_t blocks_y = (tile_h + enc::kBlockSize - 1u) / enc::kBlockSize;
+    std::vector<block_info> blocks;
+    blocks.reserve(static_cast<size_t>(blocks_x) * static_cast<size_t>(blocks_y));
 
     for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
     {
@@ -64,70 +76,80 @@ namespace tlg::v8
       for (uint32_t block_x = 0; block_x < tile_w; block_x += enc::kBlockSize)
       {
         const uint32_t block_w = std::min(enc::kBlockSize, tile_w - block_x);
-
-        uint8_t predictor_index = 0;
-        if (!reader.read_u8(predictor_index))
+        block_info info{};
+        if (!reader.read_u8(info.predictor))
         {
           err = "tlg8: タイルデータが不足しています";
           return false;
         }
-        if (predictor_index >= enc::kNumPredictors)
+        if (info.predictor >= enc::kNumPredictors)
         {
           err = "tlg8: 不正な予測器インデックスです";
           return false;
         }
 
-        uint8_t entropy_index = 0;
-        if (!reader.read_u8(entropy_index))
+        if (!reader.read_u8(info.entropy))
         {
           err = "tlg8: タイルデータが不足しています";
           return false;
         }
-        if (entropy_index >= enc::kNumEntropyEncoders)
+        if (info.entropy >= enc::kNumEntropyEncoders)
         {
           err = "tlg8: 不正なエントロピーインデックスです";
           return false;
         }
 
-        uint8_t stored_w = 0;
-        uint8_t stored_h = 0;
-        if (!reader.read_u8(stored_w) || !reader.read_u8(stored_h))
+        if (!reader.read_u8(info.block_w) || !reader.read_u8(info.block_h))
         {
           err = "tlg8: タイルデータが不足しています";
           return false;
         }
-        if (stored_w == 0 || stored_h == 0)
+        if (info.block_w == 0 || info.block_h == 0)
         {
           err = "tlg8: 不正なブロック寸法です";
           return false;
         }
-        if (stored_w != block_w || stored_h != block_h)
+        if (info.block_w != block_w || info.block_h != block_h)
         {
           err = "tlg8: ブロック寸法が一致しません";
           return false;
         }
 
-        const uint32_t value_count = static_cast<uint32_t>(stored_w) * stored_h;
-        for (auto &component : residuals.values)
-          component.fill(0);
+        blocks.push_back(info);
+      }
+    }
 
-        for (uint32_t comp = 0; comp < components; ++comp)
+    enc::entropy_decode_context entropy_ctx{};
+    if (!enc::load_entropy_contexts(reader, entropy_ctx, err))
+      return false;
+
+    enc::component_colors residuals{};
+    size_t block_index = 0;
+
+    for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
+    {
+      const uint32_t block_h = std::min(enc::kBlockSize, tile_h - block_y);
+      for (uint32_t block_x = 0; block_x < tile_w; block_x += enc::kBlockSize)
+      {
+        const uint32_t block_w = std::min(enc::kBlockSize, tile_w - block_x);
+        if (block_index >= blocks.size())
         {
-          for (uint32_t i = 0; i < value_count; ++i)
-          {
-            uint16_t raw = 0;
-            if (!reader.read_u16_le(raw))
-            {
-              err = "tlg8: タイルデータが不足しています";
-              return false;
-            }
-            int16_t residual = 0;
-            std::memcpy(&residual, &raw, sizeof(residual));
-            residuals.values[comp][i] = residual;
-          }
+          err = "tlg8: ブロック情報が不足しています";
+          return false;
+        }
+        const block_info info = blocks[block_index++];
+        if (info.block_w != block_w || info.block_h != block_h)
+        {
+          err = "tlg8: ブロック寸法が一致しません";
+          return false;
         }
 
-        const auto predictor = predictors[predictor_index];
+        const uint32_t value_count = static_cast<uint32_t>(info.block_w) * info.block_h;
+        const auto predictor = predictors[info.predictor];
+        const auto kind = entropy_encoders[info.entropy].kind;
+
+        if (!enc::decode_block_from_context(entropy_ctx, kind, components, value_count, residuals, err))
+          return false;
 
         for (uint32_t by = 0; by < block_h; ++by)
         {
