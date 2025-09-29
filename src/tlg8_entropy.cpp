@@ -1,6 +1,5 @@
 #include "tlg8_entropy.h"
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -24,29 +23,28 @@ namespace
                                                 GolombRow{2, 3, 7, 33, 74, 81, 237, 450, 137},
                                                 GolombRow{3, 1, 5, 28, 66, 92, 246, 452, 131}};
 
-  std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
-  bool g_table_ready = false;
-
-  inline void ensure_table_initialized()
+  constexpr std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> make_bit_length_table()
   {
-    if (g_table_ready)
-      return;
+    std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> table{};
     for (uint32_t row = 0; row < kGolombRowCount; ++row)
     {
-      int accumulator = 0;
+      uint32_t accumulator = 0;
       for (uint32_t col = 0; col < kGolombColumnCount; ++col)
       {
         const uint16_t count = DEFAULT_GOLOMB_TABLE[row][col];
         for (uint16_t i = 0; i < count; ++i)
         {
-          const uint32_t idx = static_cast<uint32_t>(std::min(accumulator, static_cast<int>(kGolombRowSum - 1)));
-          g_bit_length_table[idx][row] = static_cast<uint8_t>(col);
+          const uint32_t idx = (accumulator < kGolombRowSum) ? accumulator : (kGolombRowSum - 1);
+          table[idx][row] = static_cast<uint8_t>(col);
           ++accumulator;
         }
       }
     }
-    g_table_ready = true;
+    return table;
   }
+
+  constexpr std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table =
+      make_bit_length_table();
 
   inline uint32_t context_slot(GolombCodingKind kind, uint32_t component)
   {
@@ -182,7 +180,6 @@ namespace
   {
     if (count == 0)
       return 0;
-    ensure_table_initialized();
     const int row = golomb_row_index(GolombCodingKind::Plain, component);
     uint64_t bits = 0;
     int a = 0;
@@ -202,7 +199,6 @@ namespace
   {
     if (count == 0)
       return 0;
-    ensure_table_initialized();
     const int row = golomb_row_index(GolombCodingKind::RunLength, component);
     uint64_t bits = 1; // 先頭要素が 0 か否かのビット
     int a = 0;
@@ -252,7 +248,6 @@ namespace
   {
     if (count == 0)
       return true;
-    ensure_table_initialized();
     const int row = golomb_row_index(GolombCodingKind::Plain, component);
     int a = 0;
     for (uint32_t i = 0; i < count; ++i)
@@ -281,7 +276,6 @@ namespace
   {
     if (count == 0)
       return true;
-    ensure_table_initialized();
     append_bit(stream, values[0] ? 1u : 0u);
     const int row = golomb_row_index(GolombCodingKind::RunLength, component);
     int a = 0;
@@ -412,7 +406,6 @@ namespace
   {
     if (expected_count == 0)
       return true;
-    ensure_table_initialized();
     const int row = golomb_row_index(GolombCodingKind::Plain, component);
     int a = 0;
     for (uint32_t produced = 0; produced < expected_count; ++produced)
@@ -446,7 +439,6 @@ namespace
   {
     if (expected_count == 0)
       return true;
-    ensure_table_initialized();
     uint32_t first_bit = 0;
     if (!read_bit(stream, first_bit))
       return false;
