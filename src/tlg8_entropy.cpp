@@ -755,6 +755,10 @@ namespace tlg::v8::enc
       }
     }
 
+    // ブロック情報をビット単位で詰めて書き込んだ後でも、ガンマ符号が確実に
+    // バイト境界から始まるようにするために、ここでゼロ詰めでアラインする。
+    writer.align_to_byte_zero();
+
     for (const auto &stream : ctx.streams)
     {
       if (stream.data.size() > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()))
