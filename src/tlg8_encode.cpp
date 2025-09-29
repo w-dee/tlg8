@@ -14,6 +14,7 @@
 
 namespace
 {
+  inline constexpr double EARLY_EXIT_GIVE_UP_RATE = 1.4;
   // タイル全体を 8x8 ブロックへ分割し、予測→カラー相関フィルター→
   // ヒルベルト曲線による並び替え→エントロピー符号と流すパイプライン。
   // 並び替え段はタイル端で縮むブロックにも対応させている。
@@ -161,6 +162,20 @@ namespace tlg::v8::enc
     entropy_encode_context entropy_ctx{};
     std::vector<uint8_t> reconstructed_tile(static_cast<size_t>(tile_w) * tile_h * components, 0);
 
+    auto compute_energy = [](const component_colors &colors, uint32_t comp_count, uint32_t value_count) {
+      double energy = 0.0;
+      for (uint32_t comp = 0; comp < comp_count; ++comp)
+      {
+        const auto &channel = colors.values[comp];
+        for (uint32_t index = 0; index < value_count; ++index)
+        {
+          const double value = static_cast<double>(channel[index]);
+          energy += value * value;
+        }
+      }
+      return energy;
+    };
+
     for (uint32_t block_y = 0; block_y < tile_h; block_y += kBlockSize)
     {
       const uint32_t block_h = std::min(kBlockSize, tile_h - block_y);
@@ -179,6 +194,8 @@ namespace tlg::v8::enc
         component_colors candidate{};
         std::array<std::array<uint8_t, enc::kMaxBlockPixels>, 4> candidate_reconstructed{};
         const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(kColorFilterCodeCount) : 1u;
+        double best_residual_energy = std::numeric_limits<double>::infinity();
+        double best_filtered_energy = std::numeric_limits<double>::infinity();
         for (uint32_t predictor_index = 0; predictor_index < kNumPredictors; ++predictor_index)
         {
           compute_residual_block(accessor,
@@ -193,11 +210,30 @@ namespace tlg::v8::enc
                                  block_y,
                                  block_w,
                                  block_h);
+          const double residual_energy = compute_energy(candidate, components, value_count);
+          if (best_residual_energy < std::numeric_limits<double>::infinity() &&
+              residual_energy > best_residual_energy * EARLY_EXIT_GIVE_UP_RATE)
+          {
+            // 予測誤差の自乗和が閾値を超えた場合は、この predictor を早期に諦める。
+            continue;
+          }
+          if (residual_energy < best_residual_energy)
+            best_residual_energy = residual_energy;
           for (uint32_t filter_code = 0; filter_code < filter_count; ++filter_code)
           {
             component_colors filtered = candidate;
             if (components >= 3)
               apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
+
+            const double filtered_energy = compute_energy(filtered, components, value_count);
+            if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
+                filtered_energy > best_filtered_energy * EARLY_EXIT_GIVE_UP_RATE)
+            {
+              // フィルター適用後の誤差エネルギーが大きすぎる候補は以降の処理へ進めない。
+              continue;
+            }
+            if (filtered_energy < best_filtered_energy)
+              best_filtered_energy = filtered_energy;
 
             component_colors reordered = filtered;
             reorder_to_hilbert(reordered, components, block_w, block_h);
