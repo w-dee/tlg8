@@ -157,19 +157,21 @@ namespace tlg::v7
     FilterThenPredictor = 1,
   };
 
-  inline constexpr int SIDEINFO_BITS_PER_BLOCK = 11;
+  inline constexpr int SIDEINFO_BITS_PER_BLOCK = 15;
 
   struct side_info
   {
     int filter_code;
     PredictorMode mode;
     int diff_index;
+    uint8_t golomb_mode_mask;
   };
 
   uint16_t pack_block_sideinfo(const side_info &info);
   int unpack_filter_code(uint16_t sideinfo);
   PredictorMode unpack_predictor_mode(uint16_t sideinfo);
   DiffFilterType unpack_diff_filter(uint16_t sideinfo);
+  uint8_t unpack_golomb_mode_mask(uint16_t sideinfo);
 
   std::vector<int16_t> apply_diff_filter(const BlockContext &ctx,
                                          DiffFilterType type,

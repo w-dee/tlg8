@@ -37,6 +37,35 @@ namespace tlg::v7
         "r1",
         "(c0+r1)/2"};
 
+    struct BitWriter
+    {
+      void clear()
+      {
+        data.clear();
+        bit_length = 0;
+      }
+
+      void append(const std::vector<uint8_t> &src, uint32_t bits)
+      {
+        if (bits == 0)
+          return;
+        for (uint32_t i = 0; i < bits; ++i)
+        {
+          if ((bit_length & 7u) == 0)
+            data.push_back(0);
+          const uint32_t byte_index = i >> 3;
+          const uint32_t bit_index = i & 7u;
+          const uint8_t bit = static_cast<uint8_t>((src[byte_index] >> bit_index) & 1u);
+          if (bit)
+            data.back() |= static_cast<uint8_t>(1u << (bit_length & 7u));
+          ++bit_length;
+        }
+      }
+
+      std::vector<uint8_t> data;
+      uint64_t bit_length = 0;
+    };
+
     std::size_t wrap_index(int value, int modulo)
     {
       if (modulo <= 0)
@@ -363,9 +392,10 @@ namespace tlg::v7
         const std::size_t chunk_height = std::min<std::size_t>(CHUNK_SCAN_LINES, height - chunk_y0);
         const std::size_t chunk_pixels = chunk_height * width;
 
-        std::vector<std::vector<int16_t>> chunk_residuals(component_count);
-        for (auto &vec : chunk_residuals)
-          vec.reserve(chunk_pixels);
+        std::vector<BitWriter> chunk_bitstreams(component_count);
+        for (auto &bw : chunk_bitstreams)
+          bw.clear();
+        std::vector<std::size_t> chunk_residual_counts(component_count, 0);
 
         const std::size_t chunk_block_row_start = chunk_y0 / BLOCK_SIZE;
         const std::size_t chunk_block_row_end = std::min<std::size_t>((chunk_y0 + chunk_height + BLOCK_SIZE - 1) / BLOCK_SIZE, blocks_y);
@@ -600,23 +630,55 @@ namespace tlg::v7
               return false;
             }
 
-            const side_info block_sideinfo{
-                best_candidate.filter_code,
-                best_candidate.mode,
-                best_candidate.diff_filter_index};
-            const uint16_t packed_sideinfo = pack_block_sideinfo(block_sideinfo);
-            chunk_sideinfo.push_back(packed_sideinfo);
+            std::vector<std::vector<int16_t>> block_residuals(component_count);
+            std::vector<std::vector<int16_t>> block_residuals_before_hilbert;
+            if (dump_file && dump_before_hilbert)
+              block_residuals_before_hilbert.resize(component_count);
 
+            uint8_t mode_mask = 0;
             for (std::size_t c = 0; c < component_count; ++c)
             {
               std::vector<int16_t> residual = std::move(best_candidate.residuals[c]);
               if (dump_file && dump_before_hilbert)
-                dump_residual_block(dump_file.get(), c, ctx, residual, block_sideinfo, best_candidate.bit_cost);
+                block_residuals_before_hilbert[c] = residual;
               if (is_full_block)
                 reorder_to_hilbert(residual);
-              if (dump_file && dump_after_hilbert)
-                dump_residual_block(dump_file.get(), c, ctx, residual, block_sideinfo, best_candidate.bit_cost);
-              chunk_residuals[c].insert(chunk_residuals[c].end(), residual.begin(), residual.end());
+
+              if (residual.size() != ctx.bw * ctx.bh)
+              {
+                err = "tlg7: residual size mismatch";
+                return false;
+              }
+
+              entropy_encoder.set_component_index(c);
+              encoded_stream.clear();
+              uint32_t block_bit_length = 0;
+              entropy_encoder.encode(residual, encoded_stream, block_bit_length);
+              if (c < 4 && entropy_encoder.last_mode() == GolombCodingKind::Plain)
+                mode_mask |= static_cast<uint8_t>(1u << c);
+              chunk_bitstreams[c].append(encoded_stream, block_bit_length);
+
+              chunk_residual_counts[c] += residual.size();
+              block_residuals[c] = std::move(residual);
+            }
+
+            const side_info block_sideinfo{
+                best_candidate.filter_code,
+                best_candidate.mode,
+                best_candidate.diff_filter_index,
+                mode_mask};
+            const uint16_t packed_sideinfo = pack_block_sideinfo(block_sideinfo);
+            chunk_sideinfo.push_back(packed_sideinfo);
+
+            if (dump_file)
+            {
+              for (std::size_t c = 0; c < component_count; ++c)
+              {
+                if (dump_before_hilbert && !block_residuals_before_hilbert.empty())
+                  dump_residual_block(dump_file.get(), c, ctx, block_residuals_before_hilbert[c], block_sideinfo, best_candidate.bit_cost);
+                if (dump_after_hilbert)
+                  dump_residual_block(dump_file.get(), c, ctx, block_residuals[c], block_sideinfo, best_candidate.bit_cost);
+              }
             }
 
             if (order == PipelineOrder::PredictorThenFilter)
@@ -639,7 +701,7 @@ namespace tlg::v7
 
         for (std::size_t c = 0; c < component_count; ++c)
         {
-          if (chunk_residuals[c].size() != chunk_pixels)
+          if (chunk_residual_counts[c] != chunk_pixels)
           {
             err = "tlg7: residual size mismatch";
             return false;
@@ -684,14 +746,19 @@ namespace tlg::v7
 
         for (std::size_t c = 0; c < component_count; ++c)
         {
-          uint32_t bit_length = 0;
-          entropy_encoder.set_component_index(c);
-          entropy_encoder.encode(chunk_residuals[c], encoded_stream, bit_length);
+          const uint64_t bits = chunk_bitstreams[c].bit_length;
+          if (bits > std::numeric_limits<uint32_t>::max())
+          {
+            err = "tlg7: residual bit length overflow";
+            return false;
+          }
+          const uint32_t bit_length = static_cast<uint32_t>(bits);
           tlg::detail::write_u32le(fp, bit_length);
           const std::size_t byte_count = (bit_length + 7u) / 8u;
-          if (encoded_stream.size() != byte_count)
-            encoded_stream.resize(byte_count);
-          if (byte_count && fwrite(encoded_stream.data(), 1, byte_count, fp) != byte_count)
+          auto &data = chunk_bitstreams[c].data;
+          if (data.size() != byte_count)
+            data.resize(byte_count);
+          if (byte_count && fwrite(data.data(), 1, byte_count, fp) != byte_count)
           {
             err = "tlg7: write residual data";
             return false;

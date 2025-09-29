@@ -250,7 +250,8 @@ namespace tlg::v7
     const uint16_t filter_bits = static_cast<uint16_t>(info.filter_code & 0x7F);
     const uint16_t predictor_bit = (info.mode == PredictorMode::AVG) ? 1u : 0u;
     const uint16_t diff_bits = static_cast<uint16_t>(info.diff_index & 0x7);
-    return static_cast<uint16_t>(filter_bits | (predictor_bit << 7) | (diff_bits << 8));
+    const uint16_t golomb_bits = static_cast<uint16_t>(info.golomb_mode_mask & 0xF);
+    return static_cast<uint16_t>(filter_bits | (predictor_bit << 7) | (diff_bits << 8) | (golomb_bits << 11));
   }
 
   int unpack_filter_code(uint16_t sideinfo)
@@ -269,6 +270,11 @@ namespace tlg::v7
     if (diff < 0 || diff >= static_cast<int>(DiffFilterType::Count))
       return DiffFilterType::None;
     return static_cast<DiffFilterType>(diff);
+  }
+
+  uint8_t unpack_golomb_mode_mask(uint16_t sideinfo)
+  {
+    return static_cast<uint8_t>((sideinfo >> 11) & 0xF);
   }
 
   std::vector<int16_t> apply_diff_filter(const BlockContext &ctx,

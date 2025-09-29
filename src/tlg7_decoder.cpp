@@ -131,6 +131,10 @@ namespace tlg::v7
       }
 
       std::vector<std::vector<int16_t>> chunk_residuals(component_count);
+      std::vector<uint8_t> chunk_mode_masks;
+      chunk_mode_masks.reserve(chunk_sideinfo.size());
+      for (uint16_t value : chunk_sideinfo)
+        chunk_mode_masks.push_back(unpack_golomb_mode_mask(value));
 
       for (std::size_t c = 0; c < component_count; ++c)
       {
@@ -143,11 +147,34 @@ namespace tlg::v7
           return false;
         }
         entropy_decoder.set_component_index(c);
-        if (!entropy_decoder.decode(encoded_stream.data(), encoded_stream.size(), chunk_pixels, chunk_residuals[c]))
+        entropy_decoder.init_stream(encoded_stream.data(), encoded_stream.size());
+        chunk_residuals[c].clear();
+        chunk_residuals[c].reserve(chunk_pixels);
+
+        std::vector<int16_t> block_residual;
+        for (std::size_t block_idx = 0; block_idx < chunk_contexts.size(); ++block_idx)
         {
-          err = "tlg7: residual decode error";
+          const BlockContext &block_ctx = chunk_contexts[block_idx];
+          const std::size_t pixel_count = block_ctx.bw * block_ctx.bh;
+          const bool use_plain = (c < 4 && block_idx < chunk_mode_masks.size()) ? ((chunk_mode_masks[block_idx] >> c) & 1u) != 0 : false;
+          entropy_decoder.set_coding_kind(use_plain ? GolombCodingKind::Plain : GolombCodingKind::RunLength);
+
+          block_residual.clear();
+          block_residual.reserve(pixel_count);
+          if (!entropy_decoder.decode_next(pixel_count, block_residual))
+          {
+            err = "tlg7: residual decode error";
+            return false;
+          }
+          chunk_residuals[c].insert(chunk_residuals[c].end(), block_residual.begin(), block_residual.end());
+        }
+
+        if (chunk_residuals[c].size() != chunk_pixels)
+        {
+          err = "tlg7: residual size mismatch";
           return false;
         }
+
       }
 
       std::vector<std::size_t> residual_cursor(component_count, 0);

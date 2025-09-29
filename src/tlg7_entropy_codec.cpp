@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -14,7 +15,9 @@ namespace tlg::v7
 {
   namespace
   {
-    constexpr int GOLOMB_N_COUNT = 3;
+    constexpr int GOLOMB_COMPONENT_ROW_COUNT = 3;
+    constexpr int GOLOMB_MODE_COUNT = 2;
+    constexpr int GOLOMB_N_COUNT = GOLOMB_COMPONENT_ROW_COUNT * GOLOMB_MODE_COUNT;
     constexpr int GOLOMB_ROW_SUM = 1024;
 
     using GolombRow = std::array<uint16_t, 9>;
@@ -42,6 +45,9 @@ namespace tlg::v7
 0 4 4 7 24 89 270 489 137
 2 2 5 13 67 98 230 476 131
 3 2 5 15 77 92 238 462 130
+2 2 4 10 51 108 237 482 128
+2 3 7 33 74 81 237 450 137
+3 1 5 28 66 92 246 452 131
         )";
 
       ParsedGolombTable result{};
@@ -97,11 +103,16 @@ namespace tlg::v7
     unsigned char GolombBitLengthTable[GOLOMB_ROW_SUM][GOLOMB_N_COUNT];
     bool golomb_tables_ready = false;
 
-    inline int component_row_index(std::size_t component_index)
+    inline int component_row_index(std::size_t component_index, GolombCodingKind kind)
     {
-      const std::size_t max_index = static_cast<std::size_t>(GOLOMB_N_COUNT - 1);
+      if (GOLOMB_COMPONENT_ROW_COUNT <= 0)
+        return 0;
+      const std::size_t max_index = static_cast<std::size_t>(GOLOMB_COMPONENT_ROW_COUNT - 1);
       const std::size_t clamped = (component_index < max_index) ? component_index : max_index;
-      return static_cast<int>(clamped);
+      const std::size_t mode_offset = (kind == GolombCodingKind::Plain)
+                                          ? static_cast<std::size_t>(GOLOMB_COMPONENT_ROW_COUNT)
+                                          : 0u;
+      return static_cast<int>(clamped + mode_offset);
     }
 
     inline void init_golomb_tables()
@@ -235,9 +246,9 @@ namespace tlg::v7
       int bit_pos_ = 0;
     };
 
-    void compress_residuals_golomb(GolombBitStream &bs,
-                                   const std::vector<int16_t> &buf,
-                                   std::size_t component_index)
+    void compress_residuals_run_length(GolombBitStream &bs,
+                                       const std::vector<int16_t> &buf,
+                                       std::size_t component_index)
     {
       if (buf.empty())
         return;
@@ -245,8 +256,7 @@ namespace tlg::v7
       init_golomb_tables();
 
       bs.PutValue(buf[0] ? 1 : 0, 1);
-      const int row_index = component_row_index(component_index);
-      int n = row_index;
+      const int row_index = component_row_index(component_index, GolombCodingKind::RunLength);
       int a = 0;
       int count = 0;
       const size_t size = buf.size();
@@ -274,14 +284,14 @@ namespace tlg::v7
             long m = ((e >= 0) ? (2 * e) : (-2 * e - 1)) - 1;
             if (m < 0)
               m = 0;
-            int k = GolombBitLengthTable[a][n];
+            int k = GolombBitLengthTable[a][row_index];
             long q = (k > 0) ? (m >> k) : m;
             for (; q > 0; --q)
               bs.Put1Bit(0);
             bs.Put1Bit(1);
             if (k)
               bs.PutValue(m & ((1 << k) - 1), k);
-            a = (m + a + 1) >> 1; // mix 50% of m and 50% of previous a
+            a = (m + a + 1) >> 1;
           }
           i = ii - 1;
         }
@@ -295,10 +305,70 @@ namespace tlg::v7
         bs.PutRunLength(count);
     }
 
+    void compress_residuals_plain(GolombBitStream &bs,
+                                  const std::vector<int16_t> &buf,
+                                  std::size_t component_index)
+    {
+      if (buf.empty())
+        return;
+
+      init_golomb_tables();
+
+      const int row_index = component_row_index(component_index, GolombCodingKind::Plain);
+      int a = 0;
+      for (const auto value : buf)
+      {
+        const int e = static_cast<int>(value);
+        const uint32_t m = ((e >= 0) ? (2 * e) : (-2 * e - 1));
+        const int k = GolombBitLengthTable[a][row_index];
+        uint32_t q = (k > 0) ? (m >> k) : m;
+        while (q--)
+          bs.Put1Bit(0);
+        bs.Put1Bit(1);
+        if (k)
+        {
+          const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
+          bs.PutValue(static_cast<long>(m & mask), k);
+        }
+        a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
+      }
+    }
+
+    void compress_residuals(GolombBitStream &bs,
+                            const std::vector<int16_t> &buf,
+                            std::size_t component_index,
+                            GolombCodingKind kind)
+    {
+      switch (kind)
+      {
+      case GolombCodingKind::Plain:
+        compress_residuals_plain(bs, buf, component_index);
+        break;
+      case GolombCodingKind::RunLength:
+      default:
+        compress_residuals_run_length(bs, buf, component_index);
+        break;
+      }
+    }
+
     struct GolombDecoder
     {
+      GolombDecoder() = default;
+
       GolombDecoder(const uint8_t *data, size_t size)
-          : data_(data), size_(size) {}
+      {
+        reset(data, size);
+      }
+
+      void reset(const uint8_t *data, size_t size)
+      {
+        data_ = data;
+        size_ = size;
+        byte_pos_ = 0;
+        bits_ = 0;
+        bit_pos_ = 0;
+        fill();
+      }
 
       void fill()
       {
@@ -399,13 +469,18 @@ namespace tlg::v7
       const uint8_t *data_ = nullptr;
       size_t size_ = 0;
       size_t byte_pos_ = 0;
+
+    public:
+      [[nodiscard]] bool exhausted() const noexcept
+      {
+        return byte_pos_ >= size_ && bit_pos_ <= 0;
+      }
     };
 
-    bool decode_residuals_golomb(const uint8_t *data,
-                                 size_t size,
-                                 size_t expected_count,
-                                 std::vector<int16_t> &out,
-                                 std::size_t component_index)
+    bool decode_residuals_run_length(GolombDecoder &decoder,
+                                     size_t expected_count,
+                                     std::vector<int16_t> &out,
+                                     std::size_t component_index)
     {
       out.clear();
       out.reserve(expected_count);
@@ -415,24 +490,19 @@ namespace tlg::v7
 
       init_golomb_tables();
 
-      GolombDecoder decoder(data, size);
-      decoder.fill();
-
       uint32_t first_bit = 0;
       if (!decoder.read_bit(first_bit))
         return false;
 
       bool expect_nonzero = (first_bit != 0);
       int a = 0;
-      const int row_index = component_row_index(component_index);
-      int n = row_index;
+      const int row_index = component_row_index(component_index, GolombCodingKind::RunLength);
 
       while (out.size() < expected_count)
       {
         int run = 0;
         if (!expect_nonzero)
         {
-          // zero-run when expect_nonzero == false
           run = decoder.read_run_length();
         }
         else
@@ -447,7 +517,7 @@ namespace tlg::v7
         {
           if (static_cast<size_t>(run) > remaining)
             return false;
-          out.insert(out.end(), run, 0);
+          out.insert(out.end(), static_cast<std::size_t>(run), 0);
           expect_nonzero = true;
           continue;
         }
@@ -457,7 +527,7 @@ namespace tlg::v7
 
         for (int i = 0; i < run; ++i)
         {
-          int k = GolombBitLengthTable[a][n];
+          const int k = GolombBitLengthTable[a][row_index];
           int q = 0;
           while (true)
           {
@@ -471,10 +541,10 @@ namespace tlg::v7
           uint32_t remainder_bits = 0;
           if (k > 0 && !decoder.read_bits(static_cast<unsigned>(k), remainder_bits))
             return false;
-          int m = (q << k) + static_cast<int>(remainder_bits);
-          int sign = (m & 1) - 1;
-          int vv = m >> 1;
-          int residual = (vv ^ sign) + sign + 1;
+          const int m = (q << k) + static_cast<int>(remainder_bits);
+          const int sign = (m & 1) - 1;
+          const int vv = m >> 1;
+          const int residual = (vv ^ sign) + sign + 1;
 
           out.push_back(static_cast<int16_t>(residual));
           a = (m + a + 1) >> 1;
@@ -486,28 +556,153 @@ namespace tlg::v7
       return out.size() == expected_count;
     }
 
+    bool decode_residuals_plain(GolombDecoder &decoder,
+                                size_t expected_count,
+                                std::vector<int16_t> &out,
+                                std::size_t component_index)
+    {
+      out.clear();
+      out.reserve(expected_count);
+
+      if (expected_count == 0)
+        return true;
+
+      init_golomb_tables();
+
+      int a = 0;
+      const int row_index = component_row_index(component_index, GolombCodingKind::Plain);
+
+      while (out.size() < expected_count)
+      {
+        const int k = GolombBitLengthTable[a][row_index];
+        int q = 0;
+        while (true)
+        {
+          uint32_t bit = 0;
+          if (!decoder.read_bit(bit))
+            return false;
+          if (bit)
+            break;
+          ++q;
+        }
+
+        uint32_t remainder_bits = 0;
+        if (k > 0 && !decoder.read_bits(static_cast<unsigned>(k), remainder_bits))
+          return false;
+
+        const uint32_t m = (static_cast<uint32_t>(q) << static_cast<unsigned>(k)) + remainder_bits;
+        const int residual = static_cast<int>((m >> 1) ^ -static_cast<int>(m & 1u));
+
+        out.push_back(static_cast<int16_t>(residual));
+        a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
+      }
+
+      return out.size() == expected_count;
+    }
+
+    bool decode_residuals(GolombDecoder &decoder,
+                          size_t expected_count,
+                          std::vector<int16_t> &out,
+                          std::size_t component_index,
+                          GolombCodingKind kind)
+    {
+      switch (kind)
+      {
+      case GolombCodingKind::Plain:
+        return decode_residuals_plain(decoder, expected_count, out, component_index);
+      case GolombCodingKind::RunLength:
+      default:
+        return decode_residuals_run_length(decoder, expected_count, out, component_index);
+      }
+    }
+
   } // namespace
+
+  struct GolombResidualEntropyDecoder::Impl
+  {
+    GolombDecoder decoder;
+  };
 
   void GolombResidualEntropyEncoder::encode(const std::vector<int16_t> &residuals,
                                             std::vector<uint8_t> &out,
                                             uint32_t &bit_length)
   {
-    out.clear();
-    GolombBitStream bs(out);
-    compress_residuals_golomb(bs, residuals, component_index_);
-    bit_length = static_cast<uint32_t>(bs.GetBitLength());
-    bs.Flush();
-    const std::size_t expected_bytes = (bit_length + 7u) / 8u;
-    if (out.size() != expected_bytes)
-      out.resize(expected_bytes);
+    struct Candidate
+    {
+      GolombCodingKind kind = GolombCodingKind::RunLength;
+      uint32_t bits = 0;
+      std::vector<uint8_t> data;
+    };
+
+    const auto make_candidate = [&](GolombCodingKind kind)
+    {
+      Candidate candidate;
+      candidate.kind = kind;
+      GolombBitStream bs(candidate.data);
+      compress_residuals(bs, residuals, component_index_, kind);
+      candidate.bits = static_cast<uint32_t>(bs.GetBitLength());
+      bs.Flush();
+      const std::size_t expected_bytes = (candidate.bits + 7u) / 8u;
+      if (candidate.data.size() != expected_bytes)
+        candidate.data.resize(expected_bytes);
+      return candidate;
+    };
+
+    Candidate run_candidate = make_candidate(GolombCodingKind::RunLength);
+    Candidate plain_candidate = make_candidate(GolombCodingKind::Plain);
+
+    Candidate *best = &run_candidate;
+    if (plain_candidate.bits < run_candidate.bits)
+      best = &plain_candidate;
+
+    last_mode_ = best->kind;
+    bit_length = best->bits;
+    out = std::move(best->data);
   }
 
   std::uint64_t GolombResidualEntropyEncoder::estimate_bits(const std::vector<int16_t> &residuals) const
   {
-    std::vector<uint8_t> tmp;
-    GolombBitStream bs(tmp);
-    compress_residuals_golomb(bs, residuals, component_index_);
-    return bs.GetBitLength();
+    auto compute_bits = [&](GolombCodingKind kind)
+    {
+      std::vector<uint8_t> tmp;
+      GolombBitStream bs(tmp);
+      compress_residuals(bs, residuals, component_index_, kind);
+      return bs.GetBitLength();
+    };
+
+    const std::uint64_t rle_bits = compute_bits(GolombCodingKind::RunLength);
+    const std::uint64_t plain_bits = compute_bits(GolombCodingKind::Plain);
+    return std::min(rle_bits, plain_bits);
+  }
+
+  GolombResidualEntropyDecoder::GolombResidualEntropyDecoder()
+      : decoder_impl_(std::make_unique<Impl>())
+  {
+  }
+
+  GolombResidualEntropyDecoder::~GolombResidualEntropyDecoder() = default;
+
+  void GolombResidualEntropyDecoder::init_stream(const uint8_t *data, std::size_t size)
+  {
+    if (!decoder_impl_)
+      decoder_impl_ = std::make_unique<Impl>();
+    decoder_impl_->decoder.reset(data, size);
+    decoder_initialized_ = true;
+  }
+
+  bool GolombResidualEntropyDecoder::decode_next(std::size_t expected_count,
+                                                 std::vector<int16_t> &out)
+  {
+    if (!decoder_initialized_ || !decoder_impl_)
+      return false;
+    return decode_residuals(decoder_impl_->decoder, expected_count, out, component_index_, coding_kind_);
+  }
+
+  bool GolombResidualEntropyDecoder::stream_consumed() const noexcept
+  {
+    if (!decoder_impl_)
+      return true;
+    return decoder_impl_->decoder.exhausted();
   }
 
   bool GolombResidualEntropyDecoder::decode(const uint8_t *data,
@@ -515,7 +710,8 @@ namespace tlg::v7
                                             std::size_t expected_count,
                                             std::vector<int16_t> &out)
   {
-    return decode_residuals_golomb(data, size, expected_count, out, component_index_);
+    init_stream(data, size);
+    return decode_next(expected_count, out);
   }
 
   bool configure_golomb_table(const std::string &path, std::string &err)
