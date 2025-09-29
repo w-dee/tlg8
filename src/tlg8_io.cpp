@@ -315,6 +315,10 @@ namespace tlg::v8
 
     bool write_raw(FILE *fp, const PixelBuffer &src, int desired_colors, std::string &err)
     {
+      static_assert(std::numeric_limits<int8_t>::min() == -128 &&
+                        std::numeric_limits<int8_t>::max() == 127,
+                    "int8_t is not two's complement");
+
       err.clear();
 
       if (src.width == 0 || src.height == 0)
