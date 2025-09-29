@@ -243,10 +243,10 @@ namespace tlg::v8
 
     for (uint32_t origin_y = 0; origin_y < height; origin_y += tile_height)
     {
-      const uint32_t block_h = std::min<uint32_t>(tile_height, height - origin_y);
+      const uint32_t tile_h = std::min<uint32_t>(tile_height, height - origin_y);
       for (uint32_t origin_x = 0; origin_x < width; origin_x += tile_width)
       {
-        const uint32_t block_w = std::min<uint32_t>(tile_width, width - origin_x);
+        const uint32_t tile_w = std::min<uint32_t>(tile_width, width - origin_x);
         uint32_t tile_size_u32 = 0;
         if (!read_u32le(fp, tile_size_u32))
         {
@@ -260,7 +260,7 @@ namespace tlg::v8
           err = "tlg8: failed to read tile payload";
           return false;
         }
-        const size_t expected_bytes = static_cast<size_t>(block_w) * block_h * components;
+        const size_t expected_bytes = static_cast<size_t>(tile_w) * tile_h * components;
         if (tile_size < expected_bytes)
         {
           err = "tlg8: tile payload too small";
@@ -268,10 +268,10 @@ namespace tlg::v8
         }
 
         detail::bitio::BitReader reader(tile_buffer.data(), tile_size);
-        for (uint32_t dy = 0; dy < block_h; ++dy)
+        for (uint32_t dy = 0; dy < tile_h; ++dy)
         {
           const size_t row_offset = (static_cast<size_t>(origin_y + dy) * width + origin_x) * components;
-          for (uint32_t dx = 0; dx < block_w; ++dx)
+          for (uint32_t dx = 0; dx < tile_w; ++dx)
           {
             for (uint32_t c = 0; c < components; ++c)
             {
@@ -369,16 +369,16 @@ namespace tlg::v8
 
       for (uint32_t origin_y = 0; origin_y < height; origin_y += tile_height)
       {
-        const uint32_t block_h = std::min<uint32_t>(tile_height, height - origin_y);
+        const uint32_t tile_h = std::min<uint32_t>(tile_height, height - origin_y);
         for (uint32_t origin_x = 0; origin_x < width; origin_x += tile_width)
         {
-          const uint32_t block_w = std::min<uint32_t>(tile_width, width - origin_x);
+          const uint32_t tile_w = std::min<uint32_t>(tile_width, width - origin_x);
           detail::bitio::BitWriter writer(tile_buffer.data(), tile_buffer.size());
-          for (uint32_t dy = 0; dy < block_h; ++dy)
+          for (uint32_t dy = 0; dy < tile_h; ++dy)
           {
             const size_t row_offset = (static_cast<size_t>(origin_y + dy) * width + origin_x) * components;
             const uint8_t *row_ptr = packed_ptr + row_offset;
-            for (uint32_t dx = 0; dx < block_w; ++dx)
+            for (uint32_t dx = 0; dx < tile_w; ++dx)
             {
               const size_t pixel_base = static_cast<size_t>(dx) * components;
               for (uint32_t c = 0; c < components; ++c)
