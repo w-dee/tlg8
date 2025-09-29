@@ -1,5 +1,6 @@
 #include "tlg8_bit_io.h"
 #include "tlg8_block.h"
+#include "tlg8_color_filter.h"
 #include "tlg8_entropy.h"
 #include "tlg8_predictors.h"
 
@@ -60,6 +61,7 @@ namespace tlg::v8
     struct block_info
     {
       uint8_t predictor = 0;
+      uint8_t filter = 0;
       uint8_t entropy = 0;
       uint8_t block_w = 0;
       uint8_t block_h = 0;
@@ -85,6 +87,17 @@ namespace tlg::v8
         if (info.predictor >= enc::kNumPredictors)
         {
           err = "tlg8: 不正な予測器インデックスです";
+          return false;
+        }
+
+        if (!reader.read_u8(info.filter))
+        {
+          err = "tlg8: タイルデータが不足しています";
+          return false;
+        }
+        if (info.filter >= enc::kColorFilterCodeCount)
+        {
+          err = "tlg8: 不正なカラーフィルターインデックスです";
           return false;
         }
 
@@ -150,6 +163,8 @@ namespace tlg::v8
 
         if (!enc::decode_block_from_context(entropy_ctx, kind, components, value_count, residuals, err))
           return false;
+
+        enc::undo_color_filter(info.filter, residuals, components, value_count);
 
         for (uint32_t by = 0; by < block_h; ++by)
         {

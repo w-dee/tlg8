@@ -1,5 +1,6 @@
 #include "tlg8_bit_io.h"
 #include "tlg8_block.h"
+#include "tlg8_color_filter.h"
 #include "tlg8_entropy.h"
 #include "tlg8_predictors.h"
 
@@ -12,10 +13,9 @@
 
 namespace
 {
-  // タイル全体を 8x8 ブロックへ分割し、予測→（今後追加予定の）
-  // カラー相関フィルター→並び替え→エントロピー符号と流すパイプライン。
-  // 現段階では予測器とエントロピー符号器のみを実装しており、残りの段は
-  // 別タスクで追加する前提でコメントにて意図を残している。
+  // タイル全体を 8x8 ブロックへ分割し、予測→カラー相関フィルター→
+  // （今後追加予定の並び替え）→エントロピー符号と流すパイプライン。
+  // 現段階では並び替え段のみ未実装であり、その意図をコメントにて残している。
   struct tile_accessor
   {
     const uint8_t *base;
@@ -58,9 +58,8 @@ namespace
     }
   };
 
-  // TODO: predictor の出力をこの後にカラー相関フィルターへ渡し、
-  // ブロック内の並び替え（haar など）を適用する予定。現時点では
-  // それら未実装のため、純粋な予測残差のみを component_colors に詰める。
+  // predictor の出力後にカラー相関フィルターを適用し、その結果を
+  // component_colors へ格納する。
   void compute_residual_block(const tile_accessor &accessor,
                               const std::vector<uint8_t> &reconstructed_tile,
                               uint32_t tile_w,
@@ -153,9 +152,9 @@ namespace tlg::v8::enc
 
     const auto &predictors = predictor_table();
     const auto &entropy_encoders = entropy_encoder_table();
-    // 将来的にはここでカラー相関フィルターや並び替え候補も列挙し、
+    // 将来的にはここで並び替え候補も列挙し、
     // predictor × filter × reorder × entropy の全組み合わせを評価する。
-    // 現段階では predictor × entropy のみ探索している。
+    // 現段階では reorder 段を除いた predictor × filter × entropy を探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
     entropy_encode_context entropy_ctx{};
     std::vector<uint8_t> reconstructed_tile(static_cast<size_t>(tile_w) * tile_h * components, 0);
@@ -171,11 +170,13 @@ namespace tlg::v8::enc
         component_colors best_block{};
         std::array<std::array<uint8_t, enc::kMaxBlockPixels>, 4> best_reconstructed{};
         uint32_t best_predictor = 0;
+        uint32_t best_filter = 0;
         uint32_t best_entropy = 0;
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
         component_colors candidate{};
         std::array<std::array<uint8_t, enc::kMaxBlockPixels>, 4> candidate_reconstructed{};
+        const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(kColorFilterCodeCount) : 1u;
         for (uint32_t predictor_index = 0; predictor_index < kNumPredictors; ++predictor_index)
         {
           compute_residual_block(accessor,
@@ -190,16 +191,25 @@ namespace tlg::v8::enc
                                  block_y,
                                  block_w,
                                  block_h);
-          for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
+          for (uint32_t filter_code = 0; filter_code < filter_count; ++filter_code)
           {
-            const uint64_t estimated_bits = entropy_encoders[entropy_index].estimate_bits(candidate, components, value_count);
-            if (estimated_bits < best_bits)
+            component_colors filtered = candidate;
+            if (components >= 3)
+              apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
+
+            for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
             {
-              best_bits = estimated_bits;
-              best_predictor = predictor_index;
-              best_entropy = entropy_index;
-              best_block = candidate;
-              best_reconstructed = candidate_reconstructed;
+              const uint64_t estimated_bits =
+                  entropy_encoders[entropy_index].estimate_bits(filtered, components, value_count);
+              if (estimated_bits < best_bits)
+              {
+                best_bits = estimated_bits;
+                best_predictor = predictor_index;
+                best_filter = filter_code;
+                best_entropy = entropy_index;
+                best_block = filtered;
+                best_reconstructed = candidate_reconstructed;
+              }
             }
           }
         }
@@ -209,6 +219,11 @@ namespace tlg::v8::enc
         if (!writer.write_u8(static_cast<uint8_t>(best_predictor)))
         {
           err = "tlg8: 予測器インデックスの書き込みに失敗しました";
+          return false;
+        }
+        if (!writer.write_u8(static_cast<uint8_t>(best_filter)))
+        {
+          err = "tlg8: カラーフィルターインデックスの書き込みに失敗しました";
           return false;
         }
         if (!writer.write_u8(static_cast<uint8_t>(best_entropy)))
