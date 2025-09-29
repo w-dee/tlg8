@@ -23,7 +23,7 @@ GOLOMB_COLS = len(DEFAULT_GOLOMB_TABLE[0])
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tune TLG7 Golomb table with a genetic search loop")
+    parser = argparse.ArgumentParser(description="Tune TLG8 Golomb table with a genetic search loop")
     parser.add_argument(
         "--binary",
         default="build/tlgconv",
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fast-mode",
         action="store_true",
-        help="Enable --tlg7-fast when invoking the encoder",
+        help="Enable --tlg8-fast when invoking the encoder",
     )
     return parser.parse_args()
 
@@ -171,16 +171,16 @@ def evaluate_table(
         write_table(table_path, table)
         total_size = 0
         for image in images:
-            output_path = tmp_path / (image.stem + ".tlg7")
+            output_path = tmp_path / (image.stem + ".tlg8")
             cmd = [
                 str(binary),
                 str(image),
                 str(output_path),
-                "--tlg-version=7",
-                f"--tlg7-golomb-table={table_path}",
+                "--tlg-version=8",
+                f"--tlg8-golomb-table={table_path}",
             ]
             if fast_mode:
-                cmd.append("--tlg7-fast")
+                cmd.append("--tlg8-fast")
             result = subprocess.run(cmd, capture_output=True, check=False)
             if result.returncode != 0:
                 stdout = result.stdout.decode(errors="ignore").strip()
