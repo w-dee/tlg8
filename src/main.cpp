@@ -26,8 +26,8 @@ bool has_ext(const std::string &path, const char *extLowerNoDot)
 
 static void print_usage()
 {
-  std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|png|bmp)>"
-            << " [--tlg-version=5|6|7] [--pixel-format=auto|R8G8B8|A8R8G8B8]"
+  std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|tlg8|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|tlg8|png|bmp)>"
+            << " [--tlg-version=5|6|7|8] [--pixel-format=auto|R8G8B8|A8R8G8B8]"
             << " [--tlg7-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
             << " [--tlg7-dump-residuals-order=before|after]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
@@ -59,6 +59,8 @@ int main(int argc, char **argv)
         tlgopt.version = 6;
       else if (v == "7")
         tlgopt.version = 7;
+      else if (v == "8")
+        tlgopt.version = 8;
       else
       {
         std::cerr << "Invalid --tlg-version: " << v << "\n";
@@ -160,7 +162,7 @@ int main(int argc, char **argv)
   {
     ok = load_bmp(in_path, img, err);
   }
-  else if (has_ext(in_path, "tlg") || has_ext(in_path, "tlg5") || has_ext(in_path, "tlg6") || has_ext(in_path, "tlg7"))
+  else if (has_ext(in_path, "tlg") || has_ext(in_path, "tlg5") || has_ext(in_path, "tlg6") || has_ext(in_path, "tlg7") || has_ext(in_path, "tlg8"))
   {
     ok = load_tlg(in_path, img, err);
   }
@@ -191,7 +193,7 @@ int main(int argc, char **argv)
   {
     ok = save_bmp(out_path, img, err);
   }
-  else if (has_ext(out_path, "tlg") || has_ext(out_path, "tlg5") || has_ext(out_path, "tlg6") || has_ext(out_path, "tlg7"))
+  else if (has_ext(out_path, "tlg") || has_ext(out_path, "tlg5") || has_ext(out_path, "tlg6") || has_ext(out_path, "tlg7") || has_ext(out_path, "tlg8"))
   {
     ok = save_tlg(out_path, img, tlgopt, err);
   }

@@ -60,7 +60,7 @@ struct TlgOptions
     FilterThenPredictor,
   };
 
-  int version = 6;                      // 5 or 6 or 7
+  int version = 6;                      // 5 or 6 or 7 or 8
   ImageFormat fmt = ImageFormat::Auto;  // decided by input if Auto
   std::string tlg7_golomb_table_path;   // optional override for TLG7 Golomb table
   std::string tlg7_dump_residuals_path; // optional residual dump output for TLG7 encoder

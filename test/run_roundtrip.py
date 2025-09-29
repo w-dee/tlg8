@@ -2,7 +2,7 @@
 """
 Round-trip tests for tlgconv using the sample BMP images in test/images.
 
-For each *.bmp file, the script converts it to PNG, TLG6 and TLG7 into a temporary
+For each *.bmp file, the script converts it to PNG, TLG6 and TLG8 into a temporary
 folder, converts back to BMP, and checks the reconstructed BMP matches the
 original via the `cmp` command.
 
@@ -92,7 +92,7 @@ def roundtrip(
 FORMATS: tuple[FormatSpec, ...] = (
     FormatSpec("png", ".png", ()),
     FormatSpec("tlg6", ".tlg6", ("--tlg-version=6",)),
-    FormatSpec("tlg7", ".tlg7", ("--tlg-version=7",)),
+    FormatSpec("tlg8", ".tlg8", ("--tlg-version=8",)),
 )
 
 
