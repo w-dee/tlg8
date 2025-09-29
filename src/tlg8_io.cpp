@@ -166,8 +166,11 @@ namespace tlg::v8
 
   bool decode_for_tile(detail::bitio::BitReader &reader,
                        uint32_t tile_w,
+                       uint32_t tile_h,
                        uint32_t components,
-                       size_t row_offset,
+                       uint32_t origin_x,
+                       uint32_t origin_y,
+                       uint32_t image_width,
                        std::vector<uint8_t> &decoded,
                        std::string &err);
 
@@ -275,12 +278,16 @@ namespace tlg::v8
         }
 
         detail::bitio::BitReader reader(tile_buffer.data(), tile_size);
-        for (uint32_t dy = 0; dy < tile_h; ++dy)
-        {
-          const size_t row_offset = (static_cast<size_t>(origin_y + dy) * width + origin_x) * components;
-          if (!decode_for_tile(reader, tile_w, components, row_offset, decoded, err))
-            return false;
-        }
+        if (!decode_for_tile(reader,
+                             tile_w,
+                             tile_h,
+                             components,
+                             origin_x,
+                             origin_y,
+                             width,
+                             decoded,
+                             err))
+          return false;
       }
     }
 
@@ -297,9 +304,13 @@ namespace tlg::v8
   namespace enc
   {
     bool encode_for_tile(detail::bitio::BitWriter &writer,
-                         const uint8_t *row_ptr,
-                         uint32_t tile_w,
+                         const uint8_t *image_base,
+                         uint32_t image_width,
                          uint32_t components,
+                         uint32_t origin_x,
+                         uint32_t origin_y,
+                         uint32_t tile_w,
+                         uint32_t tile_h,
                          std::string &err);
 
     bool write_raw(FILE *fp, const PixelBuffer &src, int desired_colors, std::string &err)
@@ -376,13 +387,16 @@ namespace tlg::v8
         {
           const uint32_t tile_w = std::min<uint32_t>(tile_width, width - origin_x);
           detail::bitio::BitWriter writer(tile_buffer.data(), tile_buffer.size());
-          for (uint32_t dy = 0; dy < tile_h; ++dy)
-          {
-            const size_t row_offset = (static_cast<size_t>(origin_y + dy) * width + origin_x) * components;
-            const uint8_t *row_ptr = packed_ptr + row_offset;
-            if (!encode_for_tile(writer, row_ptr, tile_w, components, err))
-              return false;
-          }
+          if (!encode_for_tile(writer,
+                               packed_ptr,
+                               width,
+                               components,
+                               origin_x,
+                               origin_y,
+                               tile_w,
+                               tile_h,
+                               err))
+            return false;
           if (!writer.align_to_u32_zero() || !writer.finish())
           {
             err = "tlg8: failed to finalize tile payload";

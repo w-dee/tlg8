@@ -10,6 +10,9 @@ Usage:
   python3 test/run_roundtrip.py [--tlgconv /path/to/tlgconv] [--images DIR]
 """
 import argparse
+import filecmp
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -37,6 +40,73 @@ def run_timed_command(cmd: Sequence[str], **kwargs) -> float:
     start = time.perf_counter()
     run_command(cmd, **kwargs)
     return time.perf_counter() - start
+
+
+COMPARE_CMD = shutil.which("compare")
+
+
+def load_bmp_pixels(path: Path) -> tuple[int, int, int, bytes]:
+    with path.open("rb") as fp:
+        data = fp.read()
+
+    if len(data) < 54 or data[0:2] != b"BM":
+        raise ValueError("unsupported bmp format")
+
+    dib_size = struct.unpack_from("<I", data, 14)[0]
+    if dib_size < 40:
+        raise ValueError("unsupported bmp header")
+
+    width = struct.unpack_from("<i", data, 18)[0]
+    height_signed = struct.unpack_from("<i", data, 22)[0]
+    planes = struct.unpack_from("<H", data, 26)[0]
+    bpp = struct.unpack_from("<H", data, 28)[0]
+    compression = struct.unpack_from("<I", data, 30)[0]
+    pixel_offset = struct.unpack_from("<I", data, 10)[0]
+
+    if planes != 1 or compression != 0:
+        raise ValueError("unsupported bmp features")
+    if bpp not in (24, 32):
+        raise ValueError("unsupported bmp depth")
+
+    abs_height = abs(height_signed)
+    if width <= 0 or abs_height == 0:
+        raise ValueError("invalid bmp dimensions")
+
+    bytes_per_pixel = bpp // 8
+    row_stride = ((width * bytes_per_pixel + 3) // 4) * 4
+    bytes_per_row = width * bytes_per_pixel
+
+    if len(data) < pixel_offset + row_stride * abs_height:
+        raise ValueError("bmp payload truncated")
+
+    pixels = bytearray(bytes_per_row * abs_height)
+    bottom_up = height_signed > 0
+
+    for row in range(abs_height):
+        src_row = abs_height - 1 - row if bottom_up else row
+        src_offset = pixel_offset + src_row * row_stride
+        row_data = data[src_offset : src_offset + bytes_per_row]
+        if len(row_data) < bytes_per_row:
+            raise ValueError("bmp payload truncated")
+        dest_offset = row * bytes_per_row
+        pixels[dest_offset : dest_offset + bytes_per_row] = row_data
+
+    return width, abs_height, bpp, bytes(pixels)
+
+
+def bmp_pixels_match(a: Path, b: Path) -> bool:
+    try:
+        width_a, height_a, depth_a, pixels_a = load_bmp_pixels(a)
+        width_b, height_b, depth_b, pixels_b = load_bmp_pixels(b)
+    except ValueError:
+        return False
+
+    return (
+        width_a == width_b
+        and height_a == height_b
+        and depth_a == depth_b
+        and pixels_a == pixels_b
+    )
 
 
 def roundtrip(
@@ -70,20 +140,21 @@ def roundtrip(
     stat["compress_time"] += encode_time
     stat["decompress_time"] += decode_time
 
-    try:
+    mismatch_message = f"Mismatch detected for {bmp_path.name} ({spec.name} round-trip)"
+
+    if COMPARE_CMD:
         cmp_proc = subprocess.run(
-            ["compare", str(bmp_path), str(recon_bmp), "null:"],
+            [COMPARE_CMD, str(bmp_path), str(recon_bmp), "null:"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except FileNotFoundError as exc:
-        raise SystemExit("ImageMagick 'compare' command not found: " + str(exc)) from exc
-
-    if cmp_proc.returncode != 0:
-        return (
-            False,
-            f"Mismatch detected for {bmp_path.name} ({spec.name} round-trip)",
-        )
+        if cmp_proc.returncode != 0:
+            return False, mismatch_message
+    else:
+        if bmp_path.stat().st_size == recon_bmp.stat().st_size and filecmp.cmp(bmp_path, recon_bmp, shallow=False):
+            return True, None
+        if not bmp_pixels_match(bmp_path, recon_bmp):
+            return False, mismatch_message
 
     return True, None
 
