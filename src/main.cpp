@@ -1,5 +1,6 @@
 #include "image_io.h"
 #include "tlg7_io.h"
+#include "tlg8_io.h"
 
 #include <algorithm>
 #include <cctype>
@@ -28,7 +29,7 @@ static void print_usage()
 {
   std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|tlg8|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|tlg8|png|bmp)>"
             << " [--tlg-version=5|6|7|8] [--pixel-format=auto|R8G8B8|A8R8G8B8]"
-            << " [--tlg7-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
+            << " [--tlg7-golomb-table=<path>] [--tlg8-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
             << " [--tlg7-dump-residuals-order=before|after]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
@@ -100,6 +101,10 @@ int main(int argc, char **argv)
     {
       tlgopt.tlg7_golomb_table_path = arg.substr(20);
     }
+    else if (arg.rfind("--tlg8-golomb-table=", 0) == 0)
+    {
+      tlgopt.tlg8_golomb_table_path = arg.substr(20);
+    }
     else if ((arg.rfind("-tlg7-dump-residuals=", 0) == 0) || (arg.rfind("--tlg7-dump-residuals=", 0) == 0))
     {
       const auto eq = arg.find('=');
@@ -145,6 +150,12 @@ int main(int argc, char **argv)
 
   std::string cfg_err;
   if (!tlg::v7::configure_golomb_table(tlgopt.tlg7_golomb_table_path, cfg_err))
+  {
+    std::cerr << cfg_err << "\n";
+    return 1;
+  }
+
+  if (!tlg::v8::configure_golomb_table(tlgopt.tlg8_golomb_table_path, cfg_err))
   {
     std::cerr << cfg_err << "\n";
     return 1;

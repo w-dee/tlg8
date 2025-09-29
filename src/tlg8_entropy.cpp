@@ -4,7 +4,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <limits>
+#include <sstream>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -24,6 +28,8 @@ namespace
                                                 GolombRow{2, 3, 7, 33, 74, 81, 237, 450, 137},
                                                 GolombRow{3, 1, 5, 28, 66, 92, 246, 452, 131}};
 
+  GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
+
   std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
   bool g_table_ready = false;
 
@@ -36,7 +42,7 @@ namespace
       int accumulator = 0;
       for (uint32_t col = 0; col < kGolombColumnCount; ++col)
       {
-        const uint16_t count = DEFAULT_GOLOMB_TABLE[row][col];
+        const uint16_t count = g_golomb_table[row][col];
         for (uint16_t i = 0; i < count; ++i)
         {
           const uint32_t idx = static_cast<uint32_t>(std::min(accumulator, static_cast<int>(kGolombRowSum - 1)));
@@ -590,6 +596,139 @@ namespace
       if (!encode_run_length_component(stream, colors.values[c].data(), value_count, c))
         return false;
     }
+    return true;
+  }
+}
+
+namespace tlg::v8
+{
+  bool configure_golomb_table(const std::string &path, std::string &err)
+  {
+    if (path.empty())
+    {
+      if (g_golomb_table != DEFAULT_GOLOMB_TABLE)
+      {
+        g_golomb_table = DEFAULT_GOLOMB_TABLE;
+        g_table_ready = false;
+      }
+      err.clear();
+      return true;
+    }
+
+    std::ifstream in(path);
+    if (!in)
+    {
+      err = "tlg8: failed to open Golomb table: " + path;
+      return false;
+    }
+
+    std::string line;
+    std::size_t line_number = 0;
+    std::vector<GolombRow> parsed_rows;
+    parsed_rows.reserve(static_cast<std::size_t>(kGolombRowCount));
+
+    while (std::getline(in, line))
+    {
+      ++line_number;
+      const auto comment_pos = line.find_first_of("#;");
+      if (comment_pos != std::string::npos)
+        line.erase(comment_pos);
+
+      if (line.find_first_not_of(" \t\r\n") == std::string::npos)
+        continue;
+
+      if (parsed_rows.size() >= static_cast<std::size_t>(kGolombRowCount))
+      {
+        err = "tlg8: extra data in Golomb table '" + path + "' at line " + std::to_string(line_number);
+        return false;
+      }
+
+      const std::size_t row_index = parsed_rows.size();
+      std::istringstream iss(line);
+      GolombRow row_values{};
+      int sum = 0;
+      int value = 0;
+      std::size_t col = 0;
+      while (col < row_values.size() && (iss >> value))
+      {
+        if (value < 0)
+        {
+          err = "tlg8: negative value in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
+          return false;
+        }
+        if (value > std::numeric_limits<uint16_t>::max())
+        {
+          err = "tlg8: value too large in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
+          return false;
+        }
+        row_values[col++] = static_cast<uint16_t>(value);
+        sum += value;
+      }
+
+      if (col != row_values.size())
+      {
+        if (iss.fail() && !iss.eof())
+        {
+          err = "tlg8: invalid token in Golomb table '" + path + "' at line " + std::to_string(line_number);
+        }
+        else
+        {
+          err = "tlg8: expected 9 values in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
+        }
+        return false;
+      }
+
+      if (iss >> value)
+      {
+        err = "tlg8: too many values in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
+        return false;
+      }
+
+      if (sum != static_cast<int>(kGolombRowSum))
+      {
+        err = "tlg8: row sum must be 1024 in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
+        return false;
+      }
+
+      parsed_rows.push_back(row_values);
+    }
+
+    if (parsed_rows.empty())
+    {
+      err = "tlg8: Golomb table '" + path + "' must contain at least one row";
+      return false;
+    }
+
+    std::vector<GolombRow> expanded_rows;
+    const std::size_t parsed_count = parsed_rows.size();
+    if (parsed_count == static_cast<std::size_t>(kGolombRowCount))
+    {
+      expanded_rows = parsed_rows;
+    }
+    else if (static_cast<std::size_t>(kGolombRowCount) % parsed_count == 0)
+    {
+      const std::size_t repeat = static_cast<std::size_t>(kGolombRowCount) / parsed_count;
+      expanded_rows.reserve(static_cast<std::size_t>(kGolombRowCount));
+      for (std::size_t i = 0; i < repeat; ++i)
+        expanded_rows.insert(expanded_rows.end(), parsed_rows.begin(), parsed_rows.end());
+    }
+    else
+    {
+      err = "tlg8: Golomb table '" + path + "' must contain " + std::to_string(kGolombRowCount) +
+            " rows or a divisor of that count";
+      return false;
+    }
+
+    GolombTable candidate{};
+    for (std::size_t i = 0; i < static_cast<std::size_t>(kGolombRowCount); ++i)
+      candidate[i] = expanded_rows[i];
+
+    if (candidate != g_golomb_table)
+    {
+      g_golomb_table = candidate;
+      g_table_ready = false;
+    }
+    err.clear();
     return true;
   }
 }

@@ -7,6 +7,7 @@
 
 namespace tlg::v8
 {
+  bool configure_golomb_table(const std::string &path, std::string &err);
   bool decode_stream(FILE *fp, PixelBuffer &out, std::string &err);
 
   namespace enc
