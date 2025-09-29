@@ -2,6 +2,7 @@
 #include "tlg8_block.h"
 #include "tlg8_color_filter.h"
 #include "tlg8_entropy.h"
+#include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
 
 #include <algorithm>
@@ -163,6 +164,8 @@ namespace tlg::v8
 
         if (!enc::decode_block_from_context(entropy_ctx, kind, components, value_count, residuals, err))
           return false;
+
+        enc::reorder_from_hilbert(residuals, components, block_w, block_h);
 
         enc::undo_color_filter(info.filter, residuals, components, value_count);
 

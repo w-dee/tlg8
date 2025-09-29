@@ -2,6 +2,7 @@
 #include "tlg8_block.h"
 #include "tlg8_color_filter.h"
 #include "tlg8_entropy.h"
+#include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
 
 #include <algorithm>
@@ -14,8 +15,8 @@
 namespace
 {
   // タイル全体を 8x8 ブロックへ分割し、予測→カラー相関フィルター→
-  // （今後追加予定の並び替え）→エントロピー符号と流すパイプライン。
-  // 現段階では並び替え段のみ未実装であり、その意図をコメントにて残している。
+  // ヒルベルト曲線による並び替え→エントロピー符号と流すパイプライン。
+  // 並び替え段はタイル端で縮むブロックにも対応させている。
   struct tile_accessor
   {
     const uint8_t *base;
@@ -197,17 +198,20 @@ namespace tlg::v8::enc
             if (components >= 3)
               apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
 
+            component_colors reordered = filtered;
+            reorder_to_hilbert(reordered, components, block_w, block_h);
+
             for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
             {
               const uint64_t estimated_bits =
-                  entropy_encoders[entropy_index].estimate_bits(filtered, components, value_count);
+                  entropy_encoders[entropy_index].estimate_bits(reordered, components, value_count);
               if (estimated_bits < best_bits)
               {
                 best_bits = estimated_bits;
                 best_predictor = predictor_index;
                 best_filter = filter_code;
                 best_entropy = entropy_index;
-                best_block = filtered;
+                best_block = reordered;
                 best_reconstructed = candidate_reconstructed;
               }
             }
