@@ -12,7 +12,12 @@ namespace tlg::v8
 
   namespace enc
   {
-    bool write_raw(FILE *fp, const PixelBuffer &src, int desired_colors, std::string &err);
+    bool write_raw(FILE *fp,
+                   const PixelBuffer &src,
+                   int desired_colors,
+                   const std::string &dump_residuals_path,
+                   TlgOptions::DumpResidualsOrder dump_residuals_order,
+                   std::string &err);
   }
 } // namespace tlg::v8
 

@@ -130,7 +130,12 @@ bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions 
       std::fclose(fp);
       return false;
     }
-    ok = tlg::v8::enc::write_raw(fp, src, desired_colors, err);
+    ok = tlg::v8::enc::write_raw(fp,
+                                 src,
+                                 desired_colors,
+                                 opt.tlg8_dump_residuals_path,
+                                 opt.tlg8_dump_residuals_order,
+                                 err);
   }
   else if (opt.version == 6)
   {

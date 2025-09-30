@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <vector>
@@ -133,6 +134,63 @@ namespace
       }
     }
   }
+
+  // 残差ブロックをテキストでダンプするユーティリティ。
+  void dump_residual_block(FILE *fp,
+                           uint32_t tile_origin_x,
+                           uint32_t tile_origin_y,
+                           uint32_t block_x,
+                           uint32_t block_y,
+                           uint32_t block_w,
+                           uint32_t block_h,
+                           uint32_t components,
+                           uint32_t predictor_index,
+                           uint32_t filter_code,
+                           uint32_t entropy_index,
+                           const tlg::v8::enc::component_colors &values,
+                           const char *phase_label)
+  {
+    if (!fp || block_w == 0 || block_h == 0 || values.values.empty() || phase_label == nullptr)
+      return;
+
+    const uint32_t value_count = block_w * block_h;
+    if (value_count == 0)
+      return;
+
+    const uint32_t used_components = std::min<uint32_t>(components,
+                                                         static_cast<uint32_t>(values.values.size()));
+
+    std::fprintf(fp,
+                 "# tile_origin=(%u,%u) block_origin=(%u,%u) block_size=%ux%u phase=%s\n",
+                 tile_origin_x,
+                 tile_origin_y,
+                 tile_origin_x + block_x,
+                 tile_origin_y + block_y,
+                 block_w,
+                 block_h,
+                 phase_label);
+    std::fprintf(fp,
+                 "# predictor=%u filter=%u entropy=%u\n",
+                 predictor_index,
+                 filter_code,
+                 entropy_index);
+
+    for (uint32_t comp = 0; comp < used_components; ++comp)
+    {
+      std::fprintf(fp, "component %u:\n", comp);
+      for (uint32_t i = 0; i < value_count; ++i)
+      {
+        std::fprintf(fp, "%6d", static_cast<int>(values.values[comp][i]));
+        if (i + 1 < value_count)
+          std::fputc(',', fp);
+        if (((i + 1) % block_w) == 0 || i + 1 == value_count)
+          std::fputc('\n', fp);
+      }
+      std::fputc('\n', fp);
+    }
+
+    std::fputc('\n', fp);
+  }
 }
 
 namespace tlg::v8::enc
@@ -145,6 +203,9 @@ namespace tlg::v8::enc
                        uint32_t origin_y,
                        uint32_t tile_w,
                        uint32_t tile_h,
+                       FILE *dump_fp,
+                       bool dump_before_hilbert,
+                       bool dump_after_hilbert,
                        std::string &err)
   {
     if (components == 0 || components > 4)
@@ -186,6 +247,7 @@ namespace tlg::v8::enc
         const uint32_t value_count = block_w * block_h;
 
         component_colors best_block{};
+        component_colors best_filtered{};
         std::array<std::array<uint8_t, enc::kMaxBlockPixels>, 4> best_reconstructed{};
         uint32_t best_predictor = 0;
         uint32_t best_filter = 0;
@@ -226,6 +288,7 @@ namespace tlg::v8::enc
             if (components >= 3)
               apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
 
+            component_colors filtered_before_hilbert = filtered;
             const double filtered_energy = compute_energy(filtered, components, value_count);
             if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
                 filtered_energy > best_filtered_energy * EARLY_EXIT_GIVE_UP_RATE)
@@ -251,6 +314,7 @@ namespace tlg::v8::enc
                 best_entropy = entropy_index;
                 best_block = reordered;
                 best_reconstructed = candidate_reconstructed;
+                best_filtered = filtered_before_hilbert;
               }
             }
           }
@@ -277,6 +341,38 @@ namespace tlg::v8::enc
                 reconstructed_tile[offset] = best_reconstructed[comp][value_index];
             }
           }
+        }
+
+        if (dump_fp)
+        {
+          if (dump_before_hilbert)
+            dump_residual_block(dump_fp,
+                                origin_x,
+                                origin_y,
+                                block_x,
+                                block_y,
+                                block_w,
+                                block_h,
+                                components,
+                                best_predictor,
+                                best_filter,
+                                best_entropy,
+                                best_filtered,
+                                "before_hilbert");
+          if (dump_after_hilbert)
+            dump_residual_block(dump_fp,
+                                origin_x,
+                                origin_y,
+                                block_x,
+                                block_y,
+                                block_w,
+                                block_h,
+                                components,
+                                best_predictor,
+                                best_filter,
+                                best_entropy,
+                                best_block,
+                                "after_hilbert");
         }
 
         if (!entropy_encoders[best_entropy].encode_block(writer, best_block, components, value_count, err))

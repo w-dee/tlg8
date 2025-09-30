@@ -64,9 +64,11 @@ struct TlgOptions
   ImageFormat fmt = ImageFormat::Auto;  // decided by input if Auto
   std::string tlg7_golomb_table_path;   // optional override for TLG7 Golomb table
   std::string tlg8_golomb_table_path;   // optional override for TLG8 Golomb table
-  std::string tlg7_dump_residuals_path; // optional residual dump output for TLG7 encoder
+  std::string tlg7_dump_residuals_path; // TLG7 エンコーダで残差をダンプする場合の出力先
   DumpResidualsOrder tlg7_dump_residuals_order = DumpResidualsOrder::AfterHilbert;
   Tlg7PipelineOrder tlg7_pipeline_order = Tlg7PipelineOrder::PredictorThenFilter;
+  std::string tlg8_dump_residuals_path; // TLG8 エンコーダで残差をダンプする場合の出力先
+  DumpResidualsOrder tlg8_dump_residuals_order = DumpResidualsOrder::AfterHilbert;
 };
 
 bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err);

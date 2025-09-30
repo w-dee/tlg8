@@ -1,8 +1,10 @@
 #include "tlg8_io.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <vector>
 
 #include "tlg_io_common.h"
@@ -296,23 +298,52 @@ namespace tlg::v8
 
   namespace enc
   {
-    bool encode_for_tile(detail::bitio::BitWriter &writer,
-                         const uint8_t *image_base,
-                         uint32_t image_width,
-                         uint32_t components,
-                         uint32_t origin_x,
-                         uint32_t origin_y,
-                         uint32_t tile_w,
-                         uint32_t tile_h,
-                         std::string &err);
+  bool encode_for_tile(detail::bitio::BitWriter &writer,
+                       const uint8_t *image_base,
+                       uint32_t image_width,
+                       uint32_t components,
+                       uint32_t origin_x,
+                       uint32_t origin_y,
+                       uint32_t tile_w,
+                       uint32_t tile_h,
+                       FILE *dump_fp,
+                       bool dump_before_hilbert,
+                       bool dump_after_hilbert,
+                       std::string &err);
 
-    bool write_raw(FILE *fp, const PixelBuffer &src, int desired_colors, std::string &err)
+    bool write_raw(FILE *fp,
+                   const PixelBuffer &src,
+                   int desired_colors,
+                   const std::string &dump_residuals_path,
+                   TlgOptions::DumpResidualsOrder dump_residuals_order,
+                   std::string &err)
     {
       static_assert(std::numeric_limits<int8_t>::min() == -128 &&
                         std::numeric_limits<int8_t>::max() == 127,
                     "int8_t is not two's complement");
 
       err.clear();
+
+      struct FileCloser
+      {
+        void operator()(FILE *p) const noexcept
+        {
+          if (p)
+            std::fclose(p);
+        }
+      };
+
+      std::unique_ptr<FILE, FileCloser> dump_file;
+      if (!dump_residuals_path.empty())
+      {
+        FILE *dump_fp = std::fopen(dump_residuals_path.c_str(), "w");
+        if (!dump_fp)
+        {
+          err = "tlg8: 残差ダンプファイルを開けません: " + dump_residuals_path;
+          return false;
+        }
+        dump_file.reset(dump_fp);
+      }
 
       if (src.width == 0 || src.height == 0)
       {
@@ -377,6 +408,11 @@ namespace tlg::v8
       std::vector<uint8_t> tile_buffer(static_cast<size_t>(tile_capacity_u64));
       const uint8_t *packed_ptr = packed.data();
 
+      const bool dump_before_hilbert = dump_file &&
+                                       (dump_residuals_order == TlgOptions::DumpResidualsOrder::BeforeHilbert);
+      const bool dump_after_hilbert = dump_file &&
+                                      (dump_residuals_order == TlgOptions::DumpResidualsOrder::AfterHilbert);
+
       for (uint32_t origin_y = 0; origin_y < height; origin_y += tile_height)
       {
         const uint32_t tile_h = std::min<uint32_t>(tile_height, height - origin_y);
@@ -392,6 +428,9 @@ namespace tlg::v8
                                origin_y,
                                tile_w,
                                tile_h,
+                               dump_file.get(),
+                               dump_before_hilbert,
+                               dump_after_hilbert,
                                err))
             return false;
           if (!writer.align_to_u32_zero() || !writer.finish())

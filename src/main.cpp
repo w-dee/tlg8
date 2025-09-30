@@ -30,7 +30,8 @@ static void print_usage()
   std::cerr << "Usage: tlgconv <input.(tlg|tlg5|tlg6|tlg7|tlg8|png|bmp)> <output.(tlg|tlg5|tlg6|tlg7|tlg8|png|bmp)>"
             << " [--tlg-version=5|6|7|8] [--pixel-format=auto|R8G8B8|A8R8G8B8]"
             << " [--tlg7-golomb-table=<path>] [--tlg8-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
-            << " [--tlg7-dump-residuals-order=before|after]"
+            << " [--tlg7-dump-residuals-order=before|after] [-tlg8-dump-residuals=<path>]"
+            << " [--tlg8-dump-residuals-order=before|after]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
 
@@ -140,6 +141,37 @@ int main(int argc, char **argv)
     {
       print_usage();
       return 0;
+    }
+    else if ((arg.rfind("-tlg8-dump-residuals=", 0) == 0) || (arg.rfind("--tlg8-dump-residuals=", 0) == 0))
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid -tlg8-dump-residuals option\n";
+        return 2;
+      }
+      tlgopt.tlg8_dump_residuals_path = arg.substr(eq + 1);
+    }
+    else if ((arg.rfind("--tlg8-dump-residuals-order=", 0) == 0) ||
+             (arg.rfind("-tlg8-dump-residuals-order=", 0) == 0))
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg8-dump-residuals-order option\n";
+        return 2;
+      }
+      std::string order = arg.substr(eq + 1);
+      to_lower_inplace(order);
+      if (order == "before")
+        tlgopt.tlg8_dump_residuals_order = TlgOptions::DumpResidualsOrder::BeforeHilbert;
+      else if (order == "after")
+        tlgopt.tlg8_dump_residuals_order = TlgOptions::DumpResidualsOrder::AfterHilbert;
+      else
+      {
+        std::cerr << "Invalid --tlg8-dump-residuals-order: " << order << "\n";
+        return 2;
+      }
     }
     else
     {
