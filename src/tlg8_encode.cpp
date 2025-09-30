@@ -65,12 +65,7 @@ namespace
   // predictor の出力後にカラー相関フィルターを適用し、その結果を
   // component_colors へ格納する。
   void compute_residual_block(const tile_accessor &accessor,
-                              const std::vector<uint8_t> &reconstructed_tile,
-                              const std::vector<uint8_t> &reconstructed_mask,
-                              uint32_t tile_w,
-                              uint32_t tile_h,
                               tlg::v8::enc::component_colors &out,
-                              std::array<std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels>, 4> &reconstructed_block,
                               tlg::v8::enc::predictor_fn predictor,
                               uint32_t components,
                               uint32_t block_x,
@@ -79,8 +74,6 @@ namespace
                               uint32_t block_h)
   {
     for (auto &component : out.values)
-      component.fill(0);
-    for (auto &component : reconstructed_block)
       component.fill(0);
 
     uint32_t index = 0;
@@ -94,34 +87,7 @@ namespace
         {
           auto sample_from_state = [&](int32_t sx, int32_t sy, uint32_t sc) -> uint8_t
           {
-            if (sx < 0 || sy < 0)
-              return 0;
-            if (sx >= static_cast<int32_t>(tile_w) || sy >= static_cast<int32_t>(tile_h))
-              return 0;
-            const bool inside_block = (sx >= static_cast<int32_t>(block_x) &&
-                                       sx < static_cast<int32_t>(block_x + block_w) &&
-                                       sy >= static_cast<int32_t>(block_y) &&
-                                       sy < static_cast<int32_t>(block_y + block_h));
-            if (inside_block)
-            {
-              const int local_y = sy - static_cast<int32_t>(block_y);
-              const int local_x = sx - static_cast<int32_t>(block_x);
-              if (local_y < static_cast<int32_t>(by) ||
-                  (local_y == static_cast<int32_t>(by) && local_x < static_cast<int32_t>(bx)))
-              {
-                const size_t local_index = static_cast<size_t>(local_y) * block_w + static_cast<size_t>(local_x);
-                return reconstructed_block[sc][local_index];
-              }
-              // 未再構成のブロック内ピクセルはタイル状態にも存在しないため 0 を返す。
-              return 0;
-            }
-            const size_t offset = (static_cast<size_t>(sy) * tile_w + static_cast<size_t>(sx)) * components + sc;
-            if (offset >= reconstructed_tile.size())
-              return 0;
-            if (offset < reconstructed_mask.size() && reconstructed_mask[offset])
-              return reconstructed_tile[offset];
-            // タイル内だがまだ再構成されていない場合は 0。
-            return 0;
+            return accessor.sample(sx, sy, sc);
           };
 
           const uint8_t a = sample_from_state(tx - 1, ty, comp);
@@ -131,9 +97,6 @@ namespace
           const uint8_t predicted = predictor(a, b, c, d);
           const uint8_t actual = accessor.sample(tx, ty, comp);
           out.values[comp][index] = static_cast<int16_t>(static_cast<int32_t>(actual) - static_cast<int32_t>(predicted));
-          int32_t reconstructed = static_cast<int32_t>(predicted) + static_cast<int32_t>(out.values[comp][index]);
-          reconstructed = std::clamp(reconstructed, 0, 255);
-          reconstructed_block[comp][index] = static_cast<uint8_t>(reconstructed);
         }
         ++index;
       }
@@ -228,9 +191,6 @@ namespace tlg::v8::enc
     // 現状は reorder をヒルベルト固定とし、predictor × filter × entropy の
     // 組み合わせを探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
-    std::vector<uint8_t> reconstructed_tile(static_cast<size_t>(tile_w) * tile_h * components, 0);
-    std::vector<uint8_t> reconstructed_mask(reconstructed_tile.size(), 0);
-
     auto compute_energy = [](const component_colors &colors, uint32_t comp_count, uint32_t value_count)
     {
       double energy = 0.0;
@@ -256,26 +216,19 @@ namespace tlg::v8::enc
 
         component_colors best_block{};
         component_colors best_filtered{};
-        std::array<std::array<uint8_t, enc::kMaxBlockPixels>, 4> best_reconstructed{};
         uint32_t best_predictor = 0;
         uint32_t best_filter = 0;
         uint32_t best_entropy = 0;
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
         component_colors candidate{};
-        std::array<std::array<uint8_t, enc::kMaxBlockPixels>, 4> candidate_reconstructed{};
         const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(kColorFilterCodeCount) : 1u;
         double best_residual_energy = std::numeric_limits<double>::infinity();
         double best_filtered_energy = std::numeric_limits<double>::infinity();
         for (uint32_t predictor_index = 0; predictor_index < kNumPredictors; ++predictor_index)
         {
           compute_residual_block(accessor,
-                                 reconstructed_tile,
-                                 reconstructed_mask,
-                                 tile_w,
-                                 tile_h,
                                  candidate,
-                                 candidate_reconstructed,
                                  predictors[predictor_index],
                                  components,
                                  block_x,
@@ -322,7 +275,6 @@ namespace tlg::v8::enc
                 best_filter = filter_code;
                 best_entropy = entropy_index;
                 best_block = reordered;
-                best_reconstructed = candidate_reconstructed;
                 best_filtered = filtered_before_hilbert;
               }
             }
@@ -336,25 +288,6 @@ namespace tlg::v8::enc
         writer.put_upto8(best_predictor, tlg::detail::bit_width(kNumPredictors));
         writer.put_upto8(best_filter, tlg::detail::bit_width(filter_count));
         writer.put_upto8(best_entropy, tlg::detail::bit_width(kNumEntropyEncoders));
-
-        for (uint32_t by = 0; by < block_h; ++by)
-        {
-          for (uint32_t bx = 0; bx < block_w; ++bx)
-          {
-            const uint32_t value_index = by * block_w + bx;
-            for (uint32_t comp = 0; comp < components; ++comp)
-            {
-              const size_t offset =
-                  (static_cast<size_t>(block_y + by) * tile_w + static_cast<size_t>(block_x + bx)) * components + comp;
-              if (offset < reconstructed_tile.size())
-              {
-                reconstructed_tile[offset] = best_reconstructed[comp][value_index];
-                if (offset < reconstructed_mask.size())
-                  reconstructed_mask[offset] = 1;
-              }
-            }
-          }
-        }
 
         if (dump_fp)
         {

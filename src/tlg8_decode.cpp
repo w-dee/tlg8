@@ -74,6 +74,15 @@ namespace tlg::v8
     for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
     {
       const uint32_t block_h = std::min(enc::kBlockSize, tile_h - block_y);
+      struct block_decode_state
+      {
+        uint32_t block_x;
+        uint32_t block_w;
+        uint32_t predictor_index;
+        enc::component_colors residuals;
+      };
+      std::vector<block_decode_state> row_blocks;
+
       for (uint32_t block_x = 0; block_x < tile_w; block_x += enc::kBlockSize)
       {
         const uint32_t block_w = std::min(enc::kBlockSize, tile_w - block_x);
@@ -99,7 +108,6 @@ namespace tlg::v8
         }
 
         const uint32_t value_count = block_w * block_h;
-        const auto predictor = predictors[predictor_index];
         const auto kind = entropy_encoders[entropy_index].kind;
 
         if (!enc::decode_block(reader, kind, components, value_count, residuals, err))
@@ -109,21 +117,36 @@ namespace tlg::v8
 
         enc::undo_color_filter(filter_index, residuals, components, value_count);
 
-        for (uint32_t by = 0; by < block_h; ++by)
+        block_decode_state state{};
+        state.block_x = block_x;
+        state.block_w = block_w;
+        state.predictor_index = predictor_index;
+        state.residuals = residuals;
+        row_blocks.emplace_back(state);
+      }
+
+      for (uint32_t local_y = 0; local_y < block_h; ++local_y)
+      {
+        for (const auto &state : row_blocks)
         {
-          for (uint32_t bx = 0; bx < block_w; ++bx)
+          const auto predictor = predictors[state.predictor_index];
+          for (uint32_t bx = 0; bx < state.block_w; ++bx)
           {
-            const int32_t tx = static_cast<int32_t>(block_x + bx);
-            const int32_t ty = static_cast<int32_t>(block_y + by);
-            const uint32_t value_index = by * block_w + bx;
+            const int32_t tx = static_cast<int32_t>(state.block_x + bx);
+            const int32_t ty = static_cast<int32_t>(block_y + local_y);
+            const uint32_t value_index = local_y * state.block_w + bx;
             for (uint32_t comp = 0; comp < components; ++comp)
             {
-              const uint8_t a = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h, tx - 1, ty, comp);
-              const uint8_t b = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h, tx, ty - 1, comp);
-              const uint8_t c = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h, tx - 1, ty - 1, comp);
-              const uint8_t d = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h, tx + 1, ty - 1, comp);
+              const uint8_t a = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
+                                             tx - 1, ty, comp);
+              const uint8_t b = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
+                                             tx, ty - 1, comp);
+              const uint8_t c = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
+                                             tx - 1, ty - 1, comp);
+              const uint8_t d = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
+                                             tx + 1, ty - 1, comp);
               const uint8_t predicted = predictor(a, b, c, d);
-              const int16_t residual = residuals.values[comp][value_index];
+              const int16_t residual = state.residuals.values[comp][value_index];
               int32_t value = static_cast<int32_t>(predicted) + static_cast<int32_t>(residual);
               value = std::clamp(value, 0, 255);
               const size_t dst_index =
@@ -145,7 +168,6 @@ namespace tlg::v8
         }
       }
     }
-
     return true;
   }
 }
