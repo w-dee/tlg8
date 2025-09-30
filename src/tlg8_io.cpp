@@ -68,7 +68,7 @@ namespace tlg::v8
 {
   namespace
   {
-    constexpr uint64_t TILE_SIZE = 128;
+    constexpr uint64_t TILE_SIZE = 8192; // virtually non tiling
 
     bool copy_pixels_to_buffer(const PixelBuffer &src,
                                int desired_colors,
