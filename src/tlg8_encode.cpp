@@ -186,6 +186,10 @@ namespace tlg::v8::enc
 
     const auto &predictors = predictor_table();
     const auto &entropy_encoders = entropy_encoder_table();
+    std::array<std::vector<int16_t>, kGolombRowCount> entropy_values;
+    const size_t reserve_per_row = static_cast<size_t>(tile_w) * tile_h;
+    for (auto &values : entropy_values)
+      values.reserve(reserve_per_row);
     // 将来的にはここで並び替え候補も列挙し、
     // predictor × filter × reorder × entropy の全組み合わせを評価する。
     // 現状は reorder をヒルベルト固定とし、predictor × filter × entropy の
@@ -323,11 +327,45 @@ namespace tlg::v8::enc
                                 "after_hilbert");
         }
 
-        if (!entropy_encoders[best_entropy].encode_block(writer, best_block, components, value_count, err))
+        const auto kind = entropy_encoders[best_entropy].kind;
+        for (uint32_t comp = 0; comp < components; ++comp)
         {
-          err = "tlg8: エントロピー書き込みに失敗しました";
-          return false;
+          const int row = golomb_row_index(kind, comp);
+          if (row < 0 || row >= static_cast<int>(kGolombRowCount))
+          {
+            err = "tlg8: 不正なゴロム行です";
+            return false;
+          }
+          auto &row_values = entropy_values[static_cast<std::size_t>(row)];
+          row_values.insert(row_values.end(),
+                            best_block.values[comp].begin(),
+                            best_block.values[comp].begin() + value_count);
         }
+      }
+    }
+    writer.align_to_byte_zero();
+    for (uint32_t row = 0; row < kGolombRowCount; ++row)
+    {
+      const auto kind = golomb_row_kind(row);
+      const uint32_t component = golomb_row_component(row);
+      const auto &values = entropy_values[row];
+      if (values.size() > std::numeric_limits<uint32_t>::max())
+      {
+        err = "tlg8: エントロピー値数が大きすぎます";
+        return false;
+      }
+      const uint32_t count = static_cast<uint32_t>(values.size());
+      if (count == 0)
+        continue;
+      if (!encode_values(writer,
+                         kind,
+                         component,
+                         values.data(),
+                         count,
+                         err))
+      {
+        err = "tlg8: エントロピー書き込みに失敗しました";
+        return false;
       }
     }
     return true;

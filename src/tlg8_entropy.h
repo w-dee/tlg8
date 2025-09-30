@@ -17,6 +17,7 @@ namespace tlg::v8::enc
   };
 
   constexpr uint32_t kNumEntropyEncoders = 2;
+  constexpr uint32_t kGolombRowCount = 6;
 
   struct entropy_encoder
   {
@@ -33,6 +34,24 @@ namespace tlg::v8::enc
   };
 
   const std::array<entropy_encoder, kNumEntropyEncoders> &entropy_encoder_table();
+
+  int golomb_row_index(GolombCodingKind kind, uint32_t component);
+  GolombCodingKind golomb_row_kind(uint32_t row);
+  uint32_t golomb_row_component(uint32_t row);
+
+  bool encode_values(detail::bitio::BitWriter &writer,
+                     GolombCodingKind kind,
+                     uint32_t component,
+                     const int16_t *values,
+                     uint32_t count,
+                     std::string &err);
+
+  bool decode_values(detail::bitio::BitReader &reader,
+                     GolombCodingKind kind,
+                     uint32_t component,
+                     uint32_t count,
+                     int16_t *dst,
+                     std::string &err);
 
   bool decode_block(detail::bitio::BitReader &reader,
                     GolombCodingKind kind,

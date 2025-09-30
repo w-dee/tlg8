@@ -67,21 +67,35 @@ namespace tlg::v8
     const auto &entropy_encoders = enc::entropy_encoder_table();
     const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(tlg::v8::enc::kColorFilterCodeCount) : 1u;
 
-    enc::component_colors residuals{};
-
     std::vector<uint8_t> decoded_mask(static_cast<size_t>(tile_w) * tile_h * components, 0);
+
+    struct block_decode_state
+    {
+      uint32_t block_x;
+      uint32_t block_w;
+      uint32_t predictor_index;
+      uint32_t filter_index;
+      uint32_t entropy_index;
+      uint32_t value_count;
+      enc::component_colors residuals;
+    };
+
+    struct block_row_state
+    {
+      uint32_t block_y;
+      uint32_t block_h;
+      std::vector<block_decode_state> blocks;
+    };
+
+    std::vector<block_row_state> block_rows;
+    std::array<std::size_t, enc::kGolombRowCount> row_value_counts{};
 
     for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
     {
       const uint32_t block_h = std::min(enc::kBlockSize, tile_h - block_y);
-      struct block_decode_state
-      {
-        uint32_t block_x;
-        uint32_t block_w;
-        uint32_t predictor_index;
-        enc::component_colors residuals;
-      };
-      std::vector<block_decode_state> row_blocks;
+      block_row_state row_state{};
+      row_state.block_y = block_y;
+      row_state.block_h = block_h;
 
       for (uint32_t block_x = 0; block_x < tile_w; block_x += enc::kBlockSize)
       {
@@ -108,32 +122,99 @@ namespace tlg::v8
         }
 
         const uint32_t value_count = block_w * block_h;
-        const auto kind = entropy_encoders[entropy_index].kind;
-
-        if (!enc::decode_block(reader, kind, components, value_count, residuals, err))
-          return false;
-
-        enc::reorder_from_hilbert(residuals, components, block_w, block_h);
-
-        enc::undo_color_filter(filter_index, residuals, components, value_count);
-
         block_decode_state state{};
         state.block_x = block_x;
         state.block_w = block_w;
         state.predictor_index = predictor_index;
-        state.residuals = residuals;
-        row_blocks.emplace_back(state);
+        state.filter_index = filter_index;
+        state.entropy_index = entropy_index;
+        state.value_count = value_count;
+        row_state.blocks.emplace_back(state);
+
+        const auto kind = entropy_encoders[entropy_index].kind;
+        for (uint32_t comp = 0; comp < components; ++comp)
+        {
+          const int row = enc::golomb_row_index(kind, comp);
+          if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
+          {
+            err = "tlg8: 不正なゴロム行です";
+            return false;
+          }
+          row_value_counts[static_cast<std::size_t>(row)] += value_count;
+        }
       }
 
-      for (uint32_t local_y = 0; local_y < block_h; ++local_y)
+      block_rows.emplace_back(std::move(row_state));
+    }
+
+    reader.align_to_byte();
+
+    std::array<std::vector<int16_t>, enc::kGolombRowCount> row_values;
+    std::array<std::size_t, enc::kGolombRowCount> row_offsets{};
+
+    for (uint32_t row = 0; row < enc::kGolombRowCount; ++row)
+    {
+      const std::size_t value_count = row_value_counts[row];
+      auto &values = row_values[row];
+      values.resize(value_count);
+      if (value_count == 0)
+        continue;
+      if (value_count > std::numeric_limits<uint32_t>::max())
       {
-        for (const auto &state : row_blocks)
+        err = "tlg8: エントロピー値数が大きすぎます";
+        return false;
+      }
+      if (!enc::decode_values(reader,
+                              enc::golomb_row_kind(row),
+                              enc::golomb_row_component(row),
+                              static_cast<uint32_t>(value_count),
+                              values.data(),
+                              err))
+      {
+        err = "tlg8: エントロピー復号に失敗しました";
+        return false;
+      }
+    }
+
+    for (auto &row_state : block_rows)
+    {
+      for (auto &state : row_state.blocks)
+      {
+        const auto kind = entropy_encoders[state.entropy_index].kind;
+        for (uint32_t comp = 0; comp < components; ++comp)
+        {
+          const int row = enc::golomb_row_index(kind, comp);
+          if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
+          {
+            err = "tlg8: 不正なゴロム行です";
+            return false;
+          }
+          auto &values = row_values[static_cast<std::size_t>(row)];
+          auto &offset = row_offsets[static_cast<std::size_t>(row)];
+          if (offset + state.value_count > values.size())
+          {
+            err = "tlg8: エントロピー列が不足しています";
+            return false;
+          }
+          std::copy_n(values.data() + offset, state.value_count, state.residuals.values[comp].begin());
+          offset += state.value_count;
+        }
+        enc::reorder_from_hilbert(state.residuals, components, state.block_w, row_state.block_h);
+        enc::undo_color_filter(state.filter_index, state.residuals, components, state.value_count);
+      }
+    }
+
+    for (const auto &row_state : block_rows)
+    {
+      for (uint32_t local_y = 0; local_y < row_state.block_h; ++local_y)
+      {
+        for (const auto &state : row_state.blocks)
         {
           const auto predictor = predictors[state.predictor_index];
           for (uint32_t bx = 0; bx < state.block_w; ++bx)
           {
             const int32_t tx = static_cast<int32_t>(state.block_x + bx);
-            const int32_t ty = static_cast<int32_t>(block_y + local_y);
+            const int32_t ty = static_cast<int32_t>(row_state.block_y + local_y);
             const uint32_t value_index = local_y * state.block_w + bx;
             for (uint32_t comp = 0; comp < components; ++comp)
             {
@@ -168,6 +249,16 @@ namespace tlg::v8
         }
       }
     }
+
+    for (std::size_t row = 0; row < enc::kGolombRowCount; ++row)
+    {
+      if (row_offsets[row] != row_value_counts[row])
+      {
+        err = "tlg8: エントロピー列の消費量が一致しません";
+        return false;
+      }
+    }
+
     return true;
   }
 }

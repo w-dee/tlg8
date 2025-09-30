@@ -70,7 +70,8 @@ namespace tlg::v8
 {
   namespace
   {
-    constexpr uint64_t TILE_SIZE = 8192; // virtually non tiling
+    constexpr uint64_t TILE_WIDTH = 8192;
+    constexpr uint64_t TILE_HEIGHT = 80;
 
     bool copy_pixels_to_buffer(const PixelBuffer &src,
                                int desired_colors,
@@ -381,13 +382,15 @@ namespace tlg::v8
         return false;
       }
 
-      const uint64_t tile_side = TILE_SIZE;
-      if (tile_side == 0 || tile_side > std::numeric_limits<uint32_t>::max())
+      const uint64_t tile_width_u64 = TILE_WIDTH;
+      const uint64_t tile_height_u64 = TILE_HEIGHT;
+      if (tile_width_u64 == 0 || tile_width_u64 > std::numeric_limits<uint32_t>::max() ||
+          tile_height_u64 == 0 || tile_height_u64 > std::numeric_limits<uint32_t>::max())
       {
         err = "tlg8: invalid tile size";
         return false;
       }
-      if (!write_u64le(fp, tile_side) || !write_u64le(fp, tile_side) ||
+      if (!write_u64le(fp, tile_width_u64) || !write_u64le(fp, tile_height_u64) ||
           !write_u64le(fp, src.width) || !write_u64le(fp, src.height))
       {
         err = "tlg8: failed to write dimensions";
@@ -396,8 +399,8 @@ namespace tlg::v8
 
       const uint32_t width = src.width;
       const uint32_t height = src.height;
-      const uint32_t tile_width = static_cast<uint32_t>(tile_side);
-      const uint32_t tile_height = static_cast<uint32_t>(tile_side);
+      const uint32_t tile_width = static_cast<uint32_t>(tile_width_u64);
+      const uint32_t tile_height = static_cast<uint32_t>(tile_height_u64);
       const uint32_t components = static_cast<uint32_t>(desired_colors);
       const uint64_t tile_capacity_u64 = static_cast<uint64_t>(tile_width) * tile_height * 4u * 2u;
       if (tile_capacity_u64 == 0 || tile_capacity_u64 > std::numeric_limits<size_t>::max())

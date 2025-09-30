@@ -15,8 +15,7 @@ namespace
   using namespace tlg::v8::enc;
   using BitWriter = tlg::v8::detail::bitio::BitWriter;
   using BitReader = tlg::v8::detail::bitio::BitReader;
-
-  constexpr uint32_t kGolombRowCount = 6;
+  using tlg::v8::enc::kGolombRowCount;
   constexpr uint32_t kGolombColumnCount = 9;
   constexpr uint32_t kGolombRowSum = 1024;
 
@@ -54,36 +53,6 @@ namespace
       }
     }
     g_table_ready = true;
-  }
-
-  inline int golomb_row_index(GolombCodingKind kind, uint32_t component)
-  {
-    const uint32_t c = (component < 4u) ? component : 3u;
-    if (kind == GolombCodingKind::Plain)
-    {
-      switch (c)
-      {
-      case 0:
-        return 0;
-      case 1:
-        return 1;
-      case 2:
-        return 2;
-      default:
-        return 0;
-      }
-    }
-    switch (c)
-    {
-    case 0:
-      return 3;
-    case 1:
-      return 4;
-    case 2:
-      return 5;
-    default:
-      return 3;
-    }
   }
 
   inline void write_zero_bits(BitWriter &writer, uint32_t count)
@@ -686,6 +655,97 @@ namespace tlg::v8
 
 namespace tlg::v8::enc
 {
+  int golomb_row_index(GolombCodingKind kind, uint32_t component)
+  {
+    const uint32_t c = (component < 4u) ? component : 3u;
+    if (kind == GolombCodingKind::Plain)
+    {
+      switch (c)
+      {
+      case 0:
+        return 0;
+      case 1:
+        return 1;
+      case 2:
+        return 2;
+      default:
+        return 0;
+      }
+    }
+    switch (c)
+    {
+    case 0:
+      return 3;
+    case 1:
+      return 4;
+    case 2:
+      return 5;
+    default:
+      return 3;
+    }
+  }
+
+  GolombCodingKind golomb_row_kind(uint32_t row)
+  {
+    switch (row)
+    {
+    case 0:
+    case 1:
+    case 2:
+      return GolombCodingKind::Plain;
+    case 3:
+    case 4:
+    case 5:
+      return GolombCodingKind::RunLength;
+    default:
+      return GolombCodingKind::Plain;
+    }
+  }
+
+  uint32_t golomb_row_component(uint32_t row)
+  {
+    switch (row)
+    {
+    case 0:
+    case 3:
+      return 0;
+    case 1:
+    case 4:
+      return 1;
+    case 2:
+    case 5:
+      return 2;
+    default:
+      return 0;
+    }
+  }
+
+  bool encode_values(detail::bitio::BitWriter &writer,
+                     GolombCodingKind kind,
+                     uint32_t component,
+                     const int16_t *values,
+                     uint32_t count,
+                     std::string &err)
+  {
+    (void)err;
+    if (kind == GolombCodingKind::Plain)
+      return encode_plain_component(writer, values, count, component);
+    return encode_run_length_component(writer, values, count, component);
+  }
+
+  bool decode_values(detail::bitio::BitReader &reader,
+                     GolombCodingKind kind,
+                     uint32_t component,
+                     uint32_t count,
+                     int16_t *dst,
+                     std::string &err)
+  {
+    (void)err;
+    if (kind == GolombCodingKind::Plain)
+      return decode_plain_component(reader, count, component, dst);
+    return decode_run_length_component(reader, count, component, dst);
+  }
+
   const std::array<entropy_encoder, kNumEntropyEncoders> &entropy_encoder_table()
   {
     static constexpr std::array<entropy_encoder, kNumEntropyEncoders> kEncoders = {
