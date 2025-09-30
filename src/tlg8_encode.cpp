@@ -4,6 +4,7 @@
 #include "tlg8_entropy.h"
 #include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
+#include "tlg_io_common.h"
 
 #include <algorithm>
 #include <array>
@@ -259,9 +260,9 @@ namespace tlg::v8::enc
         // reorder は固定だが、filter やエントロピー符号化方式と同じ基準で
         // 比較する設計とし、将来的に並び替え候補を増やしても流用できるよう
         // にしている。
-        writer.put_upto8(best_predictor, 3);
-        writer.put_upto8(best_filter, 3 + 2 + 2);
-        writer.put_upto8(best_entropy, 1);
+        writer.put_upto8(best_predictor, tlg::detail::bit_width(kNumPredictors));
+        writer.put_upto8(best_filter, tlg::detail::bit_width(filter_count));
+        writer.put_upto8(best_entropy, tlg::detail::bit_width(kNumEntropyEncoders));
 
         for (uint32_t by = 0; by < block_h; ++by)
         {

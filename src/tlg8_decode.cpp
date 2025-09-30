@@ -4,6 +4,7 @@
 #include "tlg8_entropy.h"
 #include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
+#include "tlg_io_common.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -58,6 +59,7 @@ namespace tlg::v8
 
     const auto &predictors = enc::predictor_table();
     const auto &entropy_encoders = enc::entropy_encoder_table();
+    const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(tlg::v8::enc::kColorFilterCodeCount) : 1u;
 
     enc::component_colors residuals{};
 
@@ -67,21 +69,21 @@ namespace tlg::v8
       for (uint32_t block_x = 0; block_x < tile_w; block_x += enc::kBlockSize)
       {
         const uint32_t block_w = std::min(enc::kBlockSize, tile_w - block_x);
-        const uint32_t predictor_index = reader.get_upto8(3);
+        const uint32_t predictor_index = reader.get_upto8(tlg::detail::bit_width(tlg::v8::enc::kNumPredictors));
         if (predictor_index >= enc::kNumPredictors)
         {
           err = "tlg8: 不正な予測器インデックスです";
           return false;
         }
 
-        const uint32_t filter_index = reader.get_upto8(3 + 2 + 2);
+        const uint32_t filter_index = reader.get_upto8(tlg::detail::bit_width(filter_count));
         if (filter_index >= enc::kColorFilterCodeCount)
         {
           err = "tlg8: 不正なカラーフィルターインデックスです";
           return false;
         }
 
-        const uint32_t entropy_index = reader.get_upto8(1);
+        const uint32_t entropy_index = reader.get_upto8(tlg::detail::bit_width(tlg::v8::enc::kNumEntropyEncoders));
         if (entropy_index >= enc::kNumEntropyEncoders)
         {
           err = "tlg8: 不正なエントロピーインデックスです";
