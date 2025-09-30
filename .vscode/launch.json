@@ -8,8 +8,8 @@
             "program": "${workspaceFolder}/build/tlgconv",
             "args": [
                 "test/images/dko_sss.bmp",
-                "/tmp/dko_sss.tlg7",
-                "--tlg-version=7"
+                "/tmp/dko_sss.tlg8",
+                "--tlg-version=8"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
