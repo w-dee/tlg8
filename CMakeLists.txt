@@ -50,6 +50,7 @@ add_executable(tlgconv
     src/tlg8_io.cpp
     src/tlg8_decode.cpp
     src/tlg8_color_filter.cpp
+    src/tlg8_interleave.cpp
     src/tlg8_predictors.cpp
     src/tlg8_entropy.cpp
     src/tlg8_reorder.cpp

@@ -2,6 +2,7 @@
 #include "tlg8_block.h"
 #include "tlg8_color_filter.h"
 #include "tlg8_entropy.h"
+#include "tlg8_interleave.h"
 #include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
 #include "tlg_io_common.h"
@@ -115,6 +116,7 @@ namespace
                            uint32_t predictor_index,
                            uint32_t filter_code,
                            uint32_t entropy_index,
+                           uint32_t interleave_index,
                            uint32_t encoded_size,
                            const tlg::v8::enc::component_colors &values,
                            const char *phase_label)
@@ -139,10 +141,11 @@ namespace
                  block_h,
                  phase_label);
     std::fprintf(fp,
-                 "# predictor=%u filter=%u entropy=%u encoded_bit_size=%u\n",
+                 "# predictor=%u filter=%u entropy=%u interleave=%u encoded_bit_size=%u\n",
                  predictor_index,
                  filter_code,
                  entropy_index,
+                 interleave_index,
                  encoded_size);
 
     for (uint32_t comp = 0; comp < used_components; ++comp)
@@ -223,6 +226,7 @@ namespace tlg::v8::enc
         uint32_t best_predictor = 0;
         uint32_t best_filter = 0;
         uint32_t best_entropy = 0;
+        uint32_t best_interleave = 0;
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
         component_colors candidate{};
@@ -268,18 +272,28 @@ namespace tlg::v8::enc
             component_colors reordered = filtered;
             reorder_to_hilbert(reordered, components, block_w, block_h);
 
-            for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
+            for (uint32_t interleave_index = 0; interleave_index < kNumInterleaveFilter; ++interleave_index)
             {
-              const uint64_t estimated_bits =
-                  entropy_encoders[entropy_index].estimate_bits(reordered, components, value_count);
-              if (estimated_bits < best_bits)
+              component_colors interleaved = reordered;
+              apply_interleave_filter(static_cast<InterleaveFilter>(interleave_index),
+                                      interleaved,
+                                      components,
+                                      value_count);
+
+              for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
               {
-                best_bits = estimated_bits;
-                best_predictor = predictor_index;
-                best_filter = filter_code;
-                best_entropy = entropy_index;
-                best_block = reordered;
-                best_filtered = filtered_before_hilbert;
+                const uint64_t estimated_bits =
+                    entropy_encoders[entropy_index].estimate_bits(interleaved, components, value_count);
+                if (estimated_bits < best_bits)
+                {
+                  best_bits = estimated_bits;
+                  best_predictor = predictor_index;
+                  best_filter = filter_code;
+                  best_entropy = entropy_index;
+                  best_interleave = interleave_index;
+                  best_block = interleaved;
+                  best_filtered = filtered_before_hilbert;
+                }
               }
             }
           }
@@ -292,6 +306,7 @@ namespace tlg::v8::enc
         writer.put_upto8(best_predictor, tlg::detail::bit_width(kNumPredictors));
         writer.put_upto8(best_filter, tlg::detail::bit_width(filter_count));
         writer.put_upto8(best_entropy, tlg::detail::bit_width(kNumEntropyEncoders));
+        writer.put_upto8(best_interleave, tlg::detail::bit_width(kNumInterleaveFilter));
 
         if (dump_fp)
         {
@@ -307,6 +322,7 @@ namespace tlg::v8::enc
                                 best_predictor,
                                 best_filter,
                                 best_entropy,
+                                best_interleave,
                                 best_bits,
                                 best_filtered,
                                 "before_hilbert");
@@ -322,6 +338,7 @@ namespace tlg::v8::enc
                                 best_predictor,
                                 best_filter,
                                 best_entropy,
+                                best_interleave,
                                 best_bits,
                                 best_block,
                                 "after_hilbert");

@@ -2,6 +2,7 @@
 #include "tlg8_block.h"
 #include "tlg8_color_filter.h"
 #include "tlg8_entropy.h"
+#include "tlg8_interleave.h"
 #include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
 #include "tlg_io_common.h"
@@ -76,6 +77,7 @@ namespace tlg::v8
       uint32_t predictor_index;
       uint32_t filter_index;
       uint32_t entropy_index;
+      uint32_t interleave_index;
       uint32_t value_count;
       enc::component_colors residuals;
     };
@@ -121,6 +123,13 @@ namespace tlg::v8
           return false;
         }
 
+        const uint32_t interleave_index = reader.get_upto8(tlg::detail::bit_width(tlg::v8::enc::kNumInterleaveFilter));
+        if (interleave_index >= enc::kNumInterleaveFilter)
+        {
+          err = "tlg8: 不正なインターリーブフィルターです";
+          return false;
+        }
+
         const uint32_t value_count = block_w * block_h;
         block_decode_state state{};
         state.block_x = block_x;
@@ -128,6 +137,7 @@ namespace tlg::v8
         state.predictor_index = predictor_index;
         state.filter_index = filter_index;
         state.entropy_index = entropy_index;
+        state.interleave_index = interleave_index;
         state.value_count = value_count;
         row_state.blocks.emplace_back(state);
 
@@ -199,6 +209,10 @@ namespace tlg::v8
           std::copy_n(values.data() + offset, state.value_count, state.residuals.values[comp].begin());
           offset += state.value_count;
         }
+        enc::undo_interleave_filter(static_cast<enc::InterleaveFilter>(state.interleave_index),
+                                    state.residuals,
+                                    components,
+                                    state.value_count);
         enc::reorder_from_hilbert(state.residuals, components, state.block_w, row_state.block_h);
         enc::undo_color_filter(state.filter_index, state.residuals, components, state.value_count);
       }
