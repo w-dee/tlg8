@@ -312,7 +312,7 @@ namespace
         {
           int64_t mapped = (values[j] >= 0) ? (static_cast<int64_t>(2) * values[j])
                                             : (static_cast<int64_t>(-2) * values[j] - 1);
-          mapped -= 1;
+          mapped -= 1; // 0 を符号化する必要はないので -1 する
           if (mapped < 0)
             mapped = 0;
           const uint32_t m = static_cast<uint32_t>(mapped);
@@ -439,7 +439,7 @@ namespace
         return false;
       const uint32_t m = (q << k) + remainder;
       const int residual = static_cast<int>((m >> 1) ^ -static_cast<int>(m & 1u));
-      dst[produced] = static_cast<int16_t>(residual);
+      dst[produced] = static_cast<int16_t>(residual) - 1; // 符号化時に +1 しているので、ここで戻す
       a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
     }
     return true;
@@ -499,7 +499,7 @@ namespace
         const uint32_t m = (q << k) + remainder;
         const int sign = static_cast<int>(m & 1u) - 1;
         const int vv = static_cast<int>(m >> 1);
-        const int residual = (vv ^ sign) + sign + 1;
+        const int residual = (vv ^ sign) + sign + 1; // 符号化時に -1 しているので、ここで戻す
         dst[produced++] = static_cast<int16_t>(residual);
         a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
       }
@@ -839,4 +839,3 @@ namespace tlg::v8::enc
     return true;
   }
 }
-
