@@ -147,6 +147,7 @@ namespace
                            uint32_t predictor_index,
                            uint32_t filter_code,
                            uint32_t entropy_index,
+                           uint32_t encoded_size,
                            const tlg::v8::enc::component_colors &values,
                            const char *phase_label)
   {
@@ -158,7 +159,7 @@ namespace
       return;
 
     const uint32_t used_components = std::min<uint32_t>(components,
-                                                         static_cast<uint32_t>(values.values.size()));
+                                                        static_cast<uint32_t>(values.values.size()));
 
     std::fprintf(fp,
                  "# tile_origin=(%u,%u) block_origin=(%u,%u) block_size=%ux%u phase=%s\n",
@@ -170,10 +171,11 @@ namespace
                  block_h,
                  phase_label);
     std::fprintf(fp,
-                 "# predictor=%u filter=%u entropy=%u\n",
+                 "# predictor=%u filter=%u entropy=%u encoded_bit_size=%u\n",
                  predictor_index,
                  filter_code,
-                 entropy_index);
+                 entropy_index,
+                 encoded_size);
 
     for (uint32_t comp = 0; comp < used_components; ++comp)
     {
@@ -357,6 +359,7 @@ namespace tlg::v8::enc
                                 best_predictor,
                                 best_filter,
                                 best_entropy,
+                                best_bits,
                                 best_filtered,
                                 "before_hilbert");
           if (dump_after_hilbert)
@@ -371,6 +374,7 @@ namespace tlg::v8::enc
                                 best_predictor,
                                 best_filter,
                                 best_entropy,
+                                best_bits,
                                 best_block,
                                 "after_hilbert");
         }
