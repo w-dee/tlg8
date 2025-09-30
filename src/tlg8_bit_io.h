@@ -225,7 +225,9 @@ namespace tlg::v8::detail::bitio
     {
     public:
         BitWriter(uint8_t *dst, size_t capacity)
-            : base_(dst), p_(dst), end_(dst + capacity), acc_(0), bits_(0) {}
+            : base_(dst), p_(dst), end_(dst + capacity), acc_(0), bits_(0), bit_counter_(nullptr) {}
+
+        inline void set_bit_counter(uint64_t *counter) { bit_counter_ = counter; }
 
         // Put n bits (lowest n bits of v), 1..32 typical
         inline void put(uint32_t v, unsigned n)
@@ -233,6 +235,7 @@ namespace tlg::v8::detail::bitio
             // Append into accumulator at current 'bits_'.
             acc_ |= (acc_t)(v & ((n == 32) ? 0xFFFFFFFFu : ((1u << n) - 1u))) << bits_;
             bits_ += n;
+            record_bits(n);
             flush_if_full();
         }
 
@@ -242,6 +245,7 @@ namespace tlg::v8::detail::bitio
             // precondition: 1 <= n <= 8
             acc_ |= (acc_t)(v & ((1u << n) - 1u)) << bits_;
             bits_ += n;
+            record_bits(n);
             flush_if_full();
         }
 
@@ -371,11 +375,18 @@ namespace tlg::v8::detail::bitio
         }
 
     private:
+        inline void record_bits(unsigned n)
+        {
+            if (bit_counter_)
+                *bit_counter_ += static_cast<uint64_t>(n);
+        }
+
         uint8_t *base_;
         uint8_t *p_;
         uint8_t *end_;
         acc_t acc_;
         unsigned bits_;
+        uint64_t *bit_counter_;
     };
 
 } // namespace bitio

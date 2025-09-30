@@ -79,9 +79,15 @@ bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err)
   return ok;
 }
 
-bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions &opt, std::string &err)
+bool save_tlg(const std::string &path,
+              const PixelBuffer &src,
+              const TlgOptions &opt,
+              std::string &err,
+              uint64_t *out_entropy_bits)
 {
   err.clear();
+  if (out_entropy_bits)
+    *out_entropy_bits = 0;
   if (!(src.channels == 3 || src.channels == 4))
   {
     err = "unsupported pixel channels";
@@ -135,7 +141,8 @@ bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions 
                                  desired_colors,
                                  opt.tlg8_dump_residuals_path,
                                  opt.tlg8_dump_residuals_order,
-                                 err);
+                                 err,
+                                 out_entropy_bits);
   }
   else if (opt.version == 6)
   {

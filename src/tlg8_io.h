@@ -17,7 +17,8 @@ namespace tlg::v8
                    int desired_colors,
                    const std::string &dump_residuals_path,
                    TlgOptions::DumpResidualsOrder dump_residuals_order,
-                   std::string &err);
+                   std::string &err,
+                   uint64_t *out_entropy_bits = nullptr);
   }
 } // namespace tlg::v8
 

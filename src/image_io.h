@@ -69,7 +69,12 @@ struct TlgOptions
   Tlg7PipelineOrder tlg7_pipeline_order = Tlg7PipelineOrder::PredictorThenFilter;
   std::string tlg8_dump_residuals_path; // TLG8 エンコーダで残差をダンプする場合の出力先
   DumpResidualsOrder tlg8_dump_residuals_order = DumpResidualsOrder::AfterHilbert;
+  bool print_entropy_bits = false;     // エントロピー符号化で使用した正味ビット数を表示するか
 };
 
 bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err);
-bool save_tlg(const std::string &path, const PixelBuffer &src, const TlgOptions &opt, std::string &err);
+bool save_tlg(const std::string &path,
+              const PixelBuffer &src,
+              const TlgOptions &opt,
+              std::string &err,
+              uint64_t *out_entropy_bits = nullptr);

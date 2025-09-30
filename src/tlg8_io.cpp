@@ -317,13 +317,17 @@ namespace tlg::v8
                    int desired_colors,
                    const std::string &dump_residuals_path,
                    TlgOptions::DumpResidualsOrder dump_residuals_order,
-                   std::string &err)
+                   std::string &err,
+                   uint64_t *out_entropy_bits)
     {
       static_assert(std::numeric_limits<int8_t>::min() == -128 &&
                         std::numeric_limits<int8_t>::max() == 127,
                     "int8_t is not two's complement");
 
       err.clear();
+
+      if (out_entropy_bits)
+        *out_entropy_bits = 0;
 
       struct FileCloser
       {
@@ -416,6 +420,8 @@ namespace tlg::v8
       const bool dump_after_hilbert = dump_file &&
                                       (dump_residuals_order == TlgOptions::DumpResidualsOrder::AfterHilbert);
 
+      uint64_t total_entropy_bits = 0;
+
       for (uint32_t origin_y = 0; origin_y < height; origin_y += tile_height)
       {
         const uint32_t tile_h = std::min<uint32_t>(tile_height, height - origin_y);
@@ -423,6 +429,8 @@ namespace tlg::v8
         {
           const uint32_t tile_w = std::min<uint32_t>(tile_width, width - origin_x);
           detail::bitio::BitWriter writer(tile_buffer.data(), tile_buffer.size());
+          uint64_t tile_entropy_bits = 0;
+          writer.set_bit_counter(&tile_entropy_bits);
           if (!encode_for_tile(writer,
                                packed_ptr,
                                width,
@@ -441,6 +449,7 @@ namespace tlg::v8
             err = "tlg8: failed to finalize tile payload";
             return false;
           }
+          total_entropy_bits += tile_entropy_bits;
           const size_t tile_bytes = writer.bytes_written();
           if (tile_bytes > std::numeric_limits<uint32_t>::max())
           {
@@ -464,6 +473,9 @@ namespace tlg::v8
           }
         }
       }
+
+      if (out_entropy_bits)
+        *out_entropy_bits = total_entropy_bits;
 
       return true;
     }

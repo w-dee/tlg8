@@ -32,6 +32,7 @@ static void print_usage()
             << " [--tlg7-golomb-table=<path>] [--tlg8-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
             << " [--tlg7-dump-residuals-order=before|after] [-tlg8-dump-residuals=<path>]"
             << " [--tlg8-dump-residuals-order=before|after]"
+            << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
 
@@ -173,11 +174,21 @@ int main(int argc, char **argv)
         return 2;
       }
     }
+    else if (arg == "--print-entropy-bits")
+    {
+      tlgopt.print_entropy_bits = true;
+    }
     else
     {
       std::cerr << "Unknown option: " << arg << "\n";
       return 2;
     }
+  }
+
+  if (tlgopt.print_entropy_bits && tlgopt.version != 8)
+  {
+    std::cerr << "--print-entropy-bits は TLG8 エンコード時のみ使用できます\n";
+    return 2;
   }
 
   std::string cfg_err;
@@ -230,15 +241,28 @@ int main(int argc, char **argv)
   err.clear();
   if (has_ext(out_path, "png"))
   {
+    if (tlgopt.print_entropy_bits)
+    {
+      std::cerr << "--print-entropy-bits は TLG 出力時のみ指定できます\n";
+      return 2;
+    }
     ok = save_png(out_path, img, err);
   }
   else if (has_ext(out_path, "bmp"))
   {
+    if (tlgopt.print_entropy_bits)
+    {
+      std::cerr << "--print-entropy-bits は TLG 出力時のみ指定できます\n";
+      return 2;
+    }
     ok = save_bmp(out_path, img, err);
   }
   else if (has_ext(out_path, "tlg") || has_ext(out_path, "tlg5") || has_ext(out_path, "tlg6") || has_ext(out_path, "tlg7") || has_ext(out_path, "tlg8"))
   {
-    ok = save_tlg(out_path, img, tlgopt, err);
+    uint64_t entropy_bits = 0;
+    ok = save_tlg(out_path, img, tlgopt, err, tlgopt.print_entropy_bits ? &entropy_bits : nullptr);
+    if (ok && tlgopt.print_entropy_bits)
+      std::cout << "entropy_bits=" << entropy_bits << "\n";
   }
   else
   {

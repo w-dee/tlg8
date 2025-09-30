@@ -169,7 +169,7 @@ def evaluate_table(
         tmp_path = Path(tmp_root)
         table_path = tmp_path / "golomb_table.txt"
         write_table(table_path, table)
-        total_size = 0
+        total_bits = 0
         for image in images:
             output_path = tmp_path / (image.stem + ".tlg8")
             cmd = [
@@ -178,6 +178,7 @@ def evaluate_table(
                 str(output_path),
                 "--tlg-version=8",
                 f"--tlg8-golomb-table={table_path}",
+                "--print-entropy-bits",
             ]
             if fast_mode:
                 cmd.append("--tlg8-fast")
@@ -189,8 +190,22 @@ def evaluate_table(
                     f"Encoding failed for {image.name} with return code {result.returncode}:\n"
                     f"STDOUT: {stdout}\nSTDERR: {stderr}"
                 )
-            total_size += output_path.stat().st_size
-        return total_size
+            stdout = result.stdout.decode(errors="ignore")
+            entropy_bits = None
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line.startswith("entropy_bits="):
+                    try:
+                        entropy_bits = int(line.split("=", 1)[1])
+                    except ValueError as exc:  # pragma: no cover - defensive
+                        raise RuntimeError(f"Failed to parse entropy bits for {image.name}: {line}") from exc
+                    break
+            if entropy_bits is None:
+                raise RuntimeError(
+                    f"Encoder output for {image.name} did not contain entropy_bits information:\n{stdout.strip()}"
+                )
+            total_bits += entropy_bits
+        return total_bits
 
 
 def ensure_images_exist(images: Iterable[Path]) -> List[Path]:
@@ -234,12 +249,12 @@ def main() -> None:
     images = ensure_images_exist(image_dir.glob("*.bmp"))
 
     best_table = [row[:] for row in seed_table]
-    best_size = evaluate_table(binary_path, images, best_table, work_dir, args.fast_mode)
+    best_bits = evaluate_table(binary_path, images, best_table, work_dir, args.fast_mode)
     search_table = [row[:] for row in best_table]
-    size_initial = best_size
+    bits_initial = best_bits
     write_table(best_table_path, best_table)
 
-    print(f"Initial total size: {size_initial}")
+    print(f"Initial total entropy bits: {bits_initial}")
     print(f"Best table saved to {best_table_path}")
 
     iteration = 0
@@ -262,48 +277,48 @@ def main() -> None:
                 evaluated = []
                 for future, candidate_table in futures:
                     try:
-                        candidate_size = future.result()
+                        candidate_bits = future.result()
                     except Exception as exc:
                         print(f"[iter {iteration}] candidate failed: {exc}")
                         continue
-                    evaluated.append((candidate_size, candidate_table))
+                    evaluated.append((candidate_bits, candidate_table))
 
                 if not evaluated:
                     raise RuntimeError("All candidate evaluations failed in this iteration")
 
                 evaluated.sort(key=lambda item: item[0])
-                best_attempt_size, best_attempt_table = evaluated[0]
+                best_attempt_bits, best_attempt_table = evaluated[0]
 
-                improvements = [entry for entry in evaluated if entry[0] < best_size]
-                non_worse = [entry for entry in evaluated if entry[0] <= best_size]
+                improvements = [entry for entry in evaluated if entry[0] < best_bits]
+                non_worse = [entry for entry in evaluated if entry[0] <= best_bits]
 
                 if improvements:
-                    candidate_size, candidate_table = min(improvements, key=lambda item: item[0])
-                    best_size = candidate_size
+                    candidate_bits, candidate_table = min(improvements, key=lambda item: item[0])
+                    best_bits = candidate_bits
                     best_table = [row[:] for row in candidate_table]
                     search_table = [row[:] for row in candidate_table]
                     write_table(best_table_path, best_table)
                     print(
-                        f"[iter {iteration}] improvement: best={best_size} "
-                        f"(delta={best_size - size_initial})"
+                        f"[iter {iteration}] improvement: best_bits={best_bits} "
+                        f"(delta={best_bits - bits_initial})"
                     )
                 else:
                     print(
-                        f"[iter {iteration}] no improvement (best_candidate={best_attempt_size}, best={best_size})"
+                        f"[iter {iteration}] no improvement (best_candidate_bits={best_attempt_bits}, best_bits={best_bits})"
                     )
                     if non_worse:
-                        candidate_size, candidate_table = rng.choice(non_worse)
+                        candidate_bits, candidate_table = rng.choice(non_worse)
                         best_table = [row[:] for row in candidate_table]
                         search_table = [row[:] for row in candidate_table]
                         write_table(best_table_path, best_table)
                         print(
-                            f"[iter {iteration}] adopting equal-size candidate as new seed (size={candidate_size})"
+                            f"[iter {iteration}] adopting equal-or-better candidate as new seed (bits={candidate_bits})"
                         )
                     else:
                         search_table = [row[:] for row in best_table]
 
                 print(
-                    f"[iter {iteration}] size_initial={size_initial}, current_best={best_size}"
+                    f"[iter {iteration}] bits_initial={bits_initial}, current_best_bits={best_bits}"
                 )
     except KeyboardInterrupt:
         print("Interrupted by user; exiting.")
