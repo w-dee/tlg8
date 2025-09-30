@@ -18,6 +18,7 @@ namespace tlg::v8
   namespace
   {
     uint8_t sample_pixel(const std::vector<uint8_t> &decoded,
+                         const std::vector<uint8_t> &decoded_mask,
                          uint32_t image_width,
                          uint32_t components,
                          uint32_t origin_x,
@@ -31,6 +32,11 @@ namespace tlg::v8
       if (tx < 0 || ty < 0)
         return 0;
       if (tx >= static_cast<int32_t>(tile_w) || ty >= static_cast<int32_t>(tile_h))
+        return 0;
+      const size_t tile_offset = (static_cast<size_t>(ty) * tile_w + static_cast<size_t>(tx)) * components + component;
+      if (tile_offset >= decoded_mask.size())
+        return 0;
+      if (!decoded_mask[tile_offset])
         return 0;
       const uint32_t gx = origin_x + static_cast<uint32_t>(tx);
       const uint32_t gy = origin_y + static_cast<uint32_t>(ty);
@@ -62,6 +68,8 @@ namespace tlg::v8
     const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(tlg::v8::enc::kColorFilterCodeCount) : 1u;
 
     enc::component_colors residuals{};
+
+    std::vector<uint8_t> decoded_mask(static_cast<size_t>(tile_w) * tile_h * components, 0);
 
     for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
     {
@@ -110,10 +118,10 @@ namespace tlg::v8
             const uint32_t value_index = by * block_w + bx;
             for (uint32_t comp = 0; comp < components; ++comp)
             {
-              const uint8_t a = sample_pixel(decoded, image_width, components, origin_x, origin_y, tile_w, tile_h, tx - 1, ty, comp);
-              const uint8_t b = sample_pixel(decoded, image_width, components, origin_x, origin_y, tile_w, tile_h, tx, ty - 1, comp);
-              const uint8_t c = sample_pixel(decoded, image_width, components, origin_x, origin_y, tile_w, tile_h, tx - 1, ty - 1, comp);
-              const uint8_t d = sample_pixel(decoded, image_width, components, origin_x, origin_y, tile_w, tile_h, tx + 1, ty - 1, comp);
+              const uint8_t a = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h, tx - 1, ty, comp);
+              const uint8_t b = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h, tx, ty - 1, comp);
+              const uint8_t c = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h, tx - 1, ty - 1, comp);
+              const uint8_t d = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h, tx + 1, ty - 1, comp);
               const uint8_t predicted = predictor(a, b, c, d);
               const int16_t residual = residuals.values[comp][value_index];
               int32_t value = static_cast<int32_t>(predicted) + static_cast<int32_t>(residual);
@@ -129,6 +137,9 @@ namespace tlg::v8
                 return false;
               }
               decoded[dst_index] = static_cast<uint8_t>(value);
+              const size_t tile_offset = (static_cast<size_t>(ty) * tile_w + static_cast<size_t>(tx)) * components + comp;
+              if (tile_offset < decoded_mask.size())
+                decoded_mask[tile_offset] = 1;
             }
           }
         }

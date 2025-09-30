@@ -66,6 +66,7 @@ namespace
   // component_colors へ格納する。
   void compute_residual_block(const tile_accessor &accessor,
                               const std::vector<uint8_t> &reconstructed_tile,
+                              const std::vector<uint8_t> &reconstructed_mask,
                               uint32_t tile_w,
                               uint32_t tile_h,
                               tlg::v8::enc::component_colors &out,
@@ -111,12 +112,16 @@ namespace
                 const size_t local_index = static_cast<size_t>(local_y) * block_w + static_cast<size_t>(local_x);
                 return reconstructed_block[sc][local_index];
               }
+              // 未再構成のブロック内ピクセルはタイル状態にも存在しないため 0 を返す。
               return 0;
             }
             const size_t offset = (static_cast<size_t>(sy) * tile_w + static_cast<size_t>(sx)) * components + sc;
             if (offset >= reconstructed_tile.size())
               return 0;
-            return reconstructed_tile[offset];
+            if (offset < reconstructed_mask.size() && reconstructed_mask[offset])
+              return reconstructed_tile[offset];
+            // タイル内だがまだ再構成されていない場合は 0。
+            return 0;
           };
 
           const uint8_t a = sample_from_state(tx - 1, ty, comp);
@@ -224,6 +229,7 @@ namespace tlg::v8::enc
     // 組み合わせを探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
     std::vector<uint8_t> reconstructed_tile(static_cast<size_t>(tile_w) * tile_h * components, 0);
+    std::vector<uint8_t> reconstructed_mask(reconstructed_tile.size(), 0);
 
     auto compute_energy = [](const component_colors &colors, uint32_t comp_count, uint32_t value_count)
     {
@@ -265,6 +271,7 @@ namespace tlg::v8::enc
         {
           compute_residual_block(accessor,
                                  reconstructed_tile,
+                                 reconstructed_mask,
                                  tile_w,
                                  tile_h,
                                  candidate,
@@ -340,7 +347,11 @@ namespace tlg::v8::enc
               const size_t offset =
                   (static_cast<size_t>(block_y + by) * tile_w + static_cast<size_t>(block_x + bx)) * components + comp;
               if (offset < reconstructed_tile.size())
+              {
                 reconstructed_tile[offset] = best_reconstructed[comp][value_index];
+                if (offset < reconstructed_mask.size())
+                  reconstructed_mask[offset] = 1;
+              }
             }
           }
         }
