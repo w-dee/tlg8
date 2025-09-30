@@ -22,12 +22,87 @@ namespace
   using GolombRow = std::array<uint16_t, kGolombColumnCount>;
   using GolombTable = std::array<GolombRow, kGolombRowCount>;
 
-  constexpr GolombTable DEFAULT_GOLOMB_TABLE = {GolombRow{0, 4, 4, 7, 24, 89, 270, 489, 137},
-                                                GolombRow{2, 2, 5, 13, 67, 98, 230, 476, 131},
-                                                GolombRow{3, 2, 5, 15, 77, 92, 238, 462, 130},
-                                                GolombRow{2, 2, 4, 10, 51, 108, 237, 482, 128},
-                                                GolombRow{2, 3, 7, 33, 74, 81, 237, 450, 137},
-                                                GolombRow{3, 1, 5, 28, 66, 92, 246, 452, 131}};
+  struct ParsedGolombTable
+  {
+    GolombTable table{};
+    bool filled = false;
+  };
+
+  constexpr bool is_whitespace(char c)
+  {
+    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+  }
+
+  constexpr bool is_digit(char c)
+  {
+    return c >= '0' && c <= '9';
+  }
+
+  constexpr ParsedGolombTable parse_default_golomb_table()
+  {
+    constexpr char data[] = R"(
+0 4 4 7 24 89 270 489 137
+2 2 5 13 67 98 230 476 131
+3 2 5 15 77 92 238 462 130
+2 2 4 10 51 108 237 482 128
+2 3 7 33 74 81 237 450 137
+3 1 5 28 66 92 246 452 131
+        )";
+
+    ParsedGolombTable result{};
+    std::size_t row = 0;
+    std::size_t col = 0;
+    std::size_t index = 0;
+    bool overflow = false;
+
+    while (index < sizeof(data) - 1)
+    {
+      while (index < sizeof(data) - 1 && is_whitespace(data[index]))
+        ++index;
+      if (index >= sizeof(data) - 1)
+        break;
+
+      uint16_t value = 0;
+      bool has_digit = false;
+      while (index < sizeof(data) - 1 && is_digit(data[index]))
+      {
+        has_digit = true;
+        value = static_cast<uint16_t>(value * 10 + static_cast<uint16_t>(data[index] - '0'));
+        ++index;
+      }
+
+      if (!has_digit)
+      {
+        overflow = true;
+        break;
+      }
+
+      if (row < result.table.size())
+      {
+        result.table[row][col] = value;
+        ++col;
+        if (col == result.table[row].size())
+        {
+          col = 0;
+          ++row;
+        }
+      }
+      else
+      {
+        overflow = true;
+      }
+    }
+
+    result.filled = (row == result.table.size() && col == 0 && !overflow);
+    return result;
+  }
+
+  inline constexpr GolombTable DEFAULT_GOLOMB_TABLE = []() constexpr
+  {
+    constexpr auto parsed = parse_default_golomb_table();
+    static_assert(parsed.filled, "DEFAULT_GOLOMB_TABLE のデータが不足しています");
+    return parsed.table;
+  }();
 
   GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
 
