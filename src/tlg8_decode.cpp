@@ -59,19 +59,7 @@ namespace tlg::v8
     const auto &predictors = enc::predictor_table();
     const auto &entropy_encoders = enc::entropy_encoder_table();
 
-    struct block_info
-    {
-      uint8_t predictor = 0;
-      uint8_t filter = 0;
-      uint8_t entropy = 0;
-      uint8_t block_w = 0;
-      uint8_t block_h = 0;
-    };
-
-    const uint32_t blocks_x = (tile_w + enc::kBlockSize - 1u) / enc::kBlockSize;
-    const uint32_t blocks_y = (tile_h + enc::kBlockSize - 1u) / enc::kBlockSize;
-    std::vector<block_info> blocks;
-    blocks.reserve(static_cast<size_t>(blocks_x) * static_cast<size_t>(blocks_y));
+    enc::component_colors residuals{};
 
     for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
     {
@@ -79,70 +67,37 @@ namespace tlg::v8
       for (uint32_t block_x = 0; block_x < tile_w; block_x += enc::kBlockSize)
       {
         const uint32_t block_w = std::min(enc::kBlockSize, tile_w - block_x);
-        block_info info{};
-
-        info.predictor = reader.get_upto8(3);
-        if (info.predictor >= enc::kNumPredictors)
+        const uint32_t predictor_index = reader.get_upto8(3);
+        if (predictor_index >= enc::kNumPredictors)
         {
           err = "tlg8: 不正な予測器インデックスです";
           return false;
         }
 
-        info.filter = reader.get_upto8(3 + 2 + 2);
-        if (info.filter >= enc::kColorFilterCodeCount)
+        const uint32_t filter_index = reader.get_upto8(3 + 2 + 2);
+        if (filter_index >= enc::kColorFilterCodeCount)
         {
           err = "tlg8: 不正なカラーフィルターインデックスです";
           return false;
         }
 
-        info.entropy = reader.get_upto8(1);
-        if (info.entropy >= enc::kNumEntropyEncoders)
+        const uint32_t entropy_index = reader.get_upto8(1);
+        if (entropy_index >= enc::kNumEntropyEncoders)
         {
           err = "tlg8: 不正なエントロピーインデックスです";
           return false;
         }
 
-        info.block_w = static_cast<uint8_t>(block_w);
-        info.block_h = static_cast<uint8_t>(block_h);
-        blocks.push_back(info);
-      }
-    }
+        const uint32_t value_count = block_w * block_h;
+        const auto predictor = predictors[predictor_index];
+        const auto kind = entropy_encoders[entropy_index].kind;
 
-    enc::entropy_decode_context entropy_ctx{};
-    if (!enc::load_entropy_contexts(reader, entropy_ctx, err))
-      return false;
-
-    enc::component_colors residuals{};
-    size_t block_index = 0;
-
-    for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
-    {
-      const uint32_t block_h = std::min(enc::kBlockSize, tile_h - block_y);
-      for (uint32_t block_x = 0; block_x < tile_w; block_x += enc::kBlockSize)
-      {
-        const uint32_t block_w = std::min(enc::kBlockSize, tile_w - block_x);
-        if (block_index >= blocks.size())
-        {
-          err = "tlg8: ブロック情報が不足しています";
-          return false;
-        }
-        const block_info info = blocks[block_index++];
-        if (info.block_w != block_w || info.block_h != block_h)
-        {
-          err = "tlg8: ブロック寸法が一致しません";
-          return false;
-        }
-
-        const uint32_t value_count = static_cast<uint32_t>(info.block_w) * info.block_h;
-        const auto predictor = predictors[info.predictor];
-        const auto kind = entropy_encoders[info.entropy].kind;
-
-        if (!enc::decode_block_from_context(entropy_ctx, kind, components, value_count, residuals, err))
+        if (!enc::decode_block(reader, kind, components, value_count, residuals, err))
           return false;
 
         enc::reorder_from_hilbert(residuals, components, block_w, block_h);
 
-        enc::undo_color_filter(info.filter, residuals, components, value_count);
+        enc::undo_color_filter(filter_index, residuals, components, value_count);
 
         for (uint32_t by = 0; by < block_h; ++by)
         {

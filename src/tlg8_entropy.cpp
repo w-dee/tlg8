@@ -13,6 +13,8 @@
 namespace
 {
   using namespace tlg::v8::enc;
+  using BitWriter = tlg::v8::detail::bitio::BitWriter;
+  using BitReader = tlg::v8::detail::bitio::BitReader;
 
   constexpr uint32_t kGolombRowCount = 6;
   constexpr uint32_t kGolombColumnCount = 9;
@@ -54,13 +56,6 @@ namespace
     g_table_ready = true;
   }
 
-  inline uint32_t context_slot(GolombCodingKind kind, uint32_t component)
-  {
-    const uint32_t clamped_component = (component < 4u) ? component : 3u;
-    const uint32_t kind_index = (kind == GolombCodingKind::Plain) ? 0u : 1u;
-    return kind_index * 4u + clamped_component;
-  }
-
   inline int golomb_row_index(GolombCodingKind kind, uint32_t component)
   {
     const uint32_t c = (component < 4u) ? component : 3u;
@@ -91,70 +86,77 @@ namespace
     }
   }
 
-  inline void append_bit(entropy_context_stream &stream, uint32_t bit)
+  inline void write_zero_bits(BitWriter &writer, uint32_t count)
   {
-    if (stream.bit_count == 0)
-      stream.current_byte = 0;
-    if (bit & 1u)
-      stream.current_byte |= static_cast<uint8_t>(1u << stream.bit_count);
-    ++stream.bit_count;
-    if (stream.bit_count == 8)
+    while (count >= 8)
     {
-      stream.data.push_back(stream.current_byte);
-      stream.current_byte = 0;
-      stream.bit_count = 0;
+      writer.put_upto8(0, 8);
+      count -= 8;
     }
+    if (count)
+      writer.put_upto8(0, static_cast<unsigned>(count));
   }
 
-  inline void append_bits(entropy_context_stream &stream, uint32_t value, int count)
+  inline void write_bits(BitWriter &writer, uint32_t value, unsigned count)
   {
-    for (int i = 0; i < count; ++i)
-      append_bit(stream, (value >> i) & 1u);
+    if (count == 0)
+      return;
+    if (count <= 8)
+    {
+      writer.put_upto8(value, count);
+      return;
+    }
+    writer.put(value, count);
   }
 
-  inline void put_gamma(entropy_context_stream &stream, uint32_t value)
+  inline void put_gamma(BitWriter &writer, uint32_t value)
   {
     if (value == 0)
       return;
     uint32_t t = value >> 1;
-    uint32_t zeros = 0;
     while (t)
     {
-      append_bit(stream, 0);
+      writer.put_upto8(0, 1);
       t >>= 1;
-      ++zeros;
     }
-    append_bit(stream, 1);
+    writer.put_upto8(1, 1);
+    uint32_t zeros = 0;
+    t = value >> 1;
+    while (t)
+    {
+      ++zeros;
+      t >>= 1;
+    }
     for (uint32_t i = 0; i < zeros; ++i)
-      append_bit(stream, (value >> i) & 1u);
+      writer.put_upto8((value >> i) & 1u, 1);
   }
 
-  inline void put_run_length(entropy_context_stream &stream, uint32_t count)
+  inline void put_run_length(BitWriter &writer, uint32_t count)
   {
     if (count == 0)
       return;
     if (count == 1)
     {
-      append_bit(stream, 0);
+      writer.put_upto8(0, 1);
       return;
     }
     if (count == 2)
     {
-      append_bit(stream, 1);
-      append_bit(stream, 0);
+      writer.put_upto8(1, 1);
+      writer.put_upto8(0, 1);
       return;
     }
     if (count == 3)
     {
-      append_bit(stream, 1);
-      append_bit(stream, 1);
-      append_bit(stream, 0);
+      writer.put_upto8(1, 1);
+      writer.put_upto8(1, 1);
+      writer.put_upto8(0, 1);
       return;
     }
-    append_bit(stream, 1);
-    append_bit(stream, 1);
-    append_bit(stream, 1);
-    put_gamma(stream, count - 3);
+    writer.put_upto8(1, 1);
+    writer.put_upto8(1, 1);
+    writer.put_upto8(1, 1);
+    put_gamma(writer, count - 3);
   }
 
   inline uint64_t gamma_bits(uint32_t value)
@@ -254,7 +256,10 @@ namespace
     return bits;
   }
 
-  bool encode_plain_component(entropy_context_stream &stream, const int16_t *values, uint32_t count, uint32_t component)
+  bool encode_plain_component(BitWriter &writer,
+                              const int16_t *values,
+                              uint32_t count,
+                              uint32_t component)
   {
     if (count == 0)
       return true;
@@ -267,20 +272,19 @@ namespace
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
       const int k = g_bit_length_table[static_cast<uint32_t>(a)][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
-      for (uint32_t j = 0; j < q; ++j)
-        append_bit(stream, 0);
-      append_bit(stream, 1);
+      write_zero_bits(writer, q);
+      writer.put_upto8(1, 1);
       if (k)
       {
         const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
-        append_bits(stream, m & mask, k);
+        write_bits(writer, m & mask, static_cast<unsigned>(k));
       }
       a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
     }
     return true;
   }
 
-  bool encode_run_length_component(entropy_context_stream &stream,
+  bool encode_run_length_component(BitWriter &writer,
                                    const int16_t *values,
                                    uint32_t count,
                                    uint32_t component)
@@ -288,7 +292,7 @@ namespace
     if (count == 0)
       return true;
     ensure_table_initialized();
-    append_bit(stream, values[0] ? 1u : 0u);
+    writer.put_upto8(values[0] ? 1u : 0u, 1);
     const int row = golomb_row_index(GolombCodingKind::RunLength, component);
     int a = 0;
     uint32_t index = 0;
@@ -300,14 +304,14 @@ namespace
       {
         if (zero_run)
         {
-          put_run_length(stream, static_cast<uint32_t>(zero_run));
+          put_run_length(writer, static_cast<uint32_t>(zero_run));
           zero_run = 0;
         }
         const uint32_t start = index;
         while (index < count && values[index] != 0)
           ++index;
         const uint32_t nonzero_count = index - start;
-        put_gamma(stream, nonzero_count);
+        put_gamma(writer, nonzero_count);
         for (uint32_t j = start; j < index; ++j)
         {
           int64_t mapped = (values[j] >= 0) ? (static_cast<int64_t>(2) * values[j])
@@ -318,13 +322,12 @@ namespace
           const uint32_t m = static_cast<uint32_t>(mapped);
           const int k = g_bit_length_table[static_cast<uint32_t>(a)][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
-          for (uint32_t qq = 0; qq < q; ++qq)
-            append_bit(stream, 0);
-          append_bit(stream, 1);
+          write_zero_bits(writer, q);
+          writer.put_upto8(1, 1);
           if (k)
           {
             const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
-            append_bits(stream, m & mask, k);
+            write_bits(writer, m & mask, static_cast<unsigned>(k));
           }
           a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
         }
@@ -337,45 +340,38 @@ namespace
       }
     }
     if (zero_run)
-      put_run_length(stream, static_cast<uint32_t>(zero_run));
+      put_run_length(writer, static_cast<uint32_t>(zero_run));
     return true;
   }
 
-  inline bool read_bit(entropy_decode_stream &stream, uint32_t &bit)
+  inline bool read_bit(BitReader &reader, uint32_t &bit)
   {
-    if (stream.bits_available == 0)
-    {
-      if (stream.byte_pos >= stream.data.size())
-        return false;
-      stream.bit_buffer = stream.data[stream.byte_pos++];
-      stream.bits_available = 8;
-    }
-    bit = stream.bit_buffer & 1u;
-    stream.bit_buffer >>= 1;
-    --stream.bits_available;
+    if (reader.eof())
+      return false;
+    bit = reader.get_upto8(1);
     return true;
   }
 
-  bool read_bits(entropy_decode_stream &stream, unsigned count, uint32_t &value)
+  bool read_bits(BitReader &reader, unsigned count, uint32_t &value)
   {
     value = 0;
     for (unsigned i = 0; i < count; ++i)
     {
       uint32_t bit = 0;
-      if (!read_bit(stream, bit))
+      if (!read_bit(reader, bit))
         return false;
       value |= (bit & 1u) << i;
     }
     return true;
   }
 
-  bool read_gamma(entropy_decode_stream &stream, uint32_t &value)
+  bool read_gamma(BitReader &reader, uint32_t &value)
   {
     uint32_t zeros = 0;
     while (true)
     {
       uint32_t bit = 0;
-      if (!read_bit(stream, bit))
+      if (!read_bit(reader, bit))
         return false;
       if (bit)
         break;
@@ -384,34 +380,34 @@ namespace
         return false;
     }
     uint32_t suffix = 0;
-    if (zeros && !read_bits(stream, zeros, suffix))
+    if (zeros && !read_bits(reader, zeros, suffix))
       return false;
     value = (static_cast<uint32_t>(1u) << zeros) + suffix;
     return true;
   }
 
-  int read_run_length(entropy_decode_stream &stream)
+  int read_run_length(BitReader &reader)
   {
     uint32_t bit = 0;
-    if (!read_bit(stream, bit))
+    if (!read_bit(reader, bit))
       return 0;
     if (bit == 0)
       return 1;
-    if (!read_bit(stream, bit))
+    if (!read_bit(reader, bit))
       return 0;
     if (bit == 0)
       return 2;
-    if (!read_bit(stream, bit))
+    if (!read_bit(reader, bit))
       return 0;
     if (bit == 0)
       return 3;
     uint32_t gamma = 0;
-    if (!read_gamma(stream, gamma))
+    if (!read_gamma(reader, gamma))
       return 0;
     return static_cast<int>(gamma + 3);
   }
 
-  bool decode_plain_component(entropy_decode_stream &stream,
+  bool decode_plain_component(BitReader &reader,
                               uint32_t expected_count,
                               uint32_t component,
                               int16_t *dst)
@@ -428,24 +424,24 @@ namespace
       while (true)
       {
         uint32_t bit = 0;
-        if (!read_bit(stream, bit))
+        if (!read_bit(reader, bit))
           return false;
         if (bit)
           break;
         ++q;
       }
       uint32_t remainder = 0;
-      if (k > 0 && !read_bits(stream, static_cast<unsigned>(k), remainder))
+      if (k > 0 && !read_bits(reader, static_cast<unsigned>(k), remainder))
         return false;
       const uint32_t m = (q << k) + remainder;
       const int residual = static_cast<int>((m >> 1) ^ -static_cast<int>(m & 1u));
-      dst[produced] = static_cast<int16_t>(residual) - 1; // 符号化時に +1 しているので、ここで戻す
+      dst[produced] = static_cast<int16_t>(residual);
       a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
     }
     return true;
   }
 
-  bool decode_run_length_component(entropy_decode_stream &stream,
+  bool decode_run_length_component(BitReader &reader,
                                    uint32_t expected_count,
                                    uint32_t component,
                                    int16_t *dst)
@@ -454,7 +450,7 @@ namespace
       return true;
     ensure_table_initialized();
     uint32_t first_bit = 0;
-    if (!read_bit(stream, first_bit))
+    if (!read_bit(reader, first_bit))
       return false;
     bool expect_nonzero = (first_bit != 0);
     const int row = golomb_row_index(GolombCodingKind::RunLength, component);
@@ -464,7 +460,7 @@ namespace
     {
       if (!expect_nonzero)
       {
-        const int run = read_run_length(stream);
+        const int run = read_run_length(reader);
         if (run <= 0)
           return false;
         if (produced + static_cast<uint32_t>(run) > expected_count)
@@ -476,7 +472,7 @@ namespace
       }
 
       uint32_t run = 0;
-      if (!read_gamma(stream, run) || run == 0)
+      if (!read_gamma(reader, run) || run == 0)
         return false;
       if (produced + run > expected_count)
         return false;
@@ -487,14 +483,14 @@ namespace
         while (true)
         {
           uint32_t bit = 0;
-          if (!read_bit(stream, bit))
+          if (!read_bit(reader, bit))
             return false;
           if (bit)
             break;
           ++q;
         }
         uint32_t remainder = 0;
-        if (k > 0 && !read_bits(stream, static_cast<unsigned>(k), remainder))
+        if (k > 0 && !read_bits(reader, static_cast<unsigned>(k), remainder))
           return false;
         const uint32_t m = (q << k) + remainder;
         const int sign = static_cast<int>(m & 1u) - 1;
@@ -505,49 +501,6 @@ namespace
       }
       expect_nonzero = false;
     }
-    return true;
-  }
-
-  bool write_gamma(tlg::v8::detail::bitio::BitWriter &writer, uint32_t value)
-  {
-    if (value == 0)
-      return false;
-    uint32_t t = value >> 1;
-    while (t)
-    {
-      writer.put_upto8(0, 1);
-      t >>= 1;
-    }
-    writer.put_upto8(1, 1);
-    uint32_t zeros = 0;
-    t = value >> 1;
-    while (t)
-    {
-      ++zeros;
-      t >>= 1;
-    }
-    for (uint32_t i = 0; i < zeros; ++i)
-      writer.put_upto8((value >> i) & 1u, 1);
-    return true;
-  }
-
-  bool read_gamma_stream(tlg::v8::detail::bitio::BitReader &reader, uint32_t &value)
-  {
-    uint32_t zeros = 0;
-    while (true)
-    {
-      const uint32_t bit = reader.get(1);
-      if (bit == 0)
-      {
-        ++zeros;
-        if (zeros > 31)
-          return false;
-        continue;
-      }
-      break;
-    }
-    const uint32_t suffix = zeros ? reader.get(zeros) : 0u;
-    value = (static_cast<uint32_t>(1u) << zeros) + suffix;
     return true;
   }
 
@@ -567,7 +520,7 @@ namespace
     return total;
   }
 
-  bool encode_plain(entropy_encode_context &ctx,
+  bool encode_plain(BitWriter &writer,
                     const component_colors &colors,
                     uint32_t components,
                     uint32_t value_count,
@@ -576,14 +529,13 @@ namespace
     (void)err;
     for (uint32_t c = 0; c < components; ++c)
     {
-      auto &stream = ctx.streams[context_slot(GolombCodingKind::Plain, c)];
-      if (!encode_plain_component(stream, colors.values[c].data(), value_count, c))
+      if (!encode_plain_component(writer, colors.values[c].data(), value_count, c))
         return false;
     }
     return true;
   }
 
-  bool encode_run_length(entropy_encode_context &ctx,
+  bool encode_run_length(BitWriter &writer,
                          const component_colors &colors,
                          uint32_t components,
                          uint32_t value_count,
@@ -592,8 +544,7 @@ namespace
     (void)err;
     for (uint32_t c = 0; c < components; ++c)
     {
-      auto &stream = ctx.streams[context_slot(GolombCodingKind::RunLength, c)];
-      if (!encode_run_length_component(stream, colors.values[c].data(), value_count, c))
+      if (!encode_run_length_component(writer, colors.values[c].data(), value_count, c))
         return false;
     }
     return true;
@@ -743,93 +694,23 @@ namespace tlg::v8::enc
     return kEncoders;
   }
 
-  bool flush_entropy_contexts(entropy_encode_context &ctx, detail::bitio::BitWriter &writer, std::string &err)
-  {
-    for (auto &stream : ctx.streams)
-    {
-      if (stream.bit_count)
-      {
-        stream.data.push_back(stream.current_byte);
-        stream.current_byte = 0;
-        stream.bit_count = 0;
-      }
-    }
-
-    // ブロック情報をビット単位で詰めて書き込んだ後でも、ガンマ符号が確実に
-    // バイト境界から始まるようにするために、ここでゼロ詰めでアラインする。
-    writer.align_to_byte_zero();
-
-    for (const auto &stream : ctx.streams)
-    {
-      if (stream.data.size() > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()))
-      {
-        err = "tlg8: エントロピーコンテキストが大きすぎます";
-        return false;
-      }
-      const uint32_t length = static_cast<uint32_t>(stream.data.size());
-      if (!write_gamma(writer, length + 1u))
-      {
-        err = "tlg8: ガンマ符号の書き込みに失敗しました";
-        return false;
-      }
-      writer.align_to_byte_zero();
-      for (uint8_t byte : stream.data)
-      {
-        if (!writer.write_u8(byte))
-        {
-          err = "tlg8: エントロピーコンテキストの書き込みに失敗しました";
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  bool load_entropy_contexts(detail::bitio::BitReader &reader, entropy_decode_context &ctx, std::string &err)
-  {
-    reader.align_to_byte();
-    for (size_t index = 0; index < ctx.streams.size(); ++index)
-    {
-      auto &stream = ctx.streams[index];
-      uint32_t gamma_value = 0;
-      if (!read_gamma_stream(reader, gamma_value) || gamma_value == 0)
-      {
-        err = "tlg8: エントロピーコンテキスト長の取得に失敗しました";
-        return false;
-      }
-      const uint32_t length = gamma_value - 1u;
-      reader.align_to_byte();
-      stream.data.resize(length);
-      for (uint32_t i = 0; i < length; ++i)
-      {
-        const uint32_t byte = reader.get(8);
-        stream.data[i] = static_cast<uint8_t>(byte);
-      }
-      stream.byte_pos = 0;
-      stream.bit_buffer = 0;
-      stream.bits_available = 0;
-    }
-    return true;
-  }
-
-  bool decode_block_from_context(entropy_decode_context &ctx,
-                                 GolombCodingKind kind,
-                                 uint32_t components,
-                                 uint32_t value_count,
-                                 component_colors &out,
-                                 std::string &err)
+  bool decode_block(detail::bitio::BitReader &reader,
+                    GolombCodingKind kind,
+                    uint32_t components,
+                    uint32_t value_count,
+                    component_colors &out,
+                    std::string &err)
   {
     for (auto &component : out.values)
       component.fill(0);
 
     for (uint32_t c = 0; c < components; ++c)
     {
-      auto &stream = ctx.streams[context_slot(kind, c)];
       bool ok = false;
       if (kind == GolombCodingKind::Plain)
-        ok = decode_plain_component(stream, value_count, c, out.values[c].data());
+        ok = decode_plain_component(reader, value_count, c, out.values[c].data());
       else
-        ok = decode_run_length_component(stream, value_count, c, out.values[c].data());
+        ok = decode_run_length_component(reader, value_count, c, out.values[c].data());
       if (!ok)
       {
         err = "tlg8: エントロピー復号に失敗しました";

@@ -159,7 +159,6 @@ namespace tlg::v8::enc
     // 現状は reorder をヒルベルト固定とし、predictor × filter × entropy の
     // 組み合わせを探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
-    entropy_encode_context entropy_ctx{};
     std::vector<uint8_t> reconstructed_tile(static_cast<size_t>(tile_w) * tile_h * components, 0);
 
     auto compute_energy = [](const component_colors &colors, uint32_t comp_count, uint32_t value_count)
@@ -279,17 +278,13 @@ namespace tlg::v8::enc
           }
         }
 
-        if (!entropy_encoders[best_entropy].encode_block(entropy_ctx, best_block, components, value_count, err))
+        if (!entropy_encoders[best_entropy].encode_block(writer, best_block, components, value_count, err))
         {
           err = "tlg8: エントロピー書き込みに失敗しました";
           return false;
         }
       }
     }
-
-    if (!flush_entropy_contexts(entropy_ctx, writer, err))
-      return false;
-
     return true;
   }
 }
