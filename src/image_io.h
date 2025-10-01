@@ -52,6 +52,8 @@ struct TlgOptions
   {
     AfterHilbert,
     BeforeHilbert,
+    AfterPredictor,
+    AfterColorFilter,
   };
 
   enum class Tlg7PipelineOrder

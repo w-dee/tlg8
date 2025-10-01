@@ -31,7 +31,7 @@ static void print_usage()
             << " [--tlg-version=5|6|7|8] [--pixel-format=auto|R8G8B8|A8R8G8B8]"
             << " [--tlg7-golomb-table=<path>] [--tlg8-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
             << " [--tlg7-dump-residuals-order=before|after] [-tlg8-dump-residuals=<path>]"
-            << " [--tlg8-dump-residuals-order=before|after]"
+            << " [--tlg8-dump-residuals-order=predictor|color|hilbert]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
@@ -164,9 +164,11 @@ int main(int argc, char **argv)
       }
       std::string order = arg.substr(eq + 1);
       to_lower_inplace(order);
-      if (order == "before")
-        tlgopt.tlg8_dump_residuals_order = TlgOptions::DumpResidualsOrder::BeforeHilbert;
-      else if (order == "after")
+      if (order == "predictor")
+        tlgopt.tlg8_dump_residuals_order = TlgOptions::DumpResidualsOrder::AfterPredictor;
+      else if (order == "color")
+        tlgopt.tlg8_dump_residuals_order = TlgOptions::DumpResidualsOrder::AfterColorFilter;
+      else if (order == "hilbert")
         tlgopt.tlg8_dump_residuals_order = TlgOptions::DumpResidualsOrder::AfterHilbert;
       else
       {

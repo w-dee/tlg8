@@ -308,8 +308,7 @@ namespace tlg::v8
                        uint32_t tile_w,
                        uint32_t tile_h,
                        FILE *dump_fp,
-                       bool dump_before_hilbert,
-                       bool dump_after_hilbert,
+                       TlgOptions::DumpResidualsOrder dump_order,
                        std::string &err);
 
     bool write_raw(FILE *fp,
@@ -415,10 +414,12 @@ namespace tlg::v8
       std::vector<uint8_t> tile_buffer(static_cast<size_t>(tile_capacity_u64));
       const uint8_t *packed_ptr = packed.data();
 
-      const bool dump_before_hilbert = dump_file &&
-                                       (dump_residuals_order == TlgOptions::DumpResidualsOrder::BeforeHilbert);
-      const bool dump_after_hilbert = dump_file &&
-                                      (dump_residuals_order == TlgOptions::DumpResidualsOrder::AfterHilbert);
+      TlgOptions::DumpResidualsOrder effective_dump_order = dump_residuals_order;
+      if (dump_file)
+      {
+        if (effective_dump_order == TlgOptions::DumpResidualsOrder::BeforeHilbert)
+          effective_dump_order = TlgOptions::DumpResidualsOrder::AfterColorFilter;
+      }
 
       uint64_t total_entropy_bits = 0;
 
@@ -440,8 +441,7 @@ namespace tlg::v8
                                tile_w,
                                tile_h,
                                dump_file.get(),
-                               dump_before_hilbert,
-                               dump_after_hilbert,
+                               effective_dump_order,
                                err))
             return false;
           if (!writer.align_to_u32_zero() || !writer.finish())

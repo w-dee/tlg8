@@ -6,6 +6,7 @@
 #include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
 #include "tlg_io_common.h"
+#include "image_io.h"
 
 #include <algorithm>
 #include <array>
@@ -177,8 +178,7 @@ namespace tlg::v8::enc
                        uint32_t tile_w,
                        uint32_t tile_h,
                        FILE *dump_fp,
-                       bool dump_before_hilbert,
-                       bool dump_after_hilbert,
+                       TlgOptions::DumpResidualsOrder dump_order,
                        std::string &err)
   {
     if (components == 0 || components > 4)
@@ -186,6 +186,14 @@ namespace tlg::v8::enc
       err = "tlg8: コンポーネント数が不正です";
       return false;
     }
+
+    const bool dump_after_predictor = dump_fp &&
+                                      (dump_order == TlgOptions::DumpResidualsOrder::AfterPredictor);
+    const bool dump_after_color = dump_fp &&
+                                  (dump_order == TlgOptions::DumpResidualsOrder::AfterColorFilter ||
+                                   dump_order == TlgOptions::DumpResidualsOrder::BeforeHilbert);
+    const bool dump_after_hilbert = dump_fp &&
+                                    (dump_order == TlgOptions::DumpResidualsOrder::AfterHilbert);
 
     const auto &predictors = predictor_table();
     const auto &entropy_encoders = entropy_encoder_table();
@@ -221,8 +229,10 @@ namespace tlg::v8::enc
         const uint32_t block_w = std::min(kBlockSize, tile_w - block_x);
         const uint32_t value_count = block_w * block_h;
 
-        component_colors best_block{};
-        component_colors best_filtered{};
+        component_colors best_after_interleave{};
+        component_colors best_after_hilbert{};
+        component_colors best_after_color{};
+        component_colors best_after_predictor{};
         uint32_t best_predictor = 0;
         uint32_t best_filter = 0;
         uint32_t best_entropy = 0;
@@ -295,8 +305,10 @@ namespace tlg::v8::enc
                   best_filter = filter_code;
                   best_entropy = entropy_index;
                   best_interleave = interleave_index;
-                  best_block = interleaved;
-                  best_filtered = filtered_before_hilbert;
+                  best_after_interleave = interleaved;
+                  best_after_hilbert = reordered;
+                  best_after_color = filtered_before_hilbert;
+                  best_after_predictor = candidate;
                 }
               }
             }
@@ -314,7 +326,7 @@ namespace tlg::v8::enc
 
         if (dump_fp)
         {
-          if (dump_before_hilbert)
+          if (dump_after_predictor)
             dump_residual_block(dump_fp,
                                 origin_x,
                                 origin_y,
@@ -328,8 +340,24 @@ namespace tlg::v8::enc
                                 best_entropy,
                                 best_interleave,
                                 best_bits,
-                                best_filtered,
-                                "before_hilbert");
+                                best_after_predictor,
+                                "after_predictor");
+          if (dump_after_color)
+            dump_residual_block(dump_fp,
+                                origin_x,
+                                origin_y,
+                                block_x,
+                                block_y,
+                                block_w,
+                                block_h,
+                                components,
+                                best_predictor,
+                                best_filter,
+                                best_entropy,
+                                best_interleave,
+                                best_bits,
+                                best_after_color,
+                                "after_color");
           if (dump_after_hilbert)
             dump_residual_block(dump_fp,
                                 origin_x,
@@ -344,7 +372,7 @@ namespace tlg::v8::enc
                                 best_entropy,
                                 best_interleave,
                                 best_bits,
-                                best_block,
+                                best_after_hilbert,
                                 "after_hilbert");
         }
 
@@ -367,8 +395,8 @@ namespace tlg::v8::enc
           {
             // インターリーブ時は全コンポーネント分の値をまとめて同一行へ投入する。
             row_values.insert(row_values.end(),
-                              best_block.values[comp].begin(),
-                              best_block.values[comp].begin() + value_count);
+                              best_after_interleave.values[comp].begin(),
+                              best_after_interleave.values[comp].begin() + value_count);
           }
         }
         else
@@ -383,8 +411,8 @@ namespace tlg::v8::enc
             }
             auto &row_values = entropy_values[static_cast<std::size_t>(row)];
             row_values.insert(row_values.end(),
-                              best_block.values[comp].begin(),
-                              best_block.values[comp].begin() + value_count);
+                              best_after_interleave.values[comp].begin(),
+                              best_after_interleave.values[comp].begin() + value_count);
           }
         }
       }
