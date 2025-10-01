@@ -230,12 +230,11 @@ namespace
     return 3u + gamma_bits(count - 3);
   }
 
-  uint64_t estimate_plain_component(const int16_t *values, uint32_t count, uint32_t component)
+  uint64_t estimate_plain_with_row(const int16_t *values, uint32_t count, int row)
   {
     if (count == 0)
       return 0;
     ensure_table_initialized();
-    const int row = golomb_row_index(GolombCodingKind::Plain, component);
     uint64_t bits = 0;
     int a = 0;
     for (uint32_t i = 0; i < count; ++i)
@@ -250,12 +249,17 @@ namespace
     return bits;
   }
 
-  uint64_t estimate_run_length_component(const int16_t *values, uint32_t count, uint32_t component)
+  uint64_t estimate_plain_component(const int16_t *values, uint32_t count, uint32_t component)
+  {
+    const int row = golomb_row_index(GolombCodingKind::Plain, component);
+    return estimate_plain_with_row(values, count, row);
+  }
+
+  uint64_t estimate_run_length_with_row(const int16_t *values, uint32_t count, int row)
   {
     if (count == 0)
       return 0;
     ensure_table_initialized();
-    const int row = golomb_row_index(GolombCodingKind::RunLength, component);
     uint64_t bits = 1; // 先頭要素が 0 か否かのビット
     int a = 0;
     uint32_t index = 0;
@@ -298,6 +302,12 @@ namespace
     if (zero_run)
       bits += run_length_bits(static_cast<uint32_t>(zero_run));
     return bits;
+  }
+
+  uint64_t estimate_run_length_component(const int16_t *values, uint32_t count, uint32_t component)
+  {
+    const int row = golomb_row_index(GolombCodingKind::RunLength, component);
+    return estimate_run_length_with_row(values, count, row);
   }
 
   bool encode_plain_component(BitWriter &writer,
@@ -548,20 +558,64 @@ namespace
     return true;
   }
 
-  uint64_t estimate_plain(const component_colors &colors, uint32_t components, uint32_t value_count)
+  uint64_t estimate_plain(const component_colors &colors,
+                          uint32_t components,
+                          uint32_t value_count,
+                          bool uses_interleave)
   {
-    uint64_t total = 0;
-    for (uint32_t c = 0; c < components; ++c)
-      total += estimate_plain_component(colors.values[c].data(), value_count, c);
-    return total;
+    if (!uses_interleave)
+    {
+      uint64_t total = 0;
+      for (uint32_t c = 0; c < components; ++c)
+        total += estimate_plain_component(colors.values[c].data(), value_count, c);
+      return total;
+    }
+
+    if (components == 0 || value_count == 0)
+      return 0;
+
+    constexpr std::size_t kMaxCombined = kMaxBlockPixels * 4u;
+    std::array<int16_t, kMaxCombined> combined{};
+    std::size_t offset = 0;
+    const uint32_t available = std::min<uint32_t>(components, static_cast<uint32_t>(colors.values.size()));
+    // インターリーブ時は 0 番行へ集約して符号化するため、推定でも一括して評価する。
+    for (uint32_t c = 0; c < available; ++c)
+    {
+      const std::size_t required = static_cast<std::size_t>(value_count);
+      std::copy_n(colors.values[c].begin(), value_count, combined.begin() + offset);
+      offset += required;
+    }
+    return estimate_plain_with_row(combined.data(), static_cast<uint32_t>(offset), 0);
   }
 
-  uint64_t estimate_run_length(const component_colors &colors, uint32_t components, uint32_t value_count)
+  uint64_t estimate_run_length(const component_colors &colors,
+                               uint32_t components,
+                               uint32_t value_count,
+                               bool uses_interleave)
   {
-    uint64_t total = 0;
-    for (uint32_t c = 0; c < components; ++c)
-      total += estimate_run_length_component(colors.values[c].data(), value_count, c);
-    return total;
+    if (!uses_interleave)
+    {
+      uint64_t total = 0;
+      for (uint32_t c = 0; c < components; ++c)
+        total += estimate_run_length_component(colors.values[c].data(), value_count, c);
+      return total;
+    }
+
+    if (components == 0 || value_count == 0)
+      return 0;
+
+    constexpr std::size_t kMaxCombined = kMaxBlockPixels * 4u;
+    std::array<int16_t, kMaxCombined> combined{};
+    std::size_t offset = 0;
+    const uint32_t available = std::min<uint32_t>(components, static_cast<uint32_t>(colors.values.size()));
+    // ランレングスでもインターリーブ時は 3 番行へまとめるので、推定も同じ行を用いる。
+    for (uint32_t c = 0; c < available; ++c)
+    {
+      const std::size_t required = static_cast<std::size_t>(value_count);
+      std::copy_n(colors.values[c].begin(), value_count, combined.begin() + offset);
+      offset += required;
+    }
+    return estimate_run_length_with_row(combined.data(), static_cast<uint32_t>(offset), 3);
   }
 
   bool encode_plain(BitWriter &writer,

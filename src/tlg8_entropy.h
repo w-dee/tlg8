@@ -21,7 +21,10 @@ namespace tlg::v8::enc
 
   struct entropy_encoder
   {
-    using estimate_fn = uint64_t (*)(const component_colors &, uint32_t components, uint32_t value_count);
+    using estimate_fn = uint64_t (*)(const component_colors &,
+                                     uint32_t components,
+                                     uint32_t value_count,
+                                     bool uses_interleave);
     using encode_fn = bool (*)(detail::bitio::BitWriter &,
                                const component_colors &,
                                uint32_t components,

@@ -282,8 +282,12 @@ namespace tlg::v8::enc
 
               for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
               {
-                const uint64_t estimated_bits =
-                    entropy_encoders[entropy_index].estimate_bits(interleaved, components, value_count);
+                const bool uses_interleave_candidate =
+                    (interleave_index == static_cast<uint32_t>(InterleaveFilter::Interleave));
+                const uint64_t estimated_bits = entropy_encoders[entropy_index].estimate_bits(interleaved,
+                                                                                              components,
+                                                                                              value_count,
+                                                                                              uses_interleave_candidate);
                 if (estimated_bits < best_bits)
                 {
                   best_bits = estimated_bits;
@@ -345,18 +349,43 @@ namespace tlg::v8::enc
         }
 
         const auto kind = entropy_encoders[best_entropy].kind;
-        for (uint32_t comp = 0; comp < components; ++comp)
+        const bool uses_interleave =
+            (best_interleave == static_cast<uint32_t>(InterleaveFilter::Interleave));
+        if (uses_interleave)
         {
-          const int row = golomb_row_index(kind, comp);
-          if (row < 0 || row >= static_cast<int>(kGolombRowCount))
+          // インターリーブ後の値は振幅が大きくなることが多く、
+          // 絶対値が大きな値を扱う 0 番/3 番行へ集約することで
+          // 適切なパラメーターで Golomb-Rice 符号化できる。
+          const uint32_t target_row = (kind == GolombCodingKind::Plain) ? 0u : 3u;
+          if (target_row >= kGolombRowCount)
           {
             err = "tlg8: 不正なゴロム行です";
             return false;
           }
-          auto &row_values = entropy_values[static_cast<std::size_t>(row)];
-          row_values.insert(row_values.end(),
-                            best_block.values[comp].begin(),
-                            best_block.values[comp].begin() + value_count);
+          auto &row_values = entropy_values[static_cast<std::size_t>(target_row)];
+          for (uint32_t comp = 0; comp < components; ++comp)
+          {
+            // インターリーブ時は全コンポーネント分の値をまとめて同一行へ投入する。
+            row_values.insert(row_values.end(),
+                              best_block.values[comp].begin(),
+                              best_block.values[comp].begin() + value_count);
+          }
+        }
+        else
+        {
+          for (uint32_t comp = 0; comp < components; ++comp)
+          {
+            const int row = golomb_row_index(kind, comp);
+            if (row < 0 || row >= static_cast<int>(kGolombRowCount))
+            {
+              err = "tlg8: 不正なゴロム行です";
+              return false;
+            }
+            auto &row_values = entropy_values[static_cast<std::size_t>(row)];
+            row_values.insert(row_values.end(),
+                              best_block.values[comp].begin(),
+                              best_block.values[comp].begin() + value_count);
+          }
         }
       }
     }
