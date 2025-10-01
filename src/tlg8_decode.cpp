@@ -95,9 +95,12 @@ namespace tlg::v8
     const uint32_t table_flag = reader.get_upto8(1);
     if (table_flag)
     {
-      enc::golomb_table_counts table{};
+      enc::golomb_table_counts table = enc::current_golomb_table();
+      const uint32_t mask = reader.get_upto8(enc::kGolombRowCount);
       for (uint32_t row = 0; row < enc::kGolombRowCount; ++row)
       {
+        if (((mask >> row) & 1u) == 0u)
+          continue;
         uint32_t sum = 0;
         for (uint32_t col = 0; col < enc::kGolombColumnCount; ++col)
         {
@@ -169,33 +172,15 @@ namespace tlg::v8
         row_state.blocks.emplace_back(state);
 
         const auto kind = entropy_encoders[entropy_index].kind;
-        const bool uses_interleave =
-            (static_cast<enc::InterleaveFilter>(interleave_index) == enc::InterleaveFilter::Interleave);
-        if (uses_interleave)
+        for (uint32_t comp = 0; comp < components; ++comp)
         {
-          // インターリーブ後の値は振幅が大きくなるため、
-          // エンコード側と同様に 0 番/3 番行へ集約された列から
-          // 各コンポーネント分の値を順番に読み戻す。
-          const uint32_t target_row = (kind == enc::GolombCodingKind::Plain) ? 0u : 3u;
-          if (target_row >= enc::kGolombRowCount)
+          const int row = enc::golomb_row_index(kind, comp);
+          if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
           {
             err = "tlg8: 不正なゴロム行です";
             return false;
           }
-          row_value_counts[target_row] += static_cast<std::size_t>(value_count) * components;
-        }
-        else
-        {
-          for (uint32_t comp = 0; comp < components; ++comp)
-          {
-            const int row = enc::golomb_row_index(kind, comp);
-            if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
-            {
-              err = "tlg8: 不正なゴロム行です";
-              return false;
-            }
-            row_value_counts[static_cast<std::size_t>(row)] += value_count;
-          }
+          row_value_counts[static_cast<std::size_t>(row)] += value_count;
         }
       }
 
@@ -236,53 +221,23 @@ namespace tlg::v8
       for (auto &state : row_state.blocks)
       {
         const auto kind = entropy_encoders[state.entropy_index].kind;
-        const bool uses_interleave = (static_cast<enc::InterleaveFilter>(state.interleave_index) ==
-                                      enc::InterleaveFilter::Interleave);
-        if (uses_interleave)
+        for (uint32_t comp = 0; comp < components; ++comp)
         {
-          // エンコード側で 0 番/3 番行へ集約した値列を、
-          // コンポーネント単位に分割してブロックへ復元する。
-          const uint32_t target_row = (kind == enc::GolombCodingKind::Plain) ? 0u : 3u;
-          if (target_row >= enc::kGolombRowCount)
+          const int row = enc::golomb_row_index(kind, comp);
+          if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
           {
             err = "tlg8: 不正なゴロム行です";
             return false;
           }
-          auto &values = row_values[target_row];
-          auto &offset = row_offsets[target_row];
-          const std::size_t required = static_cast<std::size_t>(state.value_count) * components;
-          if (offset + required > values.size())
+          auto &values = row_values[static_cast<std::size_t>(row)];
+          auto &offset = row_offsets[static_cast<std::size_t>(row)];
+          if (offset + state.value_count > values.size())
           {
             err = "tlg8: エントロピー列が不足しています";
             return false;
           }
-          for (uint32_t comp = 0; comp < components; ++comp)
-          {
-            const std::size_t begin = offset + static_cast<std::size_t>(comp) * state.value_count;
-            std::copy_n(values.data() + begin, state.value_count, state.residuals.values[comp].begin());
-          }
-          offset += required;
-        }
-        else
-        {
-          for (uint32_t comp = 0; comp < components; ++comp)
-          {
-            const int row = enc::golomb_row_index(kind, comp);
-            if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
-            {
-              err = "tlg8: 不正なゴロム行です";
-              return false;
-            }
-            auto &values = row_values[static_cast<std::size_t>(row)];
-            auto &offset = row_offsets[static_cast<std::size_t>(row)];
-            if (offset + state.value_count > values.size())
-            {
-              err = "tlg8: エントロピー列が不足しています";
-              return false;
-            }
-            std::copy_n(values.data() + offset, state.value_count, state.residuals.values[comp].begin());
-            offset += state.value_count;
-          }
+          std::copy_n(values.data() + offset, state.value_count, state.residuals.values[comp].begin());
+          offset += state.value_count;
         }
         enc::undo_interleave_filter(static_cast<enc::InterleaveFilter>(state.interleave_index),
                                     state.residuals,
