@@ -607,6 +607,15 @@ namespace tlg::v8::enc
         }
       }
     }
+    // ここからは、収集した残差統計をもとにゴロムテーブルを動的にリビルドする。
+    // 具体的には以下の手順で実施している。
+    //   1. 既存テーブルのまま推定したビット数 (baseline_bits) を基準として記録する。
+    //   2. 行ごとに集計したバケットコストから DP 最適化 (`optimize_row_from_cost`) を実行し、
+    //      各行の候補テーブルを生成する。サンプルが存在する行のみを更新対象とし、
+    //      変更があった場合は一時的に `apply_golomb_table` で適用する。
+    //   3. 新テーブルで再度ビット数を見積もり、テーブルを書き出すオーバーヘッド
+    //      (1 スロット 11bit × 行数 × 列数) を加えた総コストを評価する。
+    //      ベースラインより悪化した場合は元のテーブルへロールバックする。
     const golomb_table_counts previous_table = current_golomb_table();
     golomb_table_counts candidate = previous_table;
     const uint64_t baseline_bits = estimate_total_bits(entropy_values);
