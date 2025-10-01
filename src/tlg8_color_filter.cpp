@@ -56,9 +56,9 @@ namespace
     case 0:
       return 0;
     case 1:
-      return c0 / 2;
-    case 2:
       return c0;
+    case 2:
+      return c0 / 2;
     case 3:
       return (3 * c0) / 2;
     default:
@@ -66,22 +66,23 @@ namespace
     }
   }
 
-  inline int predict_secondary(int mode, int c0)
+  inline int predict_secondary(int mode, int c0, int reference1)
   {
     switch (mode & 0x3)
     {
     case 0:
       return 0;
     case 1:
-      return c0 / 2;
-    case 2:
       return c0;
+    case 2:
+      return reference1;
     case 3:
-      return (3 * c0) / 2;
+      return (c0 + reference1 + 1) / 2;
     default:
       return 0;
     }
   }
+
 }
 
 namespace tlg::v8::enc
@@ -111,7 +112,7 @@ namespace tlg::v8::enc
       const int d2 = source[perm[2]];
 
       const int predicted1 = predict_primary(params.primary, d0);
-      const int predicted2 = predict_secondary(params.secondary, d0);
+      const int predicted2 = predict_secondary(params.secondary, d0, d1);
 
       const int residual1 = d1 - predicted1;
       const int residual2 = d2 - predicted2;
@@ -142,7 +143,7 @@ namespace tlg::v8::enc
 
       const int restored0 = c0;
       const int restored1 = c1 + predict_primary(params.primary, restored0);
-      const int restored2 = c2 + predict_secondary(params.secondary, restored0);
+      const int restored2 = c2 + predict_secondary(params.secondary, restored0, restored1);
 
       std::array<int, 3> destination = {0, 0, 0};
       destination[perm[0]] = restored0;
