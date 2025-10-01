@@ -130,6 +130,18 @@ namespace
     g_table_ready = true;
   }
 
+  inline constexpr int A_SHIFT = 2; // fixed-point fraction
+  inline constexpr int A_BIAS = 1 << (A_SHIFT - 1);
+  inline constexpr int reduce_a(int a)
+  {
+    return (a + A_BIAS) >> A_SHIFT;
+  }
+  inline constexpr int mix_a_m(int a, int m)
+  {
+    // mix 25% of m and 75% of a
+    return ((m << A_SHIFT) + a * 3 + 2) >> 2;
+  }
+
   inline void write_zero_bits(BitWriter &writer, uint32_t count)
   {
     while (count >= 8)
@@ -241,10 +253,10 @@ namespace
     {
       const int e = static_cast<int>(values[i]);
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
-      const int k = g_bit_length_table[static_cast<uint32_t>(a)][row];
+      const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
       bits += q + 1u + static_cast<uint32_t>(k);
-      a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
+      a = mix_a_m(a, m);
     }
     return bits;
   }
@@ -287,10 +299,10 @@ namespace
           if (mapped < 0)
             mapped = 0;
           const uint32_t m = static_cast<uint32_t>(mapped);
-          const int k = g_bit_length_table[static_cast<uint32_t>(a)][row];
+          const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
           bits += q + 1u + static_cast<uint32_t>(k);
-          a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
+          a = mix_a_m(a, m);
         }
       }
       else
@@ -324,7 +336,7 @@ namespace
     {
       const int e = static_cast<int>(values[i]);
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
-      const int k = g_bit_length_table[static_cast<uint32_t>(a)][row];
+      const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
       write_zero_bits(writer, q);
       writer.put_upto8(1, 1);
@@ -333,7 +345,7 @@ namespace
         const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
         write_bits(writer, m & mask, static_cast<unsigned>(k));
       }
-      a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
+      a = mix_a_m(a, m);
     }
     return true;
   }
@@ -374,7 +386,7 @@ namespace
           if (mapped < 0)
             mapped = 0;
           const uint32_t m = static_cast<uint32_t>(mapped);
-          const int k = g_bit_length_table[static_cast<uint32_t>(a)][row];
+          const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
           write_zero_bits(writer, q);
           writer.put_upto8(1, 1);
@@ -383,7 +395,7 @@ namespace
             const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
             write_bits(writer, m & mask, static_cast<unsigned>(k));
           }
-          a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
+          a = mix_a_m(a, m);
         }
       }
       else
@@ -473,7 +485,7 @@ namespace
     int a = 0;
     for (uint32_t produced = 0; produced < expected_count; ++produced)
     {
-      const int k = g_bit_length_table[static_cast<uint32_t>(a)][row];
+      const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       uint32_t q = 0;
       while (true)
       {
@@ -490,7 +502,7 @@ namespace
       const uint32_t m = (q << k) + remainder;
       const int residual = static_cast<int>((m >> 1) ^ -static_cast<int>(m & 1u));
       dst[produced] = static_cast<int16_t>(residual);
-      a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
+      a = mix_a_m(a, m);
     }
     return true;
   }
@@ -532,7 +544,7 @@ namespace
         return false;
       for (uint32_t i = 0; i < run; ++i)
       {
-        const int k = g_bit_length_table[static_cast<uint32_t>(a)][row];
+        const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
         uint32_t q = 0;
         while (true)
         {
@@ -551,7 +563,7 @@ namespace
         const int vv = static_cast<int>(m >> 1);
         const int residual = (vv ^ sign) + sign + 1; // 符号化時に -1 しているので、ここで戻す
         dst[produced++] = static_cast<int16_t>(residual);
-        a = static_cast<int>((m + static_cast<uint32_t>(a) + 1u) >> 1);
+        a = mix_a_m(a, m);
       }
       expect_nonzero = false;
     }
