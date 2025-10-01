@@ -19,6 +19,153 @@
 namespace
 {
   inline constexpr double EARLY_EXIT_GIVE_UP_RATE = 1.4;
+  using tlg::v8::enc::kGolombColumnCount;
+  using tlg::v8::enc::kGolombRowCount;
+  using tlg::v8::enc::kGolombRowSum;
+
+  inline constexpr int A_SHIFT = 2;
+  inline constexpr int A_BIAS = 1 << (A_SHIFT - 1);
+
+  inline int reduce_a(int a)
+  {
+    return (a + A_BIAS) >> A_SHIFT;
+  }
+
+  inline int mix_a_m(int a, int m)
+  {
+    return ((m << A_SHIFT) + a * 3 + 2) >> 2;
+  }
+
+  using bucket_cost_matrix = std::array<std::array<uint64_t, kGolombRowSum>, kGolombColumnCount>;
+  using GolombRow = std::array<uint16_t, kGolombColumnCount>;
+
+  // ブロック毎に選ばれたメタデータを一時保持する構造体。
+  struct block_choice
+  {
+    uint32_t predictor = 0;
+    uint32_t filter = 0;
+    uint32_t entropy = 0;
+    uint32_t interleave = 0;
+  };
+
+  uint64_t accumulate_plain_bucket_cost(bucket_cost_matrix &matrix,
+                                        const int16_t *values,
+                                        uint32_t count)
+  {
+    uint64_t processed = 0;
+    int a = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+      const int e = static_cast<int>(values[i]);
+      const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2u * static_cast<uint32_t>(e))
+                                  : static_cast<uint32_t>(-2 * e - 1);
+      const uint32_t bucket = std::min<uint32_t>(static_cast<uint32_t>(reduce_a(a)), kGolombRowSum - 1);
+      for (uint32_t k = 0; k < kGolombColumnCount; ++k)
+      {
+        const uint32_t q = (k > 0) ? (m >> k) : m;
+        matrix[k][bucket] += static_cast<uint64_t>(q + 1u + k);
+      }
+      a = mix_a_m(a, static_cast<int>(m));
+      ++processed;
+    }
+    return processed;
+  }
+
+  uint64_t accumulate_run_length_bucket_cost(bucket_cost_matrix &matrix,
+                                             const int16_t *values,
+                                             uint32_t count)
+  {
+    uint64_t processed = 0;
+    int a = 0;
+    uint32_t index = 0;
+    while (index < count)
+    {
+      if (values[index] == 0)
+      {
+        ++index;
+        continue;
+      }
+      while (index < count && values[index] != 0)
+      {
+        int64_t mapped = (values[index] >= 0) ? static_cast<int64_t>(values[index]) * 2
+                                              : -static_cast<int64_t>(values[index]) * 2 - 1;
+        mapped -= 1;
+        if (mapped < 0)
+          mapped = 0;
+        const uint32_t m = static_cast<uint32_t>(mapped);
+        const uint32_t bucket = std::min<uint32_t>(static_cast<uint32_t>(reduce_a(a)), kGolombRowSum - 1);
+        for (uint32_t k = 0; k < kGolombColumnCount; ++k)
+        {
+          const uint32_t q = (k > 0) ? (m >> k) : m;
+          matrix[k][bucket] += static_cast<uint64_t>(q + 1u + k);
+        }
+        a = mix_a_m(a, static_cast<int>(m));
+        ++index;
+        ++processed;
+      }
+    }
+    return processed;
+  }
+
+  GolombRow optimize_row_from_cost(const bucket_cost_matrix &matrix)
+  {
+    constexpr uint64_t INF = std::numeric_limits<uint64_t>::max() / 4;
+    std::array<std::array<uint64_t, kGolombRowSum + 1>, kGolombColumnCount> prefix{};
+    for (uint32_t k = 0; k < kGolombColumnCount; ++k)
+    {
+      prefix[k][0] = 0;
+      for (uint32_t i = 0; i < kGolombRowSum; ++i)
+        prefix[k][i + 1] = prefix[k][i] + matrix[k][i];
+    }
+
+    std::array<std::array<uint64_t, kGolombRowSum + 1>, kGolombColumnCount> dp{};
+    std::array<std::array<uint32_t, kGolombRowSum + 1>, kGolombColumnCount> prev{};
+    for (uint32_t col = 0; col < kGolombColumnCount; ++col)
+    {
+      for (uint32_t count = 0; count <= kGolombRowSum; ++count)
+      {
+        dp[col][count] = INF;
+        prev[col][count] = 0;
+      }
+    }
+
+    for (uint32_t count = 0; count <= kGolombRowSum; ++count)
+    {
+      dp[0][count] = prefix[0][count];
+      prev[0][count] = 0;
+    }
+
+    for (uint32_t col = 1; col < kGolombColumnCount; ++col)
+    {
+      for (uint32_t count = 0; count <= kGolombRowSum; ++count)
+      {
+        for (uint32_t prev_count = 0; prev_count <= count; ++prev_count)
+        {
+          const uint64_t prev_cost = dp[col - 1][prev_count];
+          if (prev_cost == INF)
+            continue;
+          const uint64_t segment_cost = prefix[col][count] - prefix[col][prev_count];
+          const uint64_t cost = prev_cost + segment_cost;
+          if (cost < dp[col][count])
+          {
+            dp[col][count] = cost;
+            prev[col][count] = prev_count;
+          }
+        }
+      }
+    }
+
+    GolombRow result{};
+    uint32_t end = kGolombRowSum;
+    for (int col = static_cast<int>(kGolombColumnCount) - 1; col >= 0; --col)
+    {
+      const uint32_t start = prev[static_cast<std::size_t>(col)][end];
+      result[static_cast<std::size_t>(col)] = static_cast<uint16_t>(end - start);
+      end = start;
+    }
+    return result;
+  }
+
   // タイル全体を 8x8 ブロックへ分割し、予測→カラー相関フィルター→
   // ヒルベルト曲線による並び替え→エントロピー符号と流すパイプライン。
   // 並び替え段はタイル端で縮むブロックにも対応させている。
@@ -206,6 +353,30 @@ namespace tlg::v8::enc
     // 現状は reorder をヒルベルト固定とし、predictor × filter × entropy の
     // 組み合わせを探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
+    const uint32_t block_cols = (tile_w + kBlockSize - 1) / kBlockSize;
+    const uint32_t block_rows = (tile_h + kBlockSize - 1) / kBlockSize;
+    std::vector<block_choice> block_choices;
+    block_choices.reserve(static_cast<size_t>(block_cols) * block_rows);
+    std::array<bucket_cost_matrix, kGolombRowCount> bucket_costs{};
+    std::array<uint64_t, kGolombRowCount> sample_counts{};
+    const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(kColorFilterCodeCount) : 1u;
+    auto estimate_total_bits = [&](const std::array<std::vector<int16_t>, kGolombRowCount> &values) -> uint64_t
+    {
+      uint64_t total_bits = 0;
+      for (uint32_t row = 0; row < kGolombRowCount; ++row)
+      {
+        const auto &row_values = values[row];
+        if (row_values.empty())
+          continue;
+        if (row_values.size() > std::numeric_limits<uint32_t>::max())
+          return std::numeric_limits<uint64_t>::max();
+        const uint32_t count = static_cast<uint32_t>(row_values.size());
+        const auto kind = golomb_row_kind(row);
+        const uint32_t component = golomb_row_component(row);
+        total_bits += estimate_row_bits(kind, component, row_values.data(), count);
+      }
+      return total_bits;
+    };
     auto compute_energy = [](const component_colors &colors, uint32_t comp_count, uint32_t value_count)
     {
       double energy = 0.0;
@@ -240,7 +411,6 @@ namespace tlg::v8::enc
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
         component_colors candidate{};
-        const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(kColorFilterCodeCount) : 1u;
         double best_residual_energy = std::numeric_limits<double>::infinity();
         double best_filtered_energy = std::numeric_limits<double>::infinity();
         for (uint32_t predictor_index = 0; predictor_index < kNumPredictors; ++predictor_index)
@@ -319,10 +489,7 @@ namespace tlg::v8::enc
         // reorder は固定だが、filter やエントロピー符号化方式と同じ基準で
         // 比較する設計とし、将来的に並び替え候補を増やしても流用できるよう
         // にしている。
-        writer.put_upto8(best_predictor, tlg::detail::bit_width(kNumPredictors));
-        writer.put_upto8(best_filter, tlg::detail::bit_width(filter_count));
-        writer.put_upto8(best_entropy, tlg::detail::bit_width(kNumEntropyEncoders));
-        writer.put_upto8(best_interleave, tlg::detail::bit_width(kNumInterleaveFilter));
+        block_choices.push_back(block_choice{best_predictor, best_filter, best_entropy, best_interleave});
 
         if (dump_fp)
         {
@@ -390,6 +557,19 @@ namespace tlg::v8::enc
             err = "tlg8: 不正なゴロム行です";
             return false;
           }
+          uint64_t processed = 0;
+          for (uint32_t comp = 0; comp < components; ++comp)
+          {
+            if (kind == GolombCodingKind::Plain)
+              processed += accumulate_plain_bucket_cost(bucket_costs[target_row],
+                                                        best_after_interleave.values[comp].data(),
+                                                        value_count);
+            else
+              processed += accumulate_run_length_bucket_cost(bucket_costs[target_row],
+                                                             best_after_interleave.values[comp].data(),
+                                                             value_count);
+          }
+          sample_counts[target_row] += processed;
           auto &row_values = entropy_values[static_cast<std::size_t>(target_row)];
           for (uint32_t comp = 0; comp < components; ++comp)
           {
@@ -409,6 +589,16 @@ namespace tlg::v8::enc
               err = "tlg8: 不正なゴロム行です";
               return false;
             }
+            uint64_t processed = 0;
+            if (kind == GolombCodingKind::Plain)
+              processed = accumulate_plain_bucket_cost(bucket_costs[static_cast<std::size_t>(row)],
+                                                        best_after_interleave.values[comp].data(),
+                                                        value_count);
+            else
+              processed = accumulate_run_length_bucket_cost(bucket_costs[static_cast<std::size_t>(row)],
+                                                             best_after_interleave.values[comp].data(),
+                                                             value_count);
+            sample_counts[static_cast<std::size_t>(row)] += processed;
             auto &row_values = entropy_values[static_cast<std::size_t>(row)];
             row_values.insert(row_values.end(),
                               best_after_interleave.values[comp].begin(),
@@ -417,6 +607,58 @@ namespace tlg::v8::enc
         }
       }
     }
+    const golomb_table_counts previous_table = current_golomb_table();
+    golomb_table_counts candidate = previous_table;
+    const uint64_t baseline_bits = estimate_total_bits(entropy_values);
+    bool table_changed = false;
+    for (uint32_t row = 0; row < kGolombRowCount; ++row)
+    {
+      if (sample_counts[row] == 0)
+        continue;
+      const GolombRow optimized = optimize_row_from_cost(bucket_costs[row]);
+      if (optimized != candidate[row])
+      {
+        candidate[row] = optimized;
+        table_changed = true;
+      }
+    }
+    if (table_changed)
+      apply_golomb_table(candidate);
+    if (table_changed)
+    {
+      const uint64_t dynamic_bits = estimate_total_bits(entropy_values);
+      const uint64_t table_overhead_bits = static_cast<uint64_t>(kGolombColumnCount) * kGolombRowCount * 11u;
+      const uint64_t total_with_table = (dynamic_bits == std::numeric_limits<uint64_t>::max())
+                                            ? std::numeric_limits<uint64_t>::max()
+                                            : dynamic_bits + table_overhead_bits;
+      if (total_with_table == std::numeric_limits<uint64_t>::max() || total_with_table >= baseline_bits)
+      {
+        apply_golomb_table(previous_table);
+        table_changed = false;
+      }
+    }
+
+    writer.put_upto8(table_changed ? 1u : 0u, 1);
+    if (table_changed)
+    {
+      const auto &table = current_golomb_table();
+      for (uint32_t row = 0; row < kGolombRowCount; ++row)
+      {
+        for (uint32_t col = 0; col < kGolombColumnCount; ++col)
+        {
+          writer.put(static_cast<uint32_t>(table[row][col]), 11);
+        }
+      }
+    }
+
+    for (const auto &choice : block_choices)
+    {
+      writer.put_upto8(choice.predictor, tlg::detail::bit_width(kNumPredictors));
+      writer.put_upto8(choice.filter, tlg::detail::bit_width(filter_count));
+      writer.put_upto8(choice.entropy, tlg::detail::bit_width(kNumEntropyEncoders));
+      writer.put_upto8(choice.interleave, tlg::detail::bit_width(kNumInterleaveFilter));
+    }
+
     writer.align_to_byte_zero();
     for (uint32_t row = 0; row < kGolombRowCount; ++row)
     {

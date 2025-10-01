@@ -92,6 +92,33 @@ namespace tlg::v8
     std::vector<block_row_state> block_rows;
     std::array<std::size_t, enc::kGolombRowCount> row_value_counts{};
 
+    const uint32_t table_flag = reader.get_upto8(1);
+    if (table_flag)
+    {
+      enc::golomb_table_counts table{};
+      for (uint32_t row = 0; row < enc::kGolombRowCount; ++row)
+      {
+        uint32_t sum = 0;
+        for (uint32_t col = 0; col < enc::kGolombColumnCount; ++col)
+        {
+          const uint32_t value = reader.get(11);
+          if (value > enc::kGolombRowSum)
+          {
+            err = "tlg8: ゴロムテーブル値が範囲外です";
+            return false;
+          }
+          table[row][col] = static_cast<uint16_t>(value);
+          sum += value;
+        }
+        if (sum != enc::kGolombRowSum)
+        {
+          err = "tlg8: ゴロムテーブルの合計が不正です";
+          return false;
+        }
+      }
+      enc::apply_golomb_table(table);
+    }
+
     for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
     {
       const uint32_t block_h = std::min(enc::kBlockSize, tile_h - block_y);

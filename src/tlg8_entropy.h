@@ -18,6 +18,11 @@ namespace tlg::v8::enc
 
   constexpr uint32_t kNumEntropyEncoders = 2;
   constexpr uint32_t kGolombRowCount = 6;
+  constexpr uint32_t kGolombColumnCount = 9;
+  constexpr uint32_t kGolombRowSum = 1024;
+
+  using golomb_histogram = std::array<std::array<uint64_t, kGolombColumnCount>, kGolombRowCount>;
+  using golomb_table_counts = std::array<std::array<uint16_t, kGolombColumnCount>, kGolombRowCount>;
 
   struct entropy_encoder
   {
@@ -62,4 +67,12 @@ namespace tlg::v8::enc
                     uint32_t value_count,
                     component_colors &out,
                     std::string &err);
+
+  bool rebuild_golomb_table_from_histogram(const golomb_histogram &histogram);
+  const golomb_table_counts &current_golomb_table();
+  bool apply_golomb_table(const golomb_table_counts &table);
+  uint64_t estimate_row_bits(GolombCodingKind kind,
+                             uint32_t component,
+                             const int16_t *values,
+                             uint32_t count);
 }
