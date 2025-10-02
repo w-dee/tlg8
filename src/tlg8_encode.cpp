@@ -19,9 +19,26 @@
 namespace
 {
   inline constexpr double EARLY_EXIT_GIVE_UP_RATE = 1.4;
+  using tlg::v8::enc::kColorFilterCodeCount;
   using tlg::v8::enc::kGolombColumnCount;
   using tlg::v8::enc::kGolombRowCount;
   using tlg::v8::enc::kGolombRowSum;
+  using tlg::v8::enc::kNumPredictors;
+
+  // ヒストグラムで得た頻度の高い順に predictor を試行するためのインデックス列。
+  constexpr std::array<uint32_t, kNumPredictors> kPredictorTrialOrder = {
+      0, 4, 1, 3, 5, 2, 7, 6,
+  };
+
+  // ヒストグラムで得た頻度の高い順にカラー相関フィルターを試行するためのインデックス列。
+  constexpr std::array<uint32_t, kColorFilterCodeCount> kColorFilterTrialOrder = {
+      71, 86, 7, 87, 23, 0, 39, 6, 55, 70, 27, 94, 79, 75, 31, 37,
+      59, 95, 11, 91, 43, 22, 53, 5, 19, 8, 14, 78, 51, 69, 57, 40,
+      15, 38, 3, 56, 25, 13, 88, 16, 36, 93, 24, 4, 10, 21, 32, 2,
+      72, 26, 77, 48, 54, 90, 44, 85, 18, 41, 64, 74, 45, 30, 67, 73,
+      50, 61, 80, 47, 1, 83, 29, 35, 60, 63, 9, 49, 58, 42, 17, 33,
+      52, 66, 82, 89, 65, 84, 68, 20, 46, 34, 81, 92, 62, 12, 76, 28,
+  };
 
   inline constexpr int A_SHIFT = 2;
   inline constexpr int A_BIAS = 1 << (A_SHIFT - 1);
@@ -429,8 +446,9 @@ namespace tlg::v8::enc
         component_colors candidate{};
         double best_residual_energy = std::numeric_limits<double>::infinity();
         double best_filtered_energy = std::numeric_limits<double>::infinity();
-        for (uint32_t predictor_index = 0; predictor_index < kNumPredictors; ++predictor_index)
+        for (uint32_t predictor_order_index = 0; predictor_order_index < kNumPredictors; ++predictor_order_index)
         {
+          const uint32_t predictor_index = kPredictorTrialOrder[predictor_order_index];
           compute_residual_block(accessor,
                                  candidate,
                                  predictors[predictor_index],
@@ -448,8 +466,10 @@ namespace tlg::v8::enc
           }
           if (residual_energy < best_residual_energy)
             best_residual_energy = residual_energy;
-          for (uint32_t filter_code = 0; filter_code < filter_count; ++filter_code)
+          for (uint32_t filter_order_index = 0; filter_order_index < filter_count; ++filter_order_index)
           {
+            const uint32_t filter_code =
+                (components >= 3) ? kColorFilterTrialOrder[filter_order_index] : filter_order_index;
             component_colors filtered = candidate;
             if (components >= 3)
               apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
@@ -736,4 +756,5 @@ namespace tlg::v8::enc
     }
     return true;
   }
+
 }
