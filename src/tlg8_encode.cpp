@@ -22,7 +22,6 @@ namespace
   using tlg::v8::enc::kGolombColumnCount;
   using tlg::v8::enc::kGolombRowCount;
   using tlg::v8::enc::kGolombRowSum;
-  using tlg::v8::enc::golomb_histogram;
 
   inline constexpr int A_SHIFT = 2;
   inline constexpr int A_BIAS = 1 << (A_SHIFT - 1);
@@ -595,6 +594,7 @@ namespace tlg::v8::enc
     //   4. 更新行が存在する場合はマスク付きで差分テーブルを送信し、総コストが改善するか確認する。
     const golomb_table_counts previous_table = current_golomb_table();
     golomb_table_counts candidate = previous_table;
+    const uint64_t baseline_bits = estimate_total_bits(entropy_values);
     std::array<uint64_t, kGolombRowCount> baseline_row_bits{};
     for (uint32_t row = 0; row < kGolombRowCount; ++row)
     {
@@ -645,7 +645,6 @@ namespace tlg::v8::enc
       }
     }
     apply_golomb_table(candidate);
-    const uint64_t baseline_bits = estimate_total_bits(entropy_values);
     uint32_t changed_rows = 0;
     for (uint32_t row = 0; row < kGolombRowCount; ++row)
     {
