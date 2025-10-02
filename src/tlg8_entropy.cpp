@@ -269,17 +269,9 @@ namespace
       writer.put_upto8(0, 1);
       return;
     }
-    if (count == 3)
-    {
-      writer.put_upto8(1, 1);
-      writer.put_upto8(1, 1);
-      writer.put_upto8(0, 1);
-      return;
-    }
     writer.put_upto8(1, 1);
     writer.put_upto8(1, 1);
-    writer.put_upto8(1, 1);
-    put_gamma(writer, count - 3);
+    put_gamma(writer, count - 2);
   }
 
   inline uint64_t gamma_bits(uint32_t value)
@@ -530,14 +522,10 @@ namespace
       return 0;
     if (bit == 0)
       return 2;
-    if (!read_bit(reader, bit))
-      return 0;
-    if (bit == 0)
-      return 3;
     uint32_t gamma = 0;
     if (!read_gamma(reader, gamma))
       return 0;
-    return static_cast<int>(gamma + 3);
+    return static_cast<int>(gamma + 2);
   }
 
   bool decode_plain_component(BitReader &reader,
