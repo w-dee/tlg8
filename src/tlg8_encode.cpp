@@ -18,7 +18,7 @@
 
 namespace
 {
-  inline constexpr double EARLY_EXIT_GIVE_UP_RATE = 1.4;
+  inline constexpr double kEarlyExitGiveUpRate = 1.4;
   using tlg::v8::enc::kColorFilterCodeCount;
   using tlg::v8::enc::kGolombColumnCount;
   using tlg::v8::enc::kGolombRowCount;
@@ -459,7 +459,7 @@ namespace tlg::v8::enc
                                  block_h);
           const double residual_energy = compute_energy(candidate, components, value_count);
           if (best_residual_energy < std::numeric_limits<double>::infinity() &&
-              residual_energy > best_residual_energy * EARLY_EXIT_GIVE_UP_RATE)
+              residual_energy > best_residual_energy * kEarlyExitGiveUpRate)
           {
             // 予測誤差の自乗和が閾値を超えた場合は、この predictor を早期に諦める。
             continue;
@@ -477,7 +477,7 @@ namespace tlg::v8::enc
             component_colors filtered_before_hilbert = filtered;
             const double filtered_energy = compute_energy(filtered, components, value_count);
             if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
-                filtered_energy > best_filtered_energy * EARLY_EXIT_GIVE_UP_RATE)
+                filtered_energy > best_filtered_energy * kEarlyExitGiveUpRate)
             {
               // フィルター適用後の誤差エネルギーが大きすぎる候補は以降の処理へ進めない。
               continue;
