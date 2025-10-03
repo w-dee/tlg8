@@ -1,10 +1,12 @@
 #include "tlg8_bit_io.h"
 #include "tlg8_block.h"
+#include "tlg8_block_side_info.h"
 #include "tlg8_color_filter.h"
 #include "tlg8_entropy.h"
 #include "tlg8_interleave.h"
 #include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
+#include "tlg8_varint.h"
 #include "tlg_io_common.h"
 #include "image_io.h"
 
@@ -19,11 +21,15 @@
 namespace
 {
   inline constexpr double kEarlyExitGiveUpRate = 1.3;
+  using tlg::v8::enc::BlockChoiceEncoding;
   using tlg::v8::enc::kColorFilterCodeCount;
   using tlg::v8::enc::kGolombColumnCount;
   using tlg::v8::enc::kGolombRowCount;
   using tlg::v8::enc::kGolombRowSum;
   using tlg::v8::enc::kNumPredictors;
+  using tlg::v8::detail::bitio::BitWriter;
+  using tlg::v8::detail::bitio::put_varuint;
+  using tlg::v8::detail::bitio::varuint_bits;
 
   // ヒストグラムで得た頻度の高い順に predictor を試行するためのインデックス列。
   constexpr std::array<uint32_t, kNumPredictors> kPredictorTrialOrder = {
@@ -243,6 +249,139 @@ namespace
     uint32_t entropy = 0;
     uint32_t interleave = 0;
   };
+
+  uint64_t estimate_value_sequence_bits(BlockChoiceEncoding mode,
+                                        const std::vector<uint32_t> &values,
+                                        uint32_t value_bits)
+  {
+    if (values.empty() || value_bits == 0)
+      return 0;
+
+    switch (mode)
+    {
+    case BlockChoiceEncoding::Raw:
+      return static_cast<uint64_t>(values.size()) * static_cast<uint64_t>(value_bits);
+
+    case BlockChoiceEncoding::SameAsPrevious:
+    {
+      uint64_t bits = value_bits;
+      uint32_t previous = values.front();
+      for (std::size_t index = 1; index < values.size(); ++index)
+      {
+        const uint32_t current = values[index];
+        bits += 1;
+        if (current != previous)
+        {
+          bits += value_bits;
+          previous = current;
+        }
+      }
+      return bits;
+    }
+
+    case BlockChoiceEncoding::RunLength:
+    {
+      uint64_t bits = 0;
+      std::size_t index = 0;
+      while (index < values.size())
+      {
+        const uint32_t current = values[index];
+        std::size_t run_end = index + 1;
+        while (run_end < values.size() && values[run_end] == current)
+          ++run_end;
+        const uint32_t run_length = static_cast<uint32_t>(run_end - index);
+        bits += value_bits;
+        bits += varuint_bits(run_length - 1);
+        index = run_end;
+      }
+      return bits;
+    }
+
+    default:
+      break;
+    }
+
+    return std::numeric_limits<uint64_t>::max();
+  }
+
+  BlockChoiceEncoding select_best_sequence_mode(const std::vector<uint32_t> &values,
+                                                uint32_t value_bits)
+  {
+    if (values.empty() || value_bits == 0)
+      return BlockChoiceEncoding::Raw;
+
+    BlockChoiceEncoding best_mode = BlockChoiceEncoding::Raw;
+    uint64_t best_bits = estimate_value_sequence_bits(best_mode, values, value_bits);
+    const std::array<BlockChoiceEncoding, 2> candidates = {
+        BlockChoiceEncoding::SameAsPrevious,
+        BlockChoiceEncoding::RunLength,
+    };
+    for (auto candidate : candidates)
+    {
+      const uint64_t bits = estimate_value_sequence_bits(candidate, values, value_bits);
+      if (bits < best_bits)
+      {
+        best_bits = bits;
+        best_mode = candidate;
+      }
+    }
+    return best_mode;
+  }
+
+  void encode_value_sequence(BitWriter &writer,
+                             BlockChoiceEncoding mode,
+                             const std::vector<uint32_t> &values,
+                             uint32_t value_bits)
+  {
+    if (values.empty() || value_bits == 0)
+      return;
+
+    switch (mode)
+    {
+    case BlockChoiceEncoding::Raw:
+      for (uint32_t value : values)
+        writer.put_upto8(value, value_bits);
+      break;
+
+    case BlockChoiceEncoding::SameAsPrevious:
+    {
+      writer.put_upto8(values.front(), value_bits);
+      uint32_t previous = values.front();
+      for (std::size_t index = 1; index < values.size(); ++index)
+      {
+        const uint32_t current = values[index];
+        const bool same = (current == previous);
+        writer.put_upto8(same ? 1u : 0u, 1);
+        if (!same)
+        {
+          writer.put_upto8(current, value_bits);
+          previous = current;
+        }
+      }
+      break;
+    }
+
+    case BlockChoiceEncoding::RunLength:
+    {
+      std::size_t index = 0;
+      while (index < values.size())
+      {
+        const uint32_t current = values[index];
+        std::size_t run_end = index + 1;
+        while (run_end < values.size() && values[run_end] == current)
+          ++run_end;
+        const uint32_t run_length = static_cast<uint32_t>(run_end - index);
+        writer.put_upto8(current, value_bits);
+        put_varuint(writer, run_length - 1);
+        index = run_end;
+      }
+      break;
+    }
+
+    default:
+      break;
+    }
+  }
 
   uint64_t accumulate_plain_histogram(std::array<uint64_t, kGolombColumnCount> &hist,
                                       const int16_t *values,
@@ -818,12 +957,43 @@ namespace tlg::v8::enc
       }
     }
 
+    const uint32_t predictor_bits = tlg::detail::bit_width(kNumPredictors);
+    const uint32_t filter_bits = tlg::detail::bit_width(filter_count);
+    const uint32_t entropy_bits = tlg::detail::bit_width(kNumEntropyEncoders);
+    const uint32_t interleave_bits = tlg::detail::bit_width(kNumInterleaveFilter);
+
+    std::vector<uint32_t> predictor_stream;
+    std::vector<uint32_t> filter_stream;
+    std::vector<uint32_t> entropy_stream;
+    std::vector<uint32_t> interleave_stream;
+    predictor_stream.reserve(block_choices.size());
+    filter_stream.reserve(block_choices.size());
+    entropy_stream.reserve(block_choices.size());
+    interleave_stream.reserve(block_choices.size());
     for (const auto &choice : block_choices)
     {
-      writer.put_upto8(choice.predictor, tlg::detail::bit_width(kNumPredictors));
-      writer.put_upto8(choice.filter, tlg::detail::bit_width(filter_count));
-      writer.put_upto8(choice.entropy, tlg::detail::bit_width(kNumEntropyEncoders));
-      writer.put_upto8(choice.interleave, tlg::detail::bit_width(kNumInterleaveFilter));
+      predictor_stream.push_back(choice.predictor);
+      filter_stream.push_back(choice.filter);
+      entropy_stream.push_back(choice.entropy);
+      interleave_stream.push_back(choice.interleave);
+    }
+
+    const BlockChoiceEncoding predictor_mode = select_best_sequence_mode(predictor_stream, predictor_bits);
+    const BlockChoiceEncoding filter_mode = select_best_sequence_mode(filter_stream, filter_bits);
+    const BlockChoiceEncoding entropy_mode = select_best_sequence_mode(entropy_stream, entropy_bits);
+    const BlockChoiceEncoding interleave_mode = select_best_sequence_mode(interleave_stream, interleave_bits);
+
+    writer.put_upto8(static_cast<uint32_t>(predictor_mode), 2);
+    writer.put_upto8(static_cast<uint32_t>(filter_mode), 2);
+    writer.put_upto8(static_cast<uint32_t>(entropy_mode), 2);
+    writer.put_upto8(static_cast<uint32_t>(interleave_mode), 2);
+
+    if (!block_choices.empty())
+    {
+      encode_value_sequence(writer, predictor_mode, predictor_stream, predictor_bits);
+      encode_value_sequence(writer, filter_mode, filter_stream, filter_bits);
+      encode_value_sequence(writer, entropy_mode, entropy_stream, entropy_bits);
+      encode_value_sequence(writer, interleave_mode, interleave_stream, interleave_bits);
     }
 
     writer.align_to_byte_zero();

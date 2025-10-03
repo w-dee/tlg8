@@ -1,13 +1,16 @@
 #include "tlg8_bit_io.h"
 #include "tlg8_block.h"
+#include "tlg8_block_side_info.h"
 #include "tlg8_color_filter.h"
 #include "tlg8_entropy.h"
 #include "tlg8_interleave.h"
 #include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
+#include "tlg8_varint.h"
 #include "tlg_io_common.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -122,6 +125,175 @@ namespace tlg::v8
       enc::apply_golomb_table(table);
     }
 
+    struct block_choice
+    {
+      uint32_t predictor = 0;
+      uint32_t filter = 0;
+      uint32_t entropy = 0;
+      uint32_t interleave = 0;
+    };
+
+    const uint32_t block_cols = (tile_w + enc::kBlockSize - 1) / enc::kBlockSize;
+    const uint32_t block_rows_count = (tile_h + enc::kBlockSize - 1) / enc::kBlockSize;
+    const uint32_t block_count = block_cols * block_rows_count;
+
+    std::vector<block_choice> block_choices;
+    block_choices.reserve(block_count);
+
+    const uint32_t predictor_bits = tlg::detail::bit_width(enc::kNumPredictors);
+    const uint32_t filter_bits = tlg::detail::bit_width(filter_count);
+    const uint32_t entropy_bits = tlg::detail::bit_width(enc::kNumEntropyEncoders);
+    const uint32_t interleave_bits = tlg::detail::bit_width(enc::kNumInterleaveFilter);
+
+    std::array<enc::BlockChoiceEncoding, 4> field_modes{};
+    for (auto &mode : field_modes)
+    {
+      const uint32_t mode_bits = reader.get_upto8(2);
+      if (mode_bits >= static_cast<uint32_t>(enc::BlockChoiceEncoding::Count))
+      {
+        err = "tlg8: サイド情報のエンコード方式が不正です";
+        return false;
+      }
+      mode = static_cast<enc::BlockChoiceEncoding>(mode_bits);
+    }
+
+    std::vector<uint32_t> predictor_stream;
+    std::vector<uint32_t> filter_stream;
+    std::vector<uint32_t> entropy_stream;
+    std::vector<uint32_t> interleave_stream;
+    predictor_stream.reserve(block_count);
+    filter_stream.reserve(block_count);
+    entropy_stream.reserve(block_count);
+    interleave_stream.reserve(block_count);
+
+    auto decode_stream = [&](enc::BlockChoiceEncoding mode,
+                             uint32_t value_bits,
+                             uint32_t max_value,
+                             std::vector<uint32_t> &output,
+                             const char *value_error) -> bool {
+      output.clear();
+      if (block_count == 0)
+        return true;
+      if (value_bits == 0)
+      {
+        if (mode != enc::BlockChoiceEncoding::Raw)
+        {
+          err = "tlg8: サイド情報のエンコード方式が不正です";
+          return false;
+        }
+        output.assign(block_count, 0u);
+        return true;
+      }
+
+      switch (mode)
+      {
+      case enc::BlockChoiceEncoding::Raw:
+        for (uint32_t index = 0; index < block_count; ++index)
+        {
+          const uint32_t value = reader.get_upto8(value_bits);
+          if (value >= max_value)
+          {
+            err = value_error;
+            return false;
+          }
+          output.push_back(value);
+        }
+        return true;
+
+      case enc::BlockChoiceEncoding::SameAsPrevious:
+      {
+        const uint32_t first = reader.get_upto8(value_bits);
+        if (first >= max_value)
+        {
+          err = value_error;
+          return false;
+        }
+        output.push_back(first);
+        uint32_t previous = first;
+        for (uint32_t index = 1; index < block_count; ++index)
+        {
+          const uint32_t same_flag = reader.get_upto8(1);
+          if (same_flag)
+          {
+            output.push_back(previous);
+          }
+          else
+          {
+            const uint32_t value = reader.get_upto8(value_bits);
+            if (value >= max_value)
+            {
+              err = value_error;
+              return false;
+            }
+            output.push_back(value);
+            previous = value;
+          }
+        }
+        return true;
+      }
+
+      case enc::BlockChoiceEncoding::RunLength:
+      {
+        uint32_t decoded = 0;
+        while (decoded < block_count)
+        {
+          const uint32_t value = reader.get_upto8(value_bits);
+          if (value >= max_value)
+          {
+            err = value_error;
+            return false;
+          }
+          uint32_t extra = 0;
+          if (!tlg::v8::detail::bitio::get_varuint(reader, extra))
+          {
+            err = "tlg8: サイド情報のランレングスが不正です";
+            return false;
+          }
+          const uint64_t run_length = static_cast<uint64_t>(extra) + 1u;
+          if (run_length == 0 || decoded + run_length > block_count)
+          {
+            err = "tlg8: サイド情報のランレングスが範囲外です";
+            return false;
+          }
+          output.insert(output.end(), static_cast<std::size_t>(run_length), value);
+          decoded += static_cast<uint32_t>(run_length);
+        }
+        if (output.size() != block_count)
+        {
+          err = "tlg8: サイド情報の数が一致しません";
+          return false;
+        }
+        return true;
+      }
+
+      default:
+        break;
+      }
+      err = "tlg8: サイド情報のエンコード方式が不正です";
+      return false;
+    };
+
+    if (!decode_stream(field_modes[0], predictor_bits, enc::kNumPredictors, predictor_stream, "tlg8: 不正な予測器インデックスです"))
+      return false;
+    if (!decode_stream(field_modes[1], filter_bits, filter_count, filter_stream, "tlg8: 不正なカラーフィルターインデックスです"))
+      return false;
+    if (!decode_stream(field_modes[2], entropy_bits, enc::kNumEntropyEncoders, entropy_stream, "tlg8: 不正なエントロピーインデックスです"))
+      return false;
+    if (!decode_stream(field_modes[3], interleave_bits, enc::kNumInterleaveFilter, interleave_stream, "tlg8: 不正なインターリーブフィルターです"))
+      return false;
+
+    for (uint32_t index = 0; index < block_count; ++index)
+    {
+      block_choice choice{};
+      choice.predictor = (index < predictor_stream.size()) ? predictor_stream[index] : 0u;
+      choice.filter = (index < filter_stream.size()) ? filter_stream[index] : 0u;
+      choice.entropy = (index < entropy_stream.size()) ? entropy_stream[index] : 0u;
+      choice.interleave = (index < interleave_stream.size()) ? interleave_stream[index] : 0u;
+      block_choices.push_back(choice);
+    }
+
+    std::size_t block_choice_index = 0;
+
     for (uint32_t block_y = 0; block_y < tile_h; block_y += enc::kBlockSize)
     {
       const uint32_t block_h = std::min(enc::kBlockSize, tile_h - block_y);
@@ -132,33 +304,17 @@ namespace tlg::v8
       for (uint32_t block_x = 0; block_x < tile_w; block_x += enc::kBlockSize)
       {
         const uint32_t block_w = std::min(enc::kBlockSize, tile_w - block_x);
-        const uint32_t predictor_index = reader.get_upto8(tlg::detail::bit_width(tlg::v8::enc::kNumPredictors));
-        if (predictor_index >= enc::kNumPredictors)
+        if (block_choice_index >= block_choices.size())
         {
-          err = "tlg8: 不正な予測器インデックスです";
+          err = "tlg8: サイド情報の数が不足しています";
           return false;
         }
 
-        const uint32_t filter_index = reader.get_upto8(tlg::detail::bit_width(filter_count));
-        if (filter_index >= enc::kColorFilterCodeCount)
-        {
-          err = "tlg8: 不正なカラーフィルターインデックスです";
-          return false;
-        }
-
-        const uint32_t entropy_index = reader.get_upto8(tlg::detail::bit_width(tlg::v8::enc::kNumEntropyEncoders));
-        if (entropy_index >= enc::kNumEntropyEncoders)
-        {
-          err = "tlg8: 不正なエントロピーインデックスです";
-          return false;
-        }
-
-        const uint32_t interleave_index = reader.get_upto8(tlg::detail::bit_width(tlg::v8::enc::kNumInterleaveFilter));
-        if (interleave_index >= enc::kNumInterleaveFilter)
-        {
-          err = "tlg8: 不正なインターリーブフィルターです";
-          return false;
-        }
+        const auto &choice = block_choices[block_choice_index++];
+        const uint32_t predictor_index = choice.predictor;
+        const uint32_t filter_index = choice.filter;
+        const uint32_t entropy_index = choice.entropy;
+        const uint32_t interleave_index = choice.interleave;
 
         const uint32_t value_count = block_w * block_h;
         block_decode_state state{};
@@ -185,6 +341,12 @@ namespace tlg::v8
       }
 
       block_rows.emplace_back(std::move(row_state));
+    }
+
+    if (block_choice_index != block_choices.size())
+    {
+      err = "tlg8: サイド情報の数が余っています";
+      return false;
     }
 
     reader.align_to_byte();
