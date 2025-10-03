@@ -58,7 +58,7 @@ namespace
     case 1:
       return c0;
     case 2:
-      return c0 / 2;
+      return (c0 + 1) / 2;
     case 3:
       return (3 * c0 + 1) / 2;
     default:
