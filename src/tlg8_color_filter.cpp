@@ -58,9 +58,9 @@ namespace
     case 1:
       return c0;
     case 2:
-      return (c0 + 1) / 2;
+      return (c0) / 2;
     case 3:
-      return (3 * c0 + 1) / 2;
+      return (3 * c0) / 2;
     default:
       return 0;
     }
@@ -77,7 +77,7 @@ namespace
     case 2:
       return reference1;
     case 3:
-      return (c0 + reference1 + 1) / 2;
+      return (c0 + reference1) / 2;
     default:
       return 0;
     }
