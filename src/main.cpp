@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -32,6 +33,9 @@ static void print_usage()
             << " [--tlg7-golomb-table=<path>] [--tlg8-golomb-table=<path>] [-tlg7-dump-residuals=<path>]"
             << " [--tlg7-dump-residuals-order=before|after] [-tlg8-dump-residuals=<path>]"
             << " [--tlg8-dump-residuals-order=predictor|color|hilbert]"
+            << " [--tlg8-write-residuals-bmp=<path>]"
+            << " [--tlg8-write-residuals-order=predictor|color|hilbert]"
+            << " [--tlg8-write-residuals-emphasis=<F>]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
@@ -175,6 +179,59 @@ int main(int argc, char **argv)
         std::cerr << "Invalid --tlg8-dump-residuals-order: " << order << "\n";
         return 2;
       }
+    }
+    else if ((arg.rfind("--tlg8-write-residuals-bmp=", 0) == 0) ||
+             (arg.rfind("-tlg8-write-residuals-bmp=", 0) == 0))
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg8-write-residuals-bmp option\n";
+        return 2;
+      }
+      tlgopt.tlg8_write_residuals_bmp_path = arg.substr(eq + 1);
+    }
+    else if ((arg.rfind("--tlg8-write-residuals-order=", 0) == 0) ||
+             (arg.rfind("-tlg8-write-residuals-order=", 0) == 0))
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg8-write-residuals-order option\n";
+        return 2;
+      }
+      std::string order = arg.substr(eq + 1);
+      to_lower_inplace(order);
+      if (order == "predictor")
+        tlgopt.tlg8_write_residuals_order = TlgOptions::DumpResidualsOrder::AfterPredictor;
+      else if (order == "color")
+        tlgopt.tlg8_write_residuals_order = TlgOptions::DumpResidualsOrder::AfterColorFilter;
+      else if (order == "hilbert")
+        tlgopt.tlg8_write_residuals_order = TlgOptions::DumpResidualsOrder::AfterHilbert;
+      else
+      {
+        std::cerr << "Invalid --tlg8-write-residuals-order: " << order << "\n";
+        return 2;
+      }
+    }
+    else if ((arg.rfind("--tlg8-write-residuals-emphasis=", 0) == 0) ||
+             (arg.rfind("-tlg8-write-residuals-emphasis=", 0) == 0))
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg8-write-residuals-emphasis option\n";
+        return 2;
+      }
+      const std::string value = arg.substr(eq + 1);
+      char *endptr = nullptr;
+      const double emphasis = std::strtod(value.c_str(), &endptr);
+      if (endptr == value.c_str() || (endptr && *endptr != '\0') || !std::isfinite(emphasis))
+      {
+        std::cerr << "Invalid --tlg8-write-residuals-emphasis: " << value << "\n";
+        return 2;
+      }
+      tlgopt.tlg8_write_residuals_emphasis = emphasis;
     }
     else if (arg == "--print-entropy-bits")
     {

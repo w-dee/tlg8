@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -580,6 +581,47 @@ namespace
 
     std::fputc('\n', fp);
   }
+
+  void write_residual_block_to_bitmap(PixelBuffer &bitmap,
+                                      uint32_t components,
+                                      uint32_t tile_origin_x,
+                                      uint32_t tile_origin_y,
+                                      uint32_t block_x,
+                                      uint32_t block_y,
+                                      uint32_t block_w,
+                                      uint32_t block_h,
+                                      const tlg::v8::enc::component_colors &values,
+                                      double emphasis)
+  {
+    if (bitmap.channels == 0 || bitmap.data.empty())
+      return;
+    const uint32_t used_components = std::min<uint32_t>(components, bitmap.channels);
+    const uint32_t stride_width = bitmap.width;
+    for (uint32_t local_y = 0; local_y < block_h; ++local_y)
+    {
+      for (uint32_t local_x = 0; local_x < block_w; ++local_x)
+      {
+        const uint32_t px = tile_origin_x + block_x + local_x;
+        const uint32_t py = tile_origin_y + block_y + local_y;
+        if (px >= bitmap.width || py >= bitmap.height)
+          continue;
+        const size_t pixel_index =
+            (static_cast<size_t>(py) * stride_width + px) * bitmap.channels;
+        const uint32_t value_index = local_y * block_w + local_x;
+        for (uint32_t comp = 0; comp < used_components; ++comp)
+        {
+          const int16_t residual = values.values[comp][value_index];
+          const double scaled = 128.0 + static_cast<double>(residual) * emphasis;
+          int pixel_value = static_cast<int>(std::lround(scaled));
+          if (pixel_value < 0)
+            pixel_value = 0;
+          else if (pixel_value > 255)
+            pixel_value = 255;
+          bitmap.data[pixel_index + comp] = static_cast<uint8_t>(pixel_value);
+        }
+      }
+    }
+  }
 }
 
 namespace tlg::v8::enc
@@ -594,6 +636,9 @@ namespace tlg::v8::enc
                        uint32_t tile_h,
                        FILE *dump_fp,
                        TlgOptions::DumpResidualsOrder dump_order,
+                       PixelBuffer *residual_bitmap,
+                       TlgOptions::DumpResidualsOrder residual_bitmap_order,
+                       double residual_bitmap_emphasis,
                        std::string &err)
   {
     if (components == 0 || components > 4)
@@ -813,6 +858,41 @@ namespace tlg::v8::enc
                                 best_bits,
                                 best_after_hilbert,
                                 "after_hilbert");
+        }
+
+        if (residual_bitmap)
+        {
+          const component_colors *source = nullptr;
+          component_colors reordered_values{};
+          if (residual_bitmap_order == TlgOptions::DumpResidualsOrder::AfterPredictor)
+          {
+            source = &best_after_predictor;
+          }
+          else if (residual_bitmap_order == TlgOptions::DumpResidualsOrder::AfterColorFilter ||
+                   residual_bitmap_order == TlgOptions::DumpResidualsOrder::BeforeHilbert)
+          {
+            source = &best_after_color;
+          }
+          else if (residual_bitmap_order == TlgOptions::DumpResidualsOrder::AfterHilbert)
+          {
+            reordered_values = best_after_hilbert;
+            reorder_from_hilbert(reordered_values, components, block_w, block_h);
+            source = &reordered_values;
+          }
+
+          if (source)
+          {
+            write_residual_block_to_bitmap(*residual_bitmap,
+                                           components,
+                                           origin_x,
+                                           origin_y,
+                                           block_x,
+                                           block_y,
+                                           block_w,
+                                           block_h,
+                                           *source,
+                                           residual_bitmap_emphasis);
+          }
         }
 
         const auto kind = entropy_encoders[best_entropy].kind;

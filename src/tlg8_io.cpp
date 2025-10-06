@@ -309,6 +309,9 @@ namespace tlg::v8
                        uint32_t tile_h,
                        FILE *dump_fp,
                        TlgOptions::DumpResidualsOrder dump_order,
+                       PixelBuffer *residual_bitmap,
+                       TlgOptions::DumpResidualsOrder residual_bitmap_order,
+                       double residual_bitmap_emphasis,
                        std::string &err);
 
     bool write_raw(FILE *fp,
@@ -316,6 +319,9 @@ namespace tlg::v8
                    int desired_colors,
                    const std::string &dump_residuals_path,
                    TlgOptions::DumpResidualsOrder dump_residuals_order,
+                   const std::string &residual_bmp_path,
+                   TlgOptions::DumpResidualsOrder residual_bmp_order,
+                   double residual_bmp_emphasis,
                    std::string &err,
                    uint64_t *out_entropy_bits)
     {
@@ -364,6 +370,11 @@ namespace tlg::v8
       if (!copy_pixels_to_buffer(src, desired_colors, packed, err))
         return false;
 
+      PixelBuffer residual_bitmap;
+      PixelBuffer *residual_bitmap_ptr = nullptr;
+      TlgOptions::DumpResidualsOrder effective_bitmap_order = residual_bmp_order;
+      const double residual_bitmap_emphasis = residual_bmp_emphasis;
+
       const unsigned char mark[11] = {'T', 'L', 'G', '8', '.', '0', 0, 'r', 'a', 'w', 0x1a};
       if (!write_bytes(fp, mark, sizeof(mark)))
       {
@@ -405,6 +416,20 @@ namespace tlg::v8
       const uint32_t tile_width = static_cast<uint32_t>(tile_width_u64);
       const uint32_t tile_height = static_cast<uint32_t>(tile_height_u64);
       const uint32_t components = static_cast<uint32_t>(desired_colors);
+
+      if (!residual_bmp_path.empty())
+      {
+        if (effective_bitmap_order == TlgOptions::DumpResidualsOrder::BeforeHilbert)
+          effective_bitmap_order = TlgOptions::DumpResidualsOrder::AfterColorFilter;
+        residual_bitmap.width = width;
+        residual_bitmap.height = height;
+        residual_bitmap.channels = components;
+        const size_t total_pixels = static_cast<size_t>(width) * height;
+        const size_t buffer_size = total_pixels * components;
+        residual_bitmap.data.resize(buffer_size);
+        std::fill(residual_bitmap.data.begin(), residual_bitmap.data.end(), static_cast<uint8_t>(128));
+        residual_bitmap_ptr = &residual_bitmap;
+      }
       const uint64_t tile_capacity_u64 = static_cast<uint64_t>(tile_width) * tile_height * 4u * 2u;
       if (tile_capacity_u64 == 0 || tile_capacity_u64 > std::numeric_limits<size_t>::max())
       {
@@ -442,6 +467,9 @@ namespace tlg::v8
                                tile_h,
                                dump_file.get(),
                                effective_dump_order,
+                               residual_bitmap_ptr,
+                               effective_bitmap_order,
+                               residual_bitmap_emphasis,
                                err))
             return false;
           if (!writer.align_to_u32_zero() || !writer.finish())
@@ -476,6 +504,16 @@ namespace tlg::v8
 
       if (out_entropy_bits)
         *out_entropy_bits = total_entropy_bits;
+
+      if (residual_bitmap_ptr)
+      {
+        std::string bmp_err;
+        if (!save_bmp(residual_bmp_path, *residual_bitmap_ptr, bmp_err))
+        {
+          err = "tlg8: 残差ビットマップを書き出せません: " + bmp_err;
+          return false;
+        }
+      }
 
       return true;
     }

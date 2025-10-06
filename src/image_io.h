@@ -71,6 +71,9 @@ struct TlgOptions
   Tlg7PipelineOrder tlg7_pipeline_order = Tlg7PipelineOrder::PredictorThenFilter;
   std::string tlg8_dump_residuals_path; // TLG8 エンコーダで残差をダンプする場合の出力先
   DumpResidualsOrder tlg8_dump_residuals_order = DumpResidualsOrder::AfterHilbert;
+  std::string tlg8_write_residuals_bmp_path; // TLG8 残差をビットマップ書き出しする際の出力先
+  DumpResidualsOrder tlg8_write_residuals_order = DumpResidualsOrder::AfterPredictor;
+  double tlg8_write_residuals_emphasis = 1.0; // 残差ビットマップの強調係数
   bool print_entropy_bits = false;     // エントロピー符号化で使用した正味ビット数を表示するか
 };
 

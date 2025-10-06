@@ -141,6 +141,9 @@ bool save_tlg(const std::string &path,
                                  desired_colors,
                                  opt.tlg8_dump_residuals_path,
                                  opt.tlg8_dump_residuals_order,
+                                 opt.tlg8_write_residuals_bmp_path,
+                                 opt.tlg8_write_residuals_order,
+                                 opt.tlg8_write_residuals_emphasis,
                                  err,
                                  out_entropy_bits);
   }
