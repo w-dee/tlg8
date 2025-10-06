@@ -110,7 +110,7 @@ namespace
   std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
   bool g_table_ready = false;
 
-  inline constexpr int kGolombGiveUpK = 9;
+  inline constexpr int kGolombGiveUpQ = 9;
 
   inline void ensure_table_initialized()
   {
@@ -314,8 +314,8 @@ namespace
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
-      if (k >= kGolombGiveUpK)
-        bits += static_cast<uint32_t>(kGolombGiveUpK + 8);
+      if (k >= kGolombGiveUpQ)
+        bits += static_cast<uint32_t>(kGolombGiveUpQ + 8);
       else
         bits += q + 1u + static_cast<uint32_t>(k);
       a = mix_a_m(a, m);
@@ -363,8 +363,8 @@ namespace
           const uint32_t m = static_cast<uint32_t>(mapped);
           const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
-          if (k >= kGolombGiveUpK)
-            bits += static_cast<uint32_t>(kGolombGiveUpK + 8);
+          if (k >= kGolombGiveUpQ)
+            bits += static_cast<uint32_t>(kGolombGiveUpQ + 8);
           else
             bits += q + 1u + static_cast<uint32_t>(k);
           a = mix_a_m(a, m);
@@ -403,9 +403,9 @@ namespace
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
-      if (k >= kGolombGiveUpK)
+      if (k >= kGolombGiveUpQ)
       {
-        write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpK));
+        write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpQ));
         if (m >= 256u)
           return false;
         writer.put_upto8(m, 8);
@@ -463,9 +463,9 @@ namespace
           const uint32_t m = static_cast<uint32_t>(mapped);
           const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
-          if (k >= kGolombGiveUpK)
+          if (k >= kGolombGiveUpQ)
           {
-            write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpK));
+            write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpQ));
             if (m >= 256u)
               return false;
             writer.put_upto8(m, 8);
@@ -571,7 +571,7 @@ namespace
       bool reached_direct = false;
       while (true)
       {
-        if (k >= kGolombGiveUpK && q == static_cast<uint32_t>(kGolombGiveUpK))
+        if (k >= kGolombGiveUpQ && q == static_cast<uint32_t>(kGolombGiveUpQ))
         {
           reached_direct = true;
           break;
@@ -646,7 +646,7 @@ namespace
         bool reached_direct = false;
         while (true)
         {
-          if (k >= kGolombGiveUpK && q == static_cast<uint32_t>(kGolombGiveUpK))
+          if (k >= kGolombGiveUpQ && q == static_cast<uint32_t>(kGolombGiveUpQ))
           {
             reached_direct = true;
             break;
