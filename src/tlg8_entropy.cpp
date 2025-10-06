@@ -110,6 +110,8 @@ namespace
   std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
   bool g_table_ready = false;
 
+  inline constexpr int kGolombGiveUpK = 9;
+
   inline void ensure_table_initialized()
   {
     if (g_table_ready)
@@ -312,7 +314,10 @@ namespace
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
-      bits += q + 1u + static_cast<uint32_t>(k);
+      if (k >= kGolombGiveUpK)
+        bits += static_cast<uint32_t>(kGolombGiveUpK + 8);
+      else
+        bits += q + 1u + static_cast<uint32_t>(k);
       a = mix_a_m(a, m);
     }
     return bits;
@@ -358,7 +363,10 @@ namespace
           const uint32_t m = static_cast<uint32_t>(mapped);
           const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
-          bits += q + 1u + static_cast<uint32_t>(k);
+          if (k >= kGolombGiveUpK)
+            bits += static_cast<uint32_t>(kGolombGiveUpK + 8);
+          else
+            bits += q + 1u + static_cast<uint32_t>(k);
           a = mix_a_m(a, m);
         }
       }
@@ -395,12 +403,22 @@ namespace
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
-      write_zero_bits(writer, q);
-      writer.put_upto8(1, 1);
-      if (k)
+      if (k >= kGolombGiveUpK)
       {
-        const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
-        write_bits(writer, m & mask, static_cast<unsigned>(k));
+        write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpK));
+        if (m >= 256u)
+          return false;
+        writer.put_upto8(m, 8);
+      }
+      else
+      {
+        write_zero_bits(writer, q);
+        writer.put_upto8(1, 1);
+        if (k)
+        {
+          const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
+          write_bits(writer, m & mask, static_cast<unsigned>(k));
+        }
       }
       a = mix_a_m(a, m);
     }
@@ -445,12 +463,22 @@ namespace
           const uint32_t m = static_cast<uint32_t>(mapped);
           const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
-          write_zero_bits(writer, q);
-          writer.put_upto8(1, 1);
-          if (k)
+          if (k >= kGolombGiveUpK)
           {
-            const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
-            write_bits(writer, m & mask, static_cast<unsigned>(k));
+            write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpK));
+            if (m >= 256u)
+              return false;
+            writer.put_upto8(m, 8);
+          }
+          else
+          {
+            write_zero_bits(writer, q);
+            writer.put_upto8(1, 1);
+            if (k)
+            {
+              const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
+              write_bits(writer, m & mask, static_cast<unsigned>(k));
+            }
           }
           a = mix_a_m(a, m);
         }
@@ -540,8 +568,14 @@ namespace
     {
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       uint32_t q = 0;
+      bool reached_direct = false;
       while (true)
       {
+        if (k >= kGolombGiveUpK && q == static_cast<uint32_t>(kGolombGiveUpK))
+        {
+          reached_direct = true;
+          break;
+        }
         uint32_t bit = 0;
         if (!read_bit(reader, bit))
           return false;
@@ -549,10 +583,20 @@ namespace
           break;
         ++q;
       }
-      uint32_t remainder = 0;
-      if (k > 0 && !read_bits(reader, static_cast<unsigned>(k), remainder))
-        return false;
-      const uint32_t m = (q << k) + remainder;
+      const bool use_direct = reached_direct;
+      uint32_t m = 0;
+      if (use_direct)
+      {
+        if (!read_bits(reader, 8, m))
+          return false;
+      }
+      else
+      {
+        uint32_t remainder = 0;
+        if (k > 0 && !read_bits(reader, static_cast<unsigned>(k), remainder))
+          return false;
+        m = (q << k) + remainder;
+      }
       const int residual = static_cast<int>((m >> 1) ^ -static_cast<int>(m & 1u));
       dst[produced] = static_cast<int16_t>(residual);
       a = mix_a_m(a, m);
@@ -599,8 +643,14 @@ namespace
       {
         const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
         uint32_t q = 0;
+        bool reached_direct = false;
         while (true)
         {
+          if (k >= kGolombGiveUpK && q == static_cast<uint32_t>(kGolombGiveUpK))
+          {
+            reached_direct = true;
+            break;
+          }
           uint32_t bit = 0;
           if (!read_bit(reader, bit))
             return false;
@@ -608,10 +658,20 @@ namespace
             break;
           ++q;
         }
-        uint32_t remainder = 0;
-        if (k > 0 && !read_bits(reader, static_cast<unsigned>(k), remainder))
-          return false;
-        const uint32_t m = (q << k) + remainder;
+        const bool use_direct = reached_direct;
+        uint32_t m = 0;
+        if (use_direct)
+        {
+          if (!read_bits(reader, 8, m))
+            return false;
+        }
+        else
+        {
+          uint32_t remainder = 0;
+          if (k > 0 && !read_bits(reader, static_cast<unsigned>(k), remainder))
+            return false;
+          m = (q << k) + remainder;
+        }
         const int sign = static_cast<int>(m & 1u) - 1;
         const int vv = static_cast<int>(m >> 1);
         const int residual = (vv ^ sign) + sign + 1; // 符号化時に -1 しているので、ここで戻す
