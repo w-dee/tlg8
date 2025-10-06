@@ -296,9 +296,7 @@ namespace
       return 1;
     if (count == 2)
       return 2;
-    if (count == 3)
-      return 3;
-    return 3u + gamma_bits(count - 3);
+    return 2u + gamma_bits(count - 2);
   }
 
   uint64_t estimate_plain_with_row(const int16_t *values, uint32_t count, int row)
