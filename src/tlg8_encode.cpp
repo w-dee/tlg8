@@ -639,6 +639,7 @@ namespace tlg::v8::enc
                        PixelBuffer *residual_bitmap,
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
+                       bool golomb_adaptive_update,
                        std::string &err)
   {
     if (components == 0 || components > 4)
@@ -904,16 +905,19 @@ namespace tlg::v8::enc
             err = "tlg8: 不正なゴロム行です";
             return false;
           }
-          uint64_t processed = 0;
-          if (kind == GolombCodingKind::Plain)
-            processed = accumulate_plain_histogram(histograms[static_cast<std::size_t>(row)],
-                                                   best_after_interleave.values[comp].data(),
-                                                   value_count);
-          else
-            processed = accumulate_run_length_histogram(histograms[static_cast<std::size_t>(row)],
-                                                        best_after_interleave.values[comp].data(),
-                                                        value_count);
-          sample_counts[static_cast<std::size_t>(row)] += processed;
+          if (golomb_adaptive_update)
+          {
+            uint64_t processed = 0;
+            if (kind == GolombCodingKind::Plain)
+              processed = accumulate_plain_histogram(histograms[static_cast<std::size_t>(row)],
+                                                     best_after_interleave.values[comp].data(),
+                                                     value_count);
+            else
+              processed = accumulate_run_length_histogram(histograms[static_cast<std::size_t>(row)],
+                                                          best_after_interleave.values[comp].data(),
+                                                          value_count);
+            sample_counts[static_cast<std::size_t>(row)] += processed;
+          }
           auto &row_values = entropy_values[static_cast<std::size_t>(row)];
           row_values.insert(row_values.end(),
                             best_after_interleave.values[comp].begin(),
@@ -928,111 +932,114 @@ namespace tlg::v8::enc
     //      サンプル数が少ない行は既定テーブルと線形補間したヒストグラムで安定化する。
     //   3. 行単位で改善量と 9×11bit の書き出しコストを比較し、改善が見込める行だけを更新する。
     //   4. 更新行が存在する場合はマスク付きで差分テーブルを送信し、総コストが改善するか確認する。
-    const golomb_table_counts previous_table = current_golomb_table();
-    golomb_table_counts candidate = previous_table;
-    const uint64_t baseline_bits = estimate_total_bits(entropy_values);
-    std::array<uint64_t, kGolombRowCount> baseline_row_bits{};
-    for (uint32_t row = 0; row < kGolombRowCount; ++row)
+    if (golomb_adaptive_update)
     {
-      const auto kind = golomb_row_kind(row);
-      const uint32_t component = golomb_row_component(row);
-      const auto &values = entropy_values[row];
-      if (!values.empty())
-        baseline_row_bits[row] = estimate_row_bits(kind, component, values.data(), static_cast<uint32_t>(values.size()));
-    }
-    bool table_changed = false;
-    std::array<bool, kGolombRowCount> row_changed{};
-    for (uint32_t row = 0; row < kGolombRowCount; ++row)
-    {
-      if (sample_counts[row] == 0)
-        continue;
-      auto blended_hist = histograms[row];
-      if (sample_counts[row] < kRowSmoothingThreshold)
+      const golomb_table_counts previous_table = current_golomb_table();
+      golomb_table_counts candidate = previous_table;
+      const uint64_t baseline_bits = estimate_total_bits(entropy_values);
+      std::array<uint64_t, kGolombRowCount> baseline_row_bits{};
+      for (uint32_t row = 0; row < kGolombRowCount; ++row)
       {
-        const uint64_t smoothing = static_cast<uint64_t>(kRowSmoothingThreshold - sample_counts[row]);
-        for (uint32_t col = 0; col < kGolombColumnCount; ++col)
-          blended_hist[col] += static_cast<uint64_t>(previous_table[row][col]) * smoothing;
+        const auto kind = golomb_row_kind(row);
+        const uint32_t component = golomb_row_component(row);
+        const auto &values = entropy_values[row];
+        if (!values.empty())
+          baseline_row_bits[row] = estimate_row_bits(kind, component, values.data(), static_cast<uint32_t>(values.size()));
       }
-      GolombRow new_row{};
-      if (!normalize_histogram_row_local(blended_hist, new_row))
-        continue;
-      if (new_row == candidate[row])
-        continue;
-      golomb_table_counts trial = candidate;
-      trial[row] = new_row;
-      apply_golomb_table(trial);
-      const auto kind = golomb_row_kind(row);
-      const uint32_t component = golomb_row_component(row);
-      const auto &values = entropy_values[row];
-      const uint64_t candidate_bits = values.empty()
-                                          ? 0
-                                          : estimate_row_bits(kind, component, values.data(), static_cast<uint32_t>(values.size()));
-      const uint64_t row_overhead_bits = static_cast<uint64_t>(kGolombColumnCount) * 11u;
-      if (candidate_bits + row_overhead_bits < baseline_row_bits[row])
+      bool table_changed = false;
+      std::array<bool, kGolombRowCount> row_changed{};
+      for (uint32_t row = 0; row < kGolombRowCount; ++row)
       {
-        candidate = trial;
-        baseline_row_bits[row] = candidate_bits;
-        row_changed[row] = true;
-        table_changed = true;
+        if (sample_counts[row] == 0)
+          continue;
+        auto blended_hist = histograms[row];
+        if (sample_counts[row] < kRowSmoothingThreshold)
+        {
+          const uint64_t smoothing = static_cast<uint64_t>(kRowSmoothingThreshold - sample_counts[row]);
+          for (uint32_t col = 0; col < kGolombColumnCount; ++col)
+            blended_hist[col] += static_cast<uint64_t>(previous_table[row][col]) * smoothing;
+        }
+        GolombRow new_row{};
+        if (!normalize_histogram_row_local(blended_hist, new_row))
+          continue;
+        if (new_row == candidate[row])
+          continue;
+        golomb_table_counts trial = candidate;
+        trial[row] = new_row;
+        apply_golomb_table(trial);
+        const auto kind = golomb_row_kind(row);
+        const uint32_t component = golomb_row_component(row);
+        const auto &values = entropy_values[row];
+        const uint64_t candidate_bits = values.empty()
+                                            ? 0
+                                            : estimate_row_bits(kind, component, values.data(), static_cast<uint32_t>(values.size()));
+        const uint64_t row_overhead_bits = static_cast<uint64_t>(kGolombColumnCount) * 11u;
+        if (candidate_bits + row_overhead_bits < baseline_row_bits[row])
+        {
+          candidate = trial;
+          baseline_row_bits[row] = candidate_bits;
+          row_changed[row] = true;
+          table_changed = true;
+        }
+        else
+        {
+          apply_golomb_table(candidate);
+        }
       }
-      else
-      {
-        apply_golomb_table(candidate);
-      }
-    }
-    apply_golomb_table(candidate);
-    uint32_t changed_rows = 0;
-    for (uint32_t row = 0; row < kGolombRowCount; ++row)
-    {
-      if (row_changed[row])
-        ++changed_rows;
-    }
-    bool keep_dynamic_table = false;
-    if (table_changed)
-    {
-      const uint64_t dynamic_bits = estimate_total_bits(entropy_values);
-      const uint64_t table_overhead_bits = static_cast<uint64_t>(changed_rows) * kGolombColumnCount * 11u +
-                                           static_cast<uint64_t>(kGolombRowCount);
-      const uint64_t total_with_table = (dynamic_bits == std::numeric_limits<uint64_t>::max())
-                                            ? std::numeric_limits<uint64_t>::max()
-                                            : dynamic_bits + table_overhead_bits;
-      if (total_with_table < baseline_bits)
-        keep_dynamic_table = true;
-    }
-    if (!keep_dynamic_table)
-    {
-      apply_golomb_table(previous_table);
-      table_changed = false;
-      row_changed.fill(false);
-      candidate = previous_table;
-    }
-
-    writer.put_upto8(table_changed ? 1u : 0u, 1);
-    if (table_changed)
-    {
-      uint32_t mask = 0;
+      apply_golomb_table(candidate);
+      uint32_t changed_rows = 0;
       for (uint32_t row = 0; row < kGolombRowCount; ++row)
       {
         if (row_changed[row])
-          mask |= (1u << row);
+          ++changed_rows;
       }
-      writer.put_upto8(mask, kGolombRowCount);
-      const auto &table = current_golomb_table();
-      for (uint32_t row = 0; row < kGolombRowCount; ++row)
+      bool keep_dynamic_table = false;
+      if (table_changed)
       {
-        if (!row_changed[row])
-          continue;
-        uint32_t sum = 0;
-        for (uint32_t col = 0; col < kGolombColumnCount; ++col)
+        const uint64_t dynamic_bits = estimate_total_bits(entropy_values);
+        const uint64_t table_overhead_bits = static_cast<uint64_t>(changed_rows) * kGolombColumnCount * 11u +
+                                             static_cast<uint64_t>(kGolombRowCount);
+        const uint64_t total_with_table = (dynamic_bits == std::numeric_limits<uint64_t>::max())
+                                              ? std::numeric_limits<uint64_t>::max()
+                                              : dynamic_bits + table_overhead_bits;
+        if (total_with_table < baseline_bits)
+          keep_dynamic_table = true;
+      }
+      if (!keep_dynamic_table)
+      {
+        apply_golomb_table(previous_table);
+        table_changed = false;
+        row_changed.fill(false);
+        candidate = previous_table;
+      }
+
+      writer.put_upto8(table_changed ? 1u : 0u, 1);
+      if (table_changed)
+      {
+        uint32_t mask = 0;
+        for (uint32_t row = 0; row < kGolombRowCount; ++row)
         {
-          const uint32_t value = static_cast<uint32_t>(table[row][col]);
-          writer.put(value, 11);
-          sum += value;
+          if (row_changed[row])
+            mask |= (1u << row);
         }
-        if (sum != kGolombRowSum)
+        writer.put_upto8(mask, kGolombRowCount);
+        const auto &table = current_golomb_table();
+        for (uint32_t row = 0; row < kGolombRowCount; ++row)
         {
-          err = "tlg8: ゴロムテーブル行の合計が不正です";
-          return false;
+          if (!row_changed[row])
+            continue;
+          uint32_t sum = 0;
+          for (uint32_t col = 0; col < kGolombColumnCount; ++col)
+          {
+            const uint32_t value = static_cast<uint32_t>(table[row][col]);
+            writer.put(value, 11);
+            sum += value;
+          }
+          if (sum != kGolombRowSum)
+          {
+            err = "tlg8: ゴロムテーブル行の合計が不正です";
+            return false;
+          }
         }
       }
     }

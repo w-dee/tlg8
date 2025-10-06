@@ -36,6 +36,7 @@ static void print_usage()
             << " [--tlg8-write-residuals-bmp=<path>]"
             << " [--tlg8-write-residuals-order=predictor|color|hilbert]"
             << " [--tlg8-write-residuals-emphasis=<F>]"
+            << " [--tlg8-golomb-adaptive-update=on|off]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
@@ -232,6 +233,30 @@ int main(int argc, char **argv)
         return 2;
       }
       tlgopt.tlg8_write_residuals_emphasis = emphasis;
+    }
+    else if (arg.rfind("--tlg8-golomb-adaptive-update=", 0) == 0)
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg8-golomb-adaptive-update option\n";
+        return 2;
+      }
+      std::string mode = arg.substr(eq + 1);
+      to_lower_inplace(mode);
+      if (mode == "on" || mode == "yes" || mode == "true" || mode == "1")
+      {
+        tlgopt.tlg8_golomb_adaptive_update = true;
+      }
+      else if (mode == "off" || mode == "no" || mode == "false" || mode == "0")
+      {
+        tlgopt.tlg8_golomb_adaptive_update = false;
+      }
+      else
+      {
+        std::cerr << "Invalid --tlg8-golomb-adaptive-update: " << mode << "\n";
+        return 2;
+      }
     }
     else if (arg == "--print-entropy-bits")
     {

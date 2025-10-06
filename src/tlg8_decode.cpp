@@ -58,6 +58,7 @@ namespace tlg::v8
                        uint32_t origin_x,
                        uint32_t origin_y,
                        uint32_t image_width,
+                       bool golomb_adaptive_update,
                        std::vector<uint8_t> &decoded,
                        std::string &err)
   {
@@ -95,34 +96,37 @@ namespace tlg::v8
     std::vector<block_row_state> block_rows;
     std::array<std::size_t, enc::kGolombRowCount> row_value_counts{};
 
-    const uint32_t table_flag = reader.get_upto8(1);
-    if (table_flag)
+    if (golomb_adaptive_update)
     {
-      enc::golomb_table_counts table = enc::current_golomb_table();
-      const uint32_t mask = reader.get_upto8(enc::kGolombRowCount);
-      for (uint32_t row = 0; row < enc::kGolombRowCount; ++row)
+      const uint32_t table_flag = reader.get_upto8(1);
+      if (table_flag)
       {
-        if (((mask >> row) & 1u) == 0u)
-          continue;
-        uint32_t sum = 0;
-        for (uint32_t col = 0; col < enc::kGolombColumnCount; ++col)
+        enc::golomb_table_counts table = enc::current_golomb_table();
+        const uint32_t mask = reader.get_upto8(enc::kGolombRowCount);
+        for (uint32_t row = 0; row < enc::kGolombRowCount; ++row)
         {
-          const uint32_t value = reader.get(11);
-          if (value > enc::kGolombRowSum)
+          if (((mask >> row) & 1u) == 0u)
+            continue;
+          uint32_t sum = 0;
+          for (uint32_t col = 0; col < enc::kGolombColumnCount; ++col)
           {
-            err = "tlg8: ゴロムテーブル値が範囲外です";
+            const uint32_t value = reader.get(11);
+            if (value > enc::kGolombRowSum)
+            {
+              err = "tlg8: ゴロムテーブル値が範囲外です";
+              return false;
+            }
+            table[row][col] = static_cast<uint16_t>(value);
+            sum += value;
+          }
+          if (sum != enc::kGolombRowSum)
+          {
+            err = "tlg8: ゴロムテーブルの合計が不正です";
             return false;
           }
-          table[row][col] = static_cast<uint16_t>(value);
-          sum += value;
         }
-        if (sum != enc::kGolombRowSum)
-        {
-          err = "tlg8: ゴロムテーブルの合計が不正です";
-          return false;
-        }
+        enc::apply_golomb_table(table);
       }
-      enc::apply_golomb_table(table);
     }
 
     struct block_choice

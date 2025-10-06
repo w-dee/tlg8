@@ -178,6 +178,7 @@ def evaluate_table(
                 str(output_path),
                 "--tlg-version=8",
                 f"--tlg8-golomb-table={table_path}",
+                "--tlg8-golomb-adaptive-update=off",
                 "--print-entropy-bits",
             ]
             if fast_mode:
