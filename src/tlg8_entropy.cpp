@@ -110,7 +110,7 @@ namespace
   std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
   bool g_table_ready = false;
 
-  inline constexpr int kGolombGiveUpQ = 9;
+  inline constexpr int kGolombGiveUpQ = 10;
 
   inline void ensure_table_initialized()
   {
@@ -314,8 +314,8 @@ namespace
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
-      if (k == 0 && q >= static_cast<uint32_t>(kGolombGiveUpQ) && q < 256u)
-        bits += static_cast<uint32_t>(kGolombGiveUpQ + 1 + 8);
+      if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
+        bits += static_cast<uint32_t>(kGolombGiveUpQ + 9);
       else
         bits += q + 1u + static_cast<uint32_t>(k);
       a = mix_a_m(a, m);
@@ -363,8 +363,8 @@ namespace
           const uint32_t m = static_cast<uint32_t>(mapped);
           const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
-          if (k == 0 && q >= static_cast<uint32_t>(kGolombGiveUpQ) && q < 256u)
-            bits += static_cast<uint32_t>(kGolombGiveUpQ + 1 + 8);
+          if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
+            bits += static_cast<uint32_t>(kGolombGiveUpQ + 9);
           else
             bits += q + 1u + static_cast<uint32_t>(k);
           a = mix_a_m(a, m);
@@ -403,11 +403,11 @@ namespace
       const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
-      if (k == 0 && q >= static_cast<uint32_t>(kGolombGiveUpQ) && q < 256u)
+      // printf("P e=%d q=%d m=%d, k=%d\n", (int)e, (int)(kGolombGiveUpQ > q ? q : kGolombGiveUpQ), (int)m, (int)k);
+      if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
       {
         write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpQ));
-        writer.put_upto8(1, 1);
-        writer.put_upto8(m, 8);
+        writer.put(m, 9);
       }
       else
       {
@@ -462,11 +462,11 @@ namespace
           const uint32_t m = static_cast<uint32_t>(mapped);
           const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
-          if (k == 0 && q >= static_cast<uint32_t>(kGolombGiveUpQ) && q < 256u)
+          // printf("R e=%d q=%d m=%d k=%d\n", (int)values[j], (int)(kGolombGiveUpQ > q ? q : kGolombGiveUpQ), (int)m, (int)k);
+          if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
           {
             write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpQ));
-            writer.put_upto8(1, 1);
-            writer.put_upto8(m, 8);
+            writer.put(m, 9);
           }
           else
           {
@@ -574,14 +574,16 @@ namespace
         if (bit)
           break;
         ++q;
+        if (q >= kGolombGiveUpQ)
+          break;
       }
-      const bool use_direct = (k == 0 && q == static_cast<uint32_t>(kGolombGiveUpQ));
+      const bool use_direct = (q >= static_cast<uint32_t>(kGolombGiveUpQ));
       uint32_t m = 0;
       if (use_direct)
       {
-        if (!read_bits(reader, 8, m))
+        if (!read_bits(reader, 9, m))
           return false;
-        q = m;
+        q = kGolombGiveUpQ;
       }
       else
       {
@@ -592,6 +594,8 @@ namespace
       }
       const int residual = static_cast<int>((m >> 1) ^ -static_cast<int>(m & 1u));
       dst[produced] = static_cast<int16_t>(residual);
+
+      // printf("P e=%d q=%d m=%d, k=%d\n", (int)residual, (int)q, (int)m, (int)k);
       a = mix_a_m(a, m);
     }
     return true;
@@ -644,14 +648,16 @@ namespace
           if (bit)
             break;
           ++q;
+          if (q >= kGolombGiveUpQ)
+            break;
         }
-        const bool use_direct = (k == 0 && q == static_cast<uint32_t>(kGolombGiveUpQ));
+        const bool use_direct = (q >= static_cast<uint32_t>(kGolombGiveUpQ));
         uint32_t m = 0;
         if (use_direct)
         {
-          if (!read_bits(reader, 8, m))
+          if (!read_bits(reader, 9, m))
             return false;
-          q = m;
+          q = kGolombGiveUpQ;
         }
         else
         {
@@ -663,6 +669,8 @@ namespace
         const int sign = static_cast<int>(m & 1u) - 1;
         const int vv = static_cast<int>(m >> 1);
         const int residual = (vv ^ sign) + sign + 1; // 符号化時に -1 しているので、ここで戻す
+
+        // printf("R e=%d q=%d m=%d, k=%d\n", (int)residual, (int)q, (int)m, (int)k);
         dst[produced++] = static_cast<int16_t>(residual);
         a = mix_a_m(a, m);
       }
