@@ -110,7 +110,7 @@ namespace
   std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
   bool g_table_ready = false;
 
-  inline constexpr int kGolombGiveUpQ = 10;
+  inline constexpr int kGolombGiveUpQ = 16;
 
   inline void ensure_table_initialized()
   {
