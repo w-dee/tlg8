@@ -207,8 +207,10 @@ namespace
   }
   inline constexpr int mix_a_m(int a, int m)
   {
-    // mix 25% of m and 75% of a
-    return ((m << A_SHIFT) + a * 3 + 2) >> 2;
+    if (a < m)
+      return ((m << A_SHIFT) * 3 + a * 5 + 4) >> 3; // mix 3:5
+    else
+      return ((m << A_SHIFT) + a * 3 + 2) >> 2; // mix 25% of m and 75% of a
   }
 
   inline void write_zero_bits(BitWriter &writer, uint32_t count)
