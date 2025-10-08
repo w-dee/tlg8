@@ -315,7 +315,11 @@ namespace
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
       const uint32_t q = (k > 0) ? (m >> k) : m;
       if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
-        bits += static_cast<uint32_t>(kGolombGiveUpQ + 9);
+      {
+        const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
+        const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
+        bits += static_cast<uint64_t>(base) + gamma_bits(direct_value);
+      }
       else
         bits += q + 1u + static_cast<uint32_t>(k);
       a = mix_a_m(a, m);
@@ -364,7 +368,11 @@ namespace
           const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
           const uint32_t q = (k > 0) ? (m >> k) : m;
           if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
-            bits += static_cast<uint32_t>(kGolombGiveUpQ + 9);
+          {
+            const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
+            const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
+            bits += static_cast<uint64_t>(base) + gamma_bits(direct_value);
+          }
           else
             bits += q + 1u + static_cast<uint32_t>(k);
           a = mix_a_m(a, m);
@@ -406,8 +414,10 @@ namespace
       // printf("P e=%d q=%d m=%d, k=%d\n", (int)e, (int)(kGolombGiveUpQ > q ? q : kGolombGiveUpQ), (int)m, (int)k);
       if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
       {
-        write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpQ));
-        writer.put(m, 9);
+        const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
+        write_zero_bits(writer, base);
+        const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
+        put_gamma(writer, direct_value);
       }
       else
       {
@@ -465,8 +475,10 @@ namespace
           // printf("R e=%d q=%d m=%d k=%d\n", (int)values[j], (int)(kGolombGiveUpQ > q ? q : kGolombGiveUpQ), (int)m, (int)k);
           if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
           {
-            write_zero_bits(writer, static_cast<uint32_t>(kGolombGiveUpQ));
-            writer.put(m, 9);
+            const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
+            write_zero_bits(writer, base);
+            const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
+            put_gamma(writer, direct_value);
           }
           else
           {
@@ -581,8 +593,11 @@ namespace
       uint32_t m = 0;
       if (use_direct)
       {
-        if (!read_bits(reader, 9, m))
+        uint32_t direct_value = 0;
+        if (!read_gamma(reader, direct_value) || direct_value == 0)
           return false;
+        const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
+        m = direct_value + base - 1u;
       }
       else
       {
@@ -654,8 +669,11 @@ namespace
         uint32_t m = 0;
         if (use_direct)
         {
-          if (!read_bits(reader, 9, m))
+          uint32_t direct_value = 0;
+          if (!read_gamma(reader, direct_value) || direct_value == 0)
             return false;
+          const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
+          m = direct_value + base - 1u;
         }
         else
         {
