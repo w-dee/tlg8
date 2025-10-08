@@ -583,7 +583,6 @@ namespace
       {
         if (!read_bits(reader, 9, m))
           return false;
-        q = kGolombGiveUpQ;
       }
       else
       {
@@ -657,7 +656,6 @@ namespace
         {
           if (!read_bits(reader, 9, m))
             return false;
-          q = kGolombGiveUpQ;
         }
         else
         {
