@@ -51,8 +51,8 @@ int main(int argc, char **argv)
   std::string in_path = argv[1];
   std::string out_path = argv[2];
 
-  TlgOptions tlgopt; // default version is 6 per requirement
-  tlgopt.version = 6;
+  TlgOptions tlgopt; // default version is 8 per requirement
+  tlgopt.version = 8;
   tlgopt.fmt = ImageFormat::Auto;
 
   for (int i = 3; i < argc; ++i)
