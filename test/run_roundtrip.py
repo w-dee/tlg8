@@ -8,6 +8,7 @@ original via the `cmp` command.
 
 Usage:
   python3 test/run_roundtrip.py [--tlgconv /path/to/tlgconv] [--images DIR]
+                                 [--encode-option OPT] [--decode-option OPT]
 """
 import argparse
 import filecmp
@@ -34,6 +35,7 @@ class FormatSpec(NamedTuple):
     name: str
     extension: str
     encode_args: Sequence[str]
+    decode_args: Sequence[str] = ()
 
 
 def run_timed_command(cmd: Sequence[str], **kwargs) -> float:
@@ -115,18 +117,32 @@ def roundtrip(
     temp_dir: Path,
     spec: FormatSpec,
     stats: dict[str, dict[str, float]],
+    encode_options: Sequence[str],
+    decode_options: Sequence[str],
 ) -> tuple[bool, str | None]:
     compressed_path = temp_dir / f"{bmp_path.stem}{spec.extension}"
     recon_bmp = temp_dir / f"{bmp_path.stem}.roundtrip.{spec.name}.bmp"
 
-    encode_cmd = [str(tlgconv), str(bmp_path), str(compressed_path), *spec.encode_args]
+    encode_cmd = [
+        str(tlgconv),
+        str(bmp_path),
+        str(compressed_path),
+        *spec.encode_args,
+        *encode_options,
+    ]
     encode_time = run_timed_command(encode_cmd)
 
     original_size = bmp_path.stat().st_size
     compressed_size = compressed_path.stat().st_size
     compression_ratio = (compressed_size / original_size * 100) if original_size else 0.0
 
-    decode_cmd = [str(tlgconv), str(compressed_path), str(recon_bmp)]
+    decode_cmd = [
+        str(tlgconv),
+        str(compressed_path),
+        str(recon_bmp),
+        *spec.decode_args,
+        *decode_options,
+    ]
     decode_time = run_timed_command(decode_cmd)
 
     print(
@@ -161,9 +177,9 @@ def roundtrip(
 
 
 FORMATS: tuple[FormatSpec, ...] = (
-    FormatSpec("png", ".png", ()),
-    FormatSpec("tlg6", ".tlg6", ("--tlg-version=6",)),
-    FormatSpec("tlg8", ".tlg8", ("--tlg-version=8",)),
+    FormatSpec("png", ".png", (), ()),
+    FormatSpec("tlg6", ".tlg6", ("--tlg-version=6",), ()),
+    FormatSpec("tlg8", ".tlg8", ("--tlg-version=8",), ()),
 )
 
 
@@ -180,6 +196,22 @@ def main(argv: list[str]) -> int:
         type=Path,
         default=Path("test") / "images",
         help="Directory containing BMP images to test",
+    )
+    parser.add_argument(
+        "--encode-option",
+        action="append",
+        default=[],
+        dest="encode_options",
+        metavar="OPT",
+        help="tlgconv のエンコード時に付与する追加オプション (複数指定可)",
+    )
+    parser.add_argument(
+        "--decode-option",
+        action="append",
+        default=[],
+        dest="decode_options",
+        metavar="OPT",
+        help="tlgconv のデコード時に付与する追加オプション (複数指定可)",
     )
     args = parser.parse_args(argv)
 
@@ -205,12 +237,23 @@ def main(argv: list[str]) -> int:
 
     format_names = "/".join(spec.name for spec in FORMATS)
 
+    encode_options = tuple(args.encode_options)
+    decode_options = tuple(args.decode_options)
+
     with tempfile.TemporaryDirectory(prefix="tlgconv_roundtrip_") as tmp:
         tmp_path = Path(tmp)
         for bmp in bmp_files:
             print(f"[INFO] Testing {bmp.name} -> {format_names} round-trip")
             for spec in FORMATS:
-                success, message = roundtrip(bmp, args.tlgconv, tmp_path, spec, stats)
+                success, message = roundtrip(
+                    bmp,
+                    args.tlgconv,
+                    tmp_path,
+                    spec,
+                    stats,
+                    encode_options,
+                    decode_options,
+                )
                 if not success and message:
                     print(f"[ERROR] {message}")
                     mismatches.append(message)
