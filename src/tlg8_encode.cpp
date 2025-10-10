@@ -480,14 +480,54 @@ namespace
     }
   };
 
+  // 8x8 ブロック周辺の画素を一度だけ読み出し、予測器評価時に再利用するための
+  // ワークスペース。
+  struct block_workspace
+  {
+    uint32_t block_w = 0;
+    uint32_t block_h = 0;
+    uint32_t stride = 0;
+    std::array<std::vector<uint8_t>, 4> padded{};
+
+    void prepare(const tile_accessor &accessor,
+                 uint32_t block_x,
+                 uint32_t block_y,
+                 uint32_t width,
+                 uint32_t height,
+                 uint32_t components)
+    {
+      block_w = width;
+      block_h = height;
+      stride = block_w + 2u;
+      const uint32_t padded_height = block_h + 1u;
+      const size_t required = static_cast<size_t>(stride) * padded_height;
+      for (auto &plane : padded)
+        plane.assign(required, 0);
+
+      for (uint32_t comp = 0; comp < components; ++comp)
+      {
+        auto &plane = padded[comp];
+        for (int32_t local_y = -1; local_y < static_cast<int32_t>(block_h); ++local_y)
+        {
+          for (int32_t local_x = -1; local_x <= static_cast<int32_t>(block_w); ++local_x)
+          {
+            const uint8_t sample = accessor.sample(static_cast<int32_t>(block_x) + local_x,
+                                                   static_cast<int32_t>(block_y) + local_y,
+                                                   comp);
+            const size_t index = static_cast<size_t>(local_y + 1) * stride + static_cast<size_t>(local_x + 1);
+            plane[index] = sample;
+          }
+        }
+      }
+    }
+  };
+
   // predictor の出力後にカラー相関フィルターを適用し、その結果を
   // component_colors へ格納する。
-  void compute_residual_block(const tile_accessor &accessor,
+  void compute_residual_block(const block_workspace &workspace,
                               tlg::v8::enc::component_colors &out,
                               tlg::v8::enc::predictor_fn predictor,
                               uint32_t components,
-                              uint32_t block_x,
-                              uint32_t block_y,
                               uint32_t block_w,
                               uint32_t block_h)
   {
@@ -499,21 +539,16 @@ namespace
     {
       for (uint32_t bx = 0; bx < block_w; ++bx)
       {
-        const int32_t tx = static_cast<int32_t>(block_x + bx);
-        const int32_t ty = static_cast<int32_t>(block_y + by);
         for (uint32_t comp = 0; comp < components; ++comp)
         {
-          auto sample_from_state = [&](int32_t sx, int32_t sy, uint32_t sc) -> uint8_t
-          {
-            return accessor.sample(sx, sy, sc);
-          };
-
-          const uint8_t a = sample_from_state(tx - 1, ty, comp);
-          const uint8_t b = sample_from_state(tx, ty - 1, comp);
-          const uint8_t c = sample_from_state(tx - 1, ty - 1, comp);
-          const uint8_t d = sample_from_state(tx + 1, ty - 1, comp);
+          const auto &plane = workspace.padded[comp];
+          const size_t base = static_cast<size_t>(by + 1) * workspace.stride + static_cast<size_t>(bx + 1);
+          const uint8_t a = plane[base - 1];
+          const uint8_t b = plane[base - workspace.stride];
+          const uint8_t c = plane[base - workspace.stride - 1];
+          const uint8_t d = plane[base - workspace.stride + 1];
+          const uint8_t actual = plane[base];
           const uint8_t predicted = predictor(a, b, c, d);
-          const uint8_t actual = accessor.sample(tx, ty, comp);
           out.values[comp][index] = static_cast<int16_t>(static_cast<int32_t>(actual) - static_cast<int32_t>(predicted));
         }
         ++index;
@@ -707,6 +742,7 @@ namespace tlg::v8::enc
       return energy;
     };
 
+    block_workspace workspace;
     for (uint32_t block_y = 0; block_y < tile_h; block_y += kBlockSize)
     {
       const uint32_t block_h = std::min(kBlockSize, tile_h - block_y);
@@ -726,17 +762,16 @@ namespace tlg::v8::enc
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
         component_colors candidate{};
+        workspace.prepare(accessor, block_x, block_y, block_w, block_h, components);
         double best_residual_energy = std::numeric_limits<double>::infinity();
         double best_filtered_energy = std::numeric_limits<double>::infinity();
         for (uint32_t predictor_order_index = 0; predictor_order_index < kNumPredictors; ++predictor_order_index)
         {
           const uint32_t predictor_index = kPredictorTrialOrder[predictor_order_index];
-          compute_residual_block(accessor,
+          compute_residual_block(workspace,
                                  candidate,
                                  predictors[predictor_index],
                                  components,
-                                 block_x,
-                                 block_y,
                                  block_w,
                                  block_h);
           const double residual_energy = compute_energy(candidate, components, value_count);
