@@ -23,6 +23,8 @@ namespace
 {
   inline constexpr double kEarlyExitGiveUpRate = 1.3;
   using tlg::v8::enc::BlockChoiceEncoding;
+  using tlg::v8::enc::GolombCodingKind;
+  using tlg::v8::enc::golomb_histogram;
   using tlg::v8::enc::kColorFilterCodeCount;
   using tlg::v8::enc::kGolombColumnCount;
   using tlg::v8::enc::kGolombRowCount;
@@ -433,6 +435,31 @@ namespace
       }
     }
     return processed;
+  }
+
+  // 動的テーブル更新を無効化している場合はヒストグラム集計をスキップする補助関数。
+  void accumulate_histogram_if_enabled(bool golomb_adaptive_update,
+                                       golomb_histogram &histograms,
+                                       std::array<uint64_t, kGolombRowCount> &sample_counts,
+                                       GolombCodingKind kind,
+                                       uint32_t row_index,
+                                       const int16_t *values,
+                                       uint32_t count)
+  {
+    if (!golomb_adaptive_update)
+      return;
+
+    const std::size_t row = static_cast<std::size_t>(row_index);
+    uint64_t processed = 0;
+    if (kind == GolombCodingKind::Plain)
+    {
+      processed = accumulate_plain_histogram(histograms[row], values, count);
+    }
+    else
+    {
+      processed = accumulate_run_length_histogram(histograms[row], values, count);
+    }
+    sample_counts[row] += processed;
   }
 
   // タイル全体を 8x8 ブロックへ分割し、予測→カラー相関フィルター→
@@ -940,19 +967,13 @@ namespace tlg::v8::enc
             err = "tlg8: 不正なゴロム行です";
             return false;
           }
-          if (golomb_adaptive_update)
-          {
-            uint64_t processed = 0;
-            if (kind == GolombCodingKind::Plain)
-              processed = accumulate_plain_histogram(histograms[static_cast<std::size_t>(row)],
-                                                     best_after_interleave.values[comp].data(),
-                                                     value_count);
-            else
-              processed = accumulate_run_length_histogram(histograms[static_cast<std::size_t>(row)],
-                                                          best_after_interleave.values[comp].data(),
-                                                          value_count);
-            sample_counts[static_cast<std::size_t>(row)] += processed;
-          }
+          accumulate_histogram_if_enabled(golomb_adaptive_update,
+                                          histograms,
+                                          sample_counts,
+                                          kind,
+                                          static_cast<uint32_t>(row),
+                                          best_after_interleave.values[comp].data(),
+                                          value_count);
           auto &row_values = entropy_values[static_cast<std::size_t>(row)];
           row_values.insert(row_values.end(),
                             best_after_interleave.values[comp].begin(),
