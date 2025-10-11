@@ -4,6 +4,7 @@ import argparse
 import random
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
@@ -82,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="Maximum generations per attempt before giving up (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=1,
+        help="Maximum number of tlgconv processes to run in parallel (default: %(default)s)",
     )
     return parser.parse_args()
 
@@ -180,13 +187,15 @@ def evaluate_table(
     table: Sequence[Sequence[int]],
     work_dir: Path,
     fast_mode: bool,
+    max_parallel: int,
 ) -> int:
     with tempfile.TemporaryDirectory(prefix="golomb_eval_", dir=work_dir) as tmp_root:
         tmp_path = Path(tmp_root)
         table_path = tmp_path / "golomb_table.txt"
         write_table(table_path, table)
         total_bits = 0
-        for image in images:
+
+        def run_encoder(image: Path) -> int:
             output_path = tmp_path / (image.stem + ".tlg8")
             cmd = [
                 str(binary),
@@ -221,7 +230,17 @@ def evaluate_table(
                 raise RuntimeError(
                     f"Encoder output for {image.name} did not contain entropy_bits information:\n{stdout.strip()}"
                 )
-            total_bits += entropy_bits
+            return entropy_bits
+
+        if max_parallel <= 1:
+            for image in images:
+                total_bits += run_encoder(image)
+            return total_bits
+
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            futures = [executor.submit(run_encoder, image) for image in images]
+            for future in as_completed(futures):
+                total_bits += future.result()
         return total_bits
 
 
@@ -300,6 +319,8 @@ def main() -> None:
         raise ValueError("attempts must be positive")
     if args.max_generations <= 0:
         raise ValueError("max-generations must be positive")
+    if args.max_parallel <= 0:
+        raise ValueError("max-parallel must be positive")
 
     rng = random.Random(args.seed)
 
@@ -308,7 +329,14 @@ def main() -> None:
     active_images = choose_initial_images(images, args.subset_size, rng)
 
     best_table = [row[:] for row in seed_table]
-    best_bits = evaluate_table(binary_path, active_images, best_table, work_dir, args.fast_mode)
+    best_bits = evaluate_table(
+        binary_path,
+        active_images,
+        best_table,
+        work_dir,
+        args.fast_mode,
+        args.max_parallel,
+    )
     write_table(best_table_path, best_table)
 
     print("Initial selection: " + ", ".join(image.name for image in active_images))
@@ -333,6 +361,7 @@ def main() -> None:
                         candidate_table,
                         work_dir,
                         args.fast_mode,
+                        args.max_parallel,
                     )
                     if candidate_bits < best_bits:
                         best_bits = candidate_bits
@@ -389,6 +418,7 @@ def main() -> None:
                 best_table,
                 work_dir,
                 args.fast_mode,
+                args.max_parallel,
             )
             print(f"[round {iteration}] baseline bits with current selection: {best_bits}")
     except KeyboardInterrupt:
