@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
-import os
 import random
 import subprocess
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Tuple
 
 DEFAULT_GOLOMB_TABLE: List[List[int]] = [
     [0, 4, 4, 7, 24, 89, 270, 489, 137],
@@ -28,12 +26,6 @@ def parse_args() -> argparse.Namespace:
         "--binary",
         default="build/tlgconv",
         help="Path to tlgconv binary (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=max(1, (os.cpu_count() or 1) // 2),
-        help="Number of parallel attempts per iteration (default: %(default)s)",
     )
     parser.add_argument(
         "--iterations",
@@ -58,6 +50,12 @@ def parse_args() -> argparse.Namespace:
         help="Directory to store temporary evaluation artifacts (default: %(default)s)",
     )
     parser.add_argument(
+        "--image-dir",
+        type=Path,
+        default=Path("test") / "images",
+        help="Directory containing BMP images to evaluate (default: %(default)s)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         help="Seed for the random generator",
@@ -66,6 +64,24 @@ def parse_args() -> argparse.Namespace:
         "--fast-mode",
         action="store_true",
         help="Enable --tlg8-fast when invoking the encoder",
+    )
+    parser.add_argument(
+        "--subset-size",
+        type=int,
+        default=10,
+        help="Number of random BMP images to evaluate per round (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=6,
+        help="Number of mutation attempts per round (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-generations",
+        type=int,
+        default=20,
+        help="Maximum generations per attempt before giving up (default: %(default)s)",
     )
     return parser.parse_args()
 
@@ -212,8 +228,45 @@ def evaluate_table(
 def ensure_images_exist(images: Iterable[Path]) -> List[Path]:
     resolved = sorted(images)
     if not resolved:
-        raise FileNotFoundError("No BMP files found under test/images")
+        raise FileNotFoundError("No BMP files found in the specified directory")
     return resolved
+
+
+def choose_initial_images(all_images: Sequence[Path], count: int, rng: random.Random) -> List[Path]:
+    pool = list(all_images)
+    if count >= len(pool):
+        rng.shuffle(pool)
+        return pool
+    return rng.sample(pool, count)
+
+
+def replace_image_subset(
+    all_images: Sequence[Path],
+    current: List[Path],
+    rng: random.Random,
+) -> List[Tuple[Path, Path]]:
+    if not current:
+        return []
+    replace_count = max(1, len(current) // 2)
+    indices = sorted(rng.sample(range(len(current)), min(replace_count, len(current))))
+    remaining = [image for idx, image in enumerate(current) if idx not in indices]
+    available_pool = [image for image in all_images if image not in remaining]
+    replacements = []
+    for idx in indices:
+        if not available_pool:
+            available_pool = list(all_images)
+        old_image = current[idx]
+        candidates = [image for image in available_pool if image != old_image]
+        if not candidates:
+            candidates = [image for image in all_images if image != old_image]
+        if not candidates:
+            candidates = list(all_images)
+        new_image = rng.choice(candidates)
+        if new_image in available_pool:
+            available_pool.remove(new_image)
+        current[idx] = new_image
+        replacements.append((old_image, new_image))
+    return replacements
 
 
 def main() -> None:
@@ -239,88 +292,105 @@ def main() -> None:
     else:
         seed_table = [row[:] for row in DEFAULT_GOLOMB_TABLE]
 
-    if args.threads <= 0:
-        raise ValueError("threads must be positive")
     if args.iterations is not None and args.iterations <= 0:
         raise ValueError("iterations must be positive when specified")
+    if args.subset_size <= 0:
+        raise ValueError("subset-size must be positive")
+    if args.attempts <= 0:
+        raise ValueError("attempts must be positive")
+    if args.max_generations <= 0:
+        raise ValueError("max-generations must be positive")
 
     rng = random.Random(args.seed)
 
-    image_dir = project_root / "test" / "images"
+    image_dir = resolve_path(project_root, args.image_dir)
     images = ensure_images_exist(image_dir.glob("*.bmp"))
+    active_images = choose_initial_images(images, args.subset_size, rng)
 
     best_table = [row[:] for row in seed_table]
-    best_bits = evaluate_table(binary_path, images, best_table, work_dir, args.fast_mode)
-    search_table = [row[:] for row in best_table]
-    bits_initial = best_bits
+    best_bits = evaluate_table(binary_path, active_images, best_table, work_dir, args.fast_mode)
     write_table(best_table_path, best_table)
 
-    print(f"Initial total entropy bits: {bits_initial}")
+    print("Initial selection: " + ", ".join(image.name for image in active_images))
+    print(f"Initial total entropy bits: {best_bits}")
     print(f"Best table saved to {best_table_path}")
 
     iteration = 0
     try:
-        with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            while args.iterations is None or iteration < args.iterations:
-                iteration += 1
-                futures = []
-                for _ in range(args.threads):
+        while args.iterations is None or iteration < args.iterations:
+            iteration += 1
+            print(f"[round {iteration}] evaluating {len(active_images)} images")
+            for attempt in range(1, args.attempts + 1):
+                print(f"  [attempt {attempt}] start")
+                search_table = [row[:] for row in best_table]
+                search_bits = best_bits
+                success = False
+                for generation in range(1, args.max_generations + 1):
                     candidate_table = mutate_table(search_table, rng)
-                    futures.append((executor.submit(
-                        evaluate_table,
+                    candidate_bits = evaluate_table(
                         binary_path,
-                        images,
-                        [row[:] for row in candidate_table],
+                        active_images,
+                        candidate_table,
                         work_dir,
                         args.fast_mode,
-                    ), candidate_table))
-
-                evaluated = []
-                for future, candidate_table in futures:
-                    try:
-                        candidate_bits = future.result()
-                    except Exception as exc:
-                        print(f"[iter {iteration}] candidate failed: {exc}")
-                        continue
-                    evaluated.append((candidate_bits, candidate_table))
-
-                if not evaluated:
-                    raise RuntimeError("All candidate evaluations failed in this iteration")
-
-                evaluated.sort(key=lambda item: item[0])
-                best_attempt_bits, best_attempt_table = evaluated[0]
-
-                improvements = [entry for entry in evaluated if entry[0] < best_bits]
-                non_worse = [entry for entry in evaluated if entry[0] <= best_bits]
-
-                if improvements:
-                    candidate_bits, candidate_table = min(improvements, key=lambda item: item[0])
-                    best_bits = candidate_bits
-                    best_table = [row[:] for row in candidate_table]
-                    search_table = [row[:] for row in candidate_table]
-                    write_table(best_table_path, best_table)
-                    print(
-                        f"[iter {iteration}] improvement: best_bits={best_bits} "
-                        f"(delta={best_bits - bits_initial})"
                     )
-                else:
-                    print(
-                        f"[iter {iteration}] no improvement (best_candidate_bits={best_attempt_bits}, best_bits={best_bits})"
-                    )
-                    if non_worse:
-                        candidate_bits, candidate_table = rng.choice(non_worse)
+                    if candidate_bits < best_bits:
+                        best_bits = candidate_bits
                         best_table = [row[:] for row in candidate_table]
                         search_table = [row[:] for row in candidate_table]
                         write_table(best_table_path, best_table)
                         print(
-                            f"[iter {iteration}] adopting equal-or-better candidate as new seed (bits={candidate_bits})"
+                            "    [generation {gen}] improvement: best_bits={bits}".format(
+                                gen=generation,
+                                bits=best_bits,
+                            )
                         )
-                    else:
-                        search_table = [row[:] for row in best_table]
+                        success = True
+                        break
+                    if candidate_bits < search_bits:
+                        search_table = [row[:] for row in candidate_table]
+                        search_bits = candidate_bits
+                        print(
+                            "    [generation {gen}] new search seed (bits={bits})".format(
+                                gen=generation,
+                                bits=candidate_bits,
+                            )
+                        )
+                if not success:
+                    print(
+                        "  [attempt {idx}] no improvement after {gen} generations".format(
+                            idx=attempt,
+                            gen=args.max_generations,
+                        )
+                    )
 
-                print(
-                    f"[iter {iteration}] bits_initial={bits_initial}, current_best_bits={best_bits}"
+            replacements = replace_image_subset(images, active_images, rng)
+            if replacements:
+                print("[round {idx}] replaced images:".format(idx=iteration))
+                for old_image, new_image in replacements:
+                    print(
+                        "    {old} -> {new}".format(
+                            old=old_image.name,
+                            new=new_image.name,
+                        )
+                    )
+            else:
+                print(f"[round {iteration}] no images available for replacement")
+
+            print(
+                "[round {idx}] current selection: {names}".format(
+                    idx=iteration,
+                    names=", ".join(image.name for image in active_images),
                 )
+            )
+            best_bits = evaluate_table(
+                binary_path,
+                active_images,
+                best_table,
+                work_dir,
+                args.fast_mode,
+            )
+            print(f"[round {iteration}] baseline bits with current selection: {best_bits}")
     except KeyboardInterrupt:
         print("Interrupted by user; exiting.")
 
