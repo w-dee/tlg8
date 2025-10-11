@@ -17,9 +17,13 @@ namespace tlg::v8::enc
   };
 
   constexpr uint32_t kNumEntropyEncoders = 2;
-  constexpr uint32_t kGolombRowCount = 6;
+  constexpr uint32_t kGolombRowCount = 8;
   constexpr uint32_t kGolombColumnCount = 9;
   constexpr uint32_t kGolombRowSum = 1024;
+
+  constexpr uint32_t kInterleavedComponentIndex = 0xFFFFFFFFu;
+  constexpr uint32_t kInterleavedPlainRow = 6;
+  constexpr uint32_t kInterleavedRunLengthRow = 7;
 
   using golomb_histogram = std::array<std::array<uint64_t, kGolombColumnCount>, kGolombRowCount>;
   using golomb_table_counts = std::array<std::array<uint16_t, kGolombColumnCount>, kGolombRowCount>;

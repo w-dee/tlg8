@@ -959,25 +959,60 @@ namespace tlg::v8::enc
         }
 
         const auto kind = entropy_encoders[best_entropy].kind;
-        for (uint32_t comp = 0; comp < components; ++comp)
+        const bool uses_interleave_filter =
+            (best_interleave == static_cast<uint32_t>(InterleaveFilter::Interleave));
+        const uint32_t used_components =
+            std::min<uint32_t>(components, static_cast<uint32_t>(best_after_interleave.values.size()));
+        if (uses_interleave_filter && used_components > 0)
         {
-          const int row = golomb_row_index(kind, comp);
+          const int row = golomb_row_index(kind, kInterleavedComponentIndex);
           if (row < 0 || row >= static_cast<int>(kGolombRowCount))
           {
             err = "tlg8: 不正なゴロム行です";
             return false;
+          }
+          const std::size_t combined_count = static_cast<std::size_t>(value_count) * used_components;
+          std::array<int16_t, kMaxBlockPixels * 4> combined{};
+          std::size_t combined_offset = 0;
+          for (uint32_t comp = 0; comp < used_components; ++comp)
+          {
+            std::copy_n(best_after_interleave.values[comp].begin(),
+                        value_count,
+                        combined.begin() + combined_offset);
+            combined_offset += value_count;
           }
           accumulate_histogram_if_enabled(golomb_adaptive_update,
                                           histograms,
                                           sample_counts,
                                           kind,
                                           static_cast<uint32_t>(row),
-                                          best_after_interleave.values[comp].data(),
-                                          value_count);
+                                          combined.data(),
+                                          static_cast<uint32_t>(combined_count));
           auto &row_values = entropy_values[static_cast<std::size_t>(row)];
-          row_values.insert(row_values.end(),
-                            best_after_interleave.values[comp].begin(),
-                            best_after_interleave.values[comp].begin() + value_count);
+          row_values.insert(row_values.end(), combined.begin(), combined.begin() + combined_count);
+        }
+        else
+        {
+          for (uint32_t comp = 0; comp < components; ++comp)
+          {
+            const int row = golomb_row_index(kind, comp);
+            if (row < 0 || row >= static_cast<int>(kGolombRowCount))
+            {
+              err = "tlg8: 不正なゴロム行です";
+              return false;
+            }
+            accumulate_histogram_if_enabled(golomb_adaptive_update,
+                                            histograms,
+                                            sample_counts,
+                                            kind,
+                                            static_cast<uint32_t>(row),
+                                            best_after_interleave.values[comp].data(),
+                                            value_count);
+            auto &row_values = entropy_values[static_cast<std::size_t>(row)];
+            row_values.insert(row_values.end(),
+                              best_after_interleave.values[comp].begin(),
+                              best_after_interleave.values[comp].begin() + value_count);
+          }
         }
       }
     }

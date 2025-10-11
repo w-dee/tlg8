@@ -23,6 +23,8 @@ namespace
   using GolombRow = std::array<uint16_t, kGolombColumnCount>;
   using GolombTable = golomb_table_counts;
 
+  constexpr std::size_t kLegacyGolombRowCount = 6;
+
   struct ParsedGolombTable
   {
     GolombTable table{};
@@ -48,6 +50,8 @@ namespace
 2 3 4 6 23 97 238 513 138
 2 3 4 10 63 109 263 454 116
 3 2 5 12 96 70 245 452 139
+3 1 6 10 19 106 254 498 127
+2 3 4 6 23 97 238 513 138
         )";
 
     ParsedGolombTable result{};
@@ -717,14 +721,15 @@ namespace
     std::array<int16_t, kMaxCombined> combined{};
     std::size_t offset = 0;
     const uint32_t available = std::min<uint32_t>(components, static_cast<uint32_t>(colors.values.size()));
-    // インターリーブ時は 0 番行へ集約して符号化するため、推定でも一括して評価する。
+    // インターリーブ時は専用の行へ集約して符号化するため、推定でも一括して評価する。
     for (uint32_t c = 0; c < available; ++c)
     {
       const std::size_t required = static_cast<std::size_t>(value_count);
       std::copy_n(colors.values[c].begin(), value_count, combined.begin() + offset);
       offset += required;
     }
-    return estimate_plain_with_row(combined.data(), static_cast<uint32_t>(offset), 0);
+    return estimate_plain_with_row(combined.data(), static_cast<uint32_t>(offset),
+                                   static_cast<int>(kInterleavedPlainRow));
   }
 
   uint64_t estimate_run_length(const component_colors &colors,
@@ -747,14 +752,15 @@ namespace
     std::array<int16_t, kMaxCombined> combined{};
     std::size_t offset = 0;
     const uint32_t available = std::min<uint32_t>(components, static_cast<uint32_t>(colors.values.size()));
-    // ランレングスでもインターリーブ時は 3 番行へまとめるので、推定も同じ行を用いる。
+    // ランレングスでもインターリーブ時は専用の行へまとめるので、推定も同じ行を用いる。
     for (uint32_t c = 0; c < available; ++c)
     {
       const std::size_t required = static_cast<std::size_t>(value_count);
       std::copy_n(colors.values[c].begin(), value_count, combined.begin() + offset);
       offset += required;
     }
-    return estimate_run_length_with_row(combined.data(), static_cast<uint32_t>(offset), 3);
+    return estimate_run_length_with_row(combined.data(), static_cast<uint32_t>(offset),
+                                        static_cast<int>(kInterleavedRunLengthRow));
   }
 
   bool encode_plain(BitWriter &writer,
@@ -814,6 +820,8 @@ namespace tlg::v8
     std::size_t line_number = 0;
     std::vector<GolombRow> parsed_rows;
     parsed_rows.reserve(static_cast<std::size_t>(kGolombRowCount));
+    std::vector<std::size_t> parsed_line_numbers;
+    parsed_line_numbers.reserve(static_cast<std::size_t>(kGolombRowCount));
 
     while (std::getline(in, line))
     {
@@ -824,12 +832,6 @@ namespace tlg::v8
 
       if (line.find_first_not_of(" \t\r\n") == std::string::npos)
         continue;
-
-      if (parsed_rows.size() >= static_cast<std::size_t>(kGolombRowCount))
-      {
-        err = "tlg8: extra data in Golomb table '" + path + "' at line " + std::to_string(line_number);
-        return false;
-      }
 
       const std::size_t row_index = parsed_rows.size();
       std::istringstream iss(line);
@@ -879,6 +881,7 @@ namespace tlg::v8
       }
 
       parsed_rows.push_back(row_values);
+      parsed_line_numbers.push_back(line_number);
     }
 
     if (parsed_rows.empty())
@@ -889,9 +892,26 @@ namespace tlg::v8
 
     std::vector<GolombRow> expanded_rows;
     const std::size_t parsed_count = parsed_rows.size();
+    if (parsed_count > static_cast<std::size_t>(kGolombRowCount))
+    {
+      const std::size_t offending_row = static_cast<std::size_t>(kGolombRowCount);
+      const std::size_t offending_line = (offending_row < parsed_line_numbers.size())
+                                           ? parsed_line_numbers[offending_row]
+                                           : line_number;
+      err = "tlg8: extra data in Golomb table '" + path + "' at line " + std::to_string(offending_line);
+      return false;
+    }
+
     if (parsed_count == static_cast<std::size_t>(kGolombRowCount))
     {
       expanded_rows = parsed_rows;
+    }
+    else if (parsed_count == kLegacyGolombRowCount)
+    {
+      // 旧形式のテーブルに対応するため、専用のインターリーブ行を追加する
+      expanded_rows = parsed_rows;
+      expanded_rows.push_back(parsed_rows[0]);
+      expanded_rows.push_back(parsed_rows[3]);
     }
     else if (static_cast<std::size_t>(kGolombRowCount) % parsed_count == 0)
     {
@@ -974,6 +994,11 @@ namespace tlg::v8::enc
 
   int golomb_row_index(GolombCodingKind kind, uint32_t component)
   {
+    if (component == kInterleavedComponentIndex)
+    {
+      return (kind == GolombCodingKind::Plain) ? static_cast<int>(kInterleavedPlainRow)
+                                               : static_cast<int>(kInterleavedRunLengthRow);
+    }
     const uint32_t c = (component < 4u) ? component : 3u;
     if (kind == GolombCodingKind::Plain)
     {
@@ -1009,10 +1034,12 @@ namespace tlg::v8::enc
     case 0:
     case 1:
     case 2:
+    case kInterleavedPlainRow:
       return GolombCodingKind::Plain;
     case 3:
     case 4:
     case 5:
+    case kInterleavedRunLengthRow:
       return GolombCodingKind::RunLength;
     default:
       return GolombCodingKind::Plain;
@@ -1032,6 +1059,9 @@ namespace tlg::v8::enc
     case 2:
     case 5:
       return 2;
+    case kInterleavedPlainRow:
+    case kInterleavedRunLengthRow:
+      return kInterleavedComponentIndex;
     default:
       return 0;
     }

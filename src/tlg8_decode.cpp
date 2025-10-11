@@ -332,15 +332,33 @@ namespace tlg::v8
         row_state.blocks.emplace_back(state);
 
         const auto kind = entropy_encoders[entropy_index].kind;
-        for (uint32_t comp = 0; comp < components; ++comp)
+        const bool uses_interleave_filter =
+            (interleave_index == static_cast<uint32_t>(enc::InterleaveFilter::Interleave));
+        const uint32_t used_components =
+            std::min<uint32_t>(components, static_cast<uint32_t>(state.residuals.values.size()));
+        if (uses_interleave_filter && used_components > 0)
         {
-          const int row = enc::golomb_row_index(kind, comp);
+          const int row = enc::golomb_row_index(kind, enc::kInterleavedComponentIndex);
           if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
           {
             err = "tlg8: 不正なゴロム行です";
             return false;
           }
-          row_value_counts[static_cast<std::size_t>(row)] += value_count;
+          row_value_counts[static_cast<std::size_t>(row)] +=
+              static_cast<std::size_t>(value_count) * used_components;
+        }
+        else
+        {
+          for (uint32_t comp = 0; comp < components; ++comp)
+          {
+            const int row = enc::golomb_row_index(kind, comp);
+            if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
+            {
+              err = "tlg8: 不正なゴロム行です";
+              return false;
+            }
+            row_value_counts[static_cast<std::size_t>(row)] += value_count;
+          }
         }
       }
 
@@ -387,9 +405,13 @@ namespace tlg::v8
       for (auto &state : row_state.blocks)
       {
         const auto kind = entropy_encoders[state.entropy_index].kind;
-        for (uint32_t comp = 0; comp < components; ++comp)
+        const bool uses_interleave_filter =
+            (state.interleave_index == static_cast<uint32_t>(enc::InterleaveFilter::Interleave));
+        const uint32_t used_components =
+            std::min<uint32_t>(components, static_cast<uint32_t>(state.residuals.values.size()));
+        if (uses_interleave_filter && used_components > 0)
         {
-          const int row = enc::golomb_row_index(kind, comp);
+          const int row = enc::golomb_row_index(kind, enc::kInterleavedComponentIndex);
           if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
           {
             err = "tlg8: 不正なゴロム行です";
@@ -397,13 +419,43 @@ namespace tlg::v8
           }
           auto &values = row_values[static_cast<std::size_t>(row)];
           auto &offset = row_offsets[static_cast<std::size_t>(row)];
-          if (offset + state.value_count > values.size())
+          const std::size_t combined_count = static_cast<std::size_t>(state.value_count) * used_components;
+          if (offset + combined_count > values.size())
           {
             err = "tlg8: エントロピー列が不足しています";
             return false;
           }
-          std::copy_n(values.data() + offset, state.value_count, state.residuals.values[comp].begin());
-          offset += state.value_count;
+          for (uint32_t comp = 0; comp < used_components; ++comp)
+          {
+            const std::size_t chunk_offset = offset + static_cast<std::size_t>(comp) * state.value_count;
+            std::copy_n(values.data() + chunk_offset,
+                        state.value_count,
+                        state.residuals.values[comp].begin());
+          }
+          for (uint32_t comp = used_components; comp < components; ++comp)
+            std::fill_n(state.residuals.values[comp].begin(), state.value_count, 0);
+          offset += combined_count;
+        }
+        else
+        {
+          for (uint32_t comp = 0; comp < components; ++comp)
+          {
+            const int row = enc::golomb_row_index(kind, comp);
+            if (row < 0 || row >= static_cast<int>(enc::kGolombRowCount))
+            {
+              err = "tlg8: 不正なゴロム行です";
+              return false;
+            }
+            auto &values = row_values[static_cast<std::size_t>(row)];
+            auto &offset = row_offsets[static_cast<std::size_t>(row)];
+            if (offset + state.value_count > values.size())
+            {
+              err = "tlg8: エントロピー列が不足しています";
+              return false;
+            }
+            std::copy_n(values.data() + offset, state.value_count, state.residuals.values[comp].begin());
+            offset += state.value_count;
+          }
         }
         enc::undo_interleave_filter(static_cast<enc::InterleaveFilter>(state.interleave_index),
                                     state.residuals,
