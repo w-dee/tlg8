@@ -19,6 +19,8 @@ namespace
   using tlg::v8::enc::kGolombColumnCount;
   using tlg::v8::enc::kGolombRowCount;
   using tlg::v8::enc::kGolombRowSum;
+  using tlg::v8::enc::adaptation::mix_a_m;
+  using tlg::v8::enc::adaptation::reduce_a;
 
   using GolombRow = std::array<uint16_t, kGolombColumnCount>;
   using GolombTable = golomb_table_counts;
@@ -201,20 +203,6 @@ namespace
       ++assigned;
     }
     return true;
-  }
-
-  inline constexpr int A_SHIFT = 2; // fixed-point fraction
-  inline constexpr int A_BIAS = 1 << (A_SHIFT - 1);
-  inline constexpr int reduce_a(int a)
-  {
-    return (a + A_BIAS) >> A_SHIFT;
-  }
-  inline constexpr int mix_a_m(int a, int m)
-  {
-    if (a < m)
-      return ((m << A_SHIFT) * 3 + a * 5 + 4) >> 3; // mix 3:5
-    else
-      return ((m << A_SHIFT) + a * 3 + 2) >> 2; // mix 25% of m and 75% of a
   }
 
   inline void write_zero_bits(BitWriter &writer, uint32_t count)

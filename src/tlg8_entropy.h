@@ -9,6 +9,25 @@
 
 namespace tlg::v8::enc
 {
+  namespace adaptation
+  {
+    // 適応パラメータを共有するための定数と関数。
+    inline constexpr int kAParameterShift = 2;
+    inline constexpr int kAParameterBias = 1 << (kAParameterShift - 1);
+
+    inline constexpr int reduce_a(int a)
+    {
+      return (a + kAParameterBias) >> kAParameterShift;
+    }
+
+    inline constexpr int mix_a_m(int a, int m)
+    {
+      if (a < m)
+        return ((m << kAParameterShift) * 3 + a * 5 + 4) >> 3; // 3:5 の比率で混合
+      return ((m << kAParameterShift) + a * 3 + 2) >> 2;        // m を 25%、a を 75% 混合
+    }
+  }
+
   // ゴロム符号はプレーン／ランレングスの 2 種類を使用する。
   enum class GolombCodingKind : uint8_t
   {

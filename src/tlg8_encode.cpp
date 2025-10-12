@@ -30,6 +30,8 @@ namespace
   using tlg::v8::enc::kGolombRowCount;
   using tlg::v8::enc::kGolombRowSum;
   using tlg::v8::enc::kNumPredictors;
+  using tlg::v8::enc::adaptation::mix_a_m;
+  using tlg::v8::enc::adaptation::reduce_a;
   using tlg::v8::detail::bitio::BitWriter;
   using tlg::v8::detail::bitio::put_varuint;
   using tlg::v8::detail::bitio::varuint_bits;
@@ -145,19 +147,6 @@ namespace
       76,
       28,
   };
-
-  inline constexpr int A_SHIFT = 2;
-  inline constexpr int A_BIAS = 1 << (A_SHIFT - 1);
-
-  inline int reduce_a(int a)
-  {
-    return (a + A_BIAS) >> A_SHIFT;
-  }
-
-  inline int mix_a_m(int a, int m)
-  {
-    return ((m << A_SHIFT) + a * 3 + 2) >> 2;
-  }
 
   inline uint32_t select_best_k(uint32_t m)
   {
