@@ -94,6 +94,7 @@ namespace tlg::v8::enc
   bool rebuild_golomb_table_from_histogram(const golomb_histogram &histogram);
   const golomb_table_counts &current_golomb_table();
   bool apply_golomb_table(const golomb_table_counts &table);
+  bool is_golomb_table_overridden();
   uint64_t estimate_row_bits(GolombCodingKind kind,
                              uint32_t component,
                              const int16_t *values,

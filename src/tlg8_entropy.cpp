@@ -115,6 +115,7 @@ namespace
 
   std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
   bool g_table_ready = false;
+  bool g_table_overridden = false;
 
   inline constexpr int kGolombGiveUpQ = 16;
 
@@ -801,6 +802,7 @@ namespace tlg::v8
         g_golomb_table = DEFAULT_GOLOMB_TABLE;
         g_table_ready = false;
       }
+      g_table_overridden = false;
       err.clear();
       return true;
     }
@@ -932,6 +934,7 @@ namespace tlg::v8
       g_golomb_table = candidate;
       g_table_ready = false;
     }
+    g_table_overridden = true;
     err.clear();
     return true;
   }
@@ -976,6 +979,11 @@ namespace tlg::v8::enc
       return true;
     }
     return false;
+  }
+
+  bool is_golomb_table_overridden()
+  {
+    return g_table_overridden;
   }
 
   uint64_t estimate_row_bits(GolombCodingKind kind,

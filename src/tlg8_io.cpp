@@ -11,10 +11,15 @@
 
 #include "tlg_io_common.h"
 #include "tlg8_bit_io.h"
+#include "tlg8_entropy.h"
 
 namespace
 {
   using tlg::detail::read_exact;
+
+  constexpr uint8_t kHeaderFlagHasGolombTable = 0x01;
+  constexpr std::size_t kSerializedGolombTableSize =
+      static_cast<std::size_t>(tlg::v8::enc::kGolombRowCount) * tlg::v8::enc::kGolombColumnCount * sizeof(uint16_t);
 
   bool write_bytes(FILE *fp, const void *data, size_t size)
   {
@@ -200,6 +205,21 @@ namespace tlg::v8
   {
     err.clear();
 
+    if (enc::is_golomb_table_overridden())
+    {
+      err = "tlg8: --tlg8-golomb-table オプションはデコード時には使用できません";
+      return false;
+    }
+
+    {
+      std::string reset_err;
+      if (!configure_golomb_table("", reset_err))
+      {
+        err = reset_err.empty() ? "tlg8: ゴロムテーブルを初期化できません" : reset_err;
+        return false;
+      }
+    }
+
     uint8_t colors = 0;
     if (!read_exact(fp, &colors, 1))
     {
@@ -213,6 +233,11 @@ namespace tlg::v8
       err = "tlg8: failed to read header flags";
       return false;
     }
+
+    const bool has_golomb_table = (header_bytes[0] & kHeaderFlagHasGolombTable) != 0;
+    const uint32_t serialized_table_size = static_cast<uint32_t>(header_bytes[1]) |
+                                           (static_cast<uint32_t>(header_bytes[2]) << 8) |
+                                           (static_cast<uint32_t>(header_bytes[3]) << 16);
 
     uint64_t tile_w = 0;
     uint64_t tile_h = 0;
@@ -269,6 +294,50 @@ namespace tlg::v8
     const uint32_t tile_width = static_cast<uint32_t>(tile_w);
     const uint32_t tile_height = static_cast<uint32_t>(tile_h);
     const uint32_t components = colors;
+
+    if (!has_golomb_table)
+    {
+      if (serialized_table_size != 0)
+      {
+        err = "tlg8: ゴロムテーブル長が不正です";
+        return false;
+      }
+    }
+    else
+    {
+      if (serialized_table_size != static_cast<uint32_t>(kSerializedGolombTableSize))
+      {
+        err = "tlg8: ゴロムテーブルのサイズが不正です";
+        return false;
+      }
+      std::array<uint8_t, kSerializedGolombTableSize> table_bytes{};
+      if (!read_exact(fp, table_bytes.data(), table_bytes.size()))
+      {
+        err = "tlg8: ゴロムテーブルを読み取れません";
+        return false;
+      }
+      enc::golomb_table_counts table{};
+      std::size_t offset = 0;
+      for (std::size_t row = 0; row < table.size(); ++row)
+      {
+        uint32_t row_sum = 0;
+        for (std::size_t col = 0; col < table[row].size(); ++col)
+        {
+          const uint16_t low = table_bytes[offset];
+          const uint16_t high = table_bytes[offset + 1];
+          const uint16_t value = static_cast<uint16_t>(low | static_cast<uint16_t>(high << 8));
+          table[row][col] = value;
+          row_sum += value;
+          offset += 2;
+        }
+        if (row_sum != enc::kGolombRowSum)
+        {
+          err = "tlg8: ゴロムテーブルの行合計が不正です";
+          return false;
+        }
+      }
+      (void)enc::apply_golomb_table(table);
+    }
 
     std::vector<uint8_t> decoded(static_cast<size_t>(total_bytes));
     std::vector<uint8_t> tile_buffer;
@@ -408,7 +477,13 @@ namespace tlg::v8
         return false;
       }
 
-      uint8_t meta[5] = {0x00, 0x00, 0x00, 0x00, 0x08};
+      constexpr uint32_t kSerializedGolombTableSizeU32 = static_cast<uint32_t>(kSerializedGolombTableSize);
+      uint8_t meta[5] = {
+          kHeaderFlagHasGolombTable,
+          static_cast<uint8_t>(kSerializedGolombTableSizeU32 & 0xFFu),
+          static_cast<uint8_t>((kSerializedGolombTableSizeU32 >> 8) & 0xFFu),
+          static_cast<uint8_t>((kSerializedGolombTableSizeU32 >> 16) & 0xFFu),
+          0x08};
       if (!write_bytes(fp, meta, sizeof(meta)))
       {
         err = "tlg8: failed to write header flags";
@@ -427,6 +502,23 @@ namespace tlg::v8
           !write_u64le(fp, src.width) || !write_u64le(fp, src.height))
       {
         err = "tlg8: failed to write dimensions";
+        return false;
+      }
+
+      const auto &golomb_table = current_golomb_table();
+      std::array<uint8_t, kSerializedGolombTableSize> table_bytes{};
+      std::size_t table_offset = 0;
+      for (const auto &row : golomb_table)
+      {
+        for (uint16_t value : row)
+        {
+          table_bytes[table_offset++] = static_cast<uint8_t>(value & 0xFFu);
+          table_bytes[table_offset++] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+        }
+      }
+      if (!write_bytes(fp, table_bytes.data(), table_bytes.size()))
+      {
+        err = "tlg8: ゴロムテーブルを書き出せません";
         return false;
       }
 
