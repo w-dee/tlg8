@@ -362,7 +362,7 @@ namespace
         while (index < count && values[index] != 0)
           ++index;
         const uint32_t nonzero_count = index - start;
-        bits += gamma_bits(nonzero_count);
+        bits += run_length_bits(nonzero_count);
         for (uint32_t j = start; j < index; ++j)
         {
           int64_t mapped = (values[j] >= 0) ? (static_cast<int64_t>(2) * values[j])
@@ -467,7 +467,7 @@ namespace
         while (index < count && values[index] != 0)
           ++index;
         const uint32_t nonzero_count = index - start;
-        put_gamma(writer, nonzero_count);
+        put_run_length(writer, nonzero_count);
         for (uint32_t j = start; j < index; ++j)
         {
           int64_t mapped = (values[j] >= 0) ? (static_cast<int64_t>(2) * values[j])
@@ -651,8 +651,8 @@ namespace
         continue;
       }
 
-      uint32_t run = 0;
-      if (!read_gamma(reader, run) || run == 0)
+      uint32_t run = read_run_length(reader);
+      if (run == 0)
         return false;
       if (produced + run > expected_count)
         return false;
