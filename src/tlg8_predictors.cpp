@@ -17,62 +17,64 @@ namespace
     return static_cast<uint8_t>(a + b - c);
   }
 
-  uint8_t f0(uint8_t a, uint8_t b, uint8_t c, uint8_t d) noexcept
+  uint8_t f0(uint8_t a, uint8_t b, uint8_t c, [[maybe_unused]] uint8_t d) noexcept
   {
-    (void)d;
     return med(a, b, c);
   }
 
-  uint8_t f1(uint8_t a, uint8_t b, uint8_t c, uint8_t d) noexcept
+  uint8_t f1(uint8_t a,
+             [[maybe_unused]] uint8_t b,
+             uint8_t c,
+             [[maybe_unused]] uint8_t d) noexcept
   {
-    (void)b;
-    (void)d;
     return static_cast<uint8_t>((a + c + 1) >> 1);
   }
 
-  uint8_t f2(uint8_t a, uint8_t b, uint8_t c, uint8_t d) noexcept
+  uint8_t f2([[maybe_unused]] uint8_t a,
+             uint8_t b,
+             uint8_t c,
+             [[maybe_unused]] uint8_t d) noexcept
   {
-    (void)a;
-    (void)d;
     return static_cast<uint8_t>((b + c + 1) >> 1);
   }
 
-  uint8_t f3(uint8_t a, uint8_t b, uint8_t c, uint8_t d) noexcept
+  uint8_t f3([[maybe_unused]] uint8_t a,
+             uint8_t b,
+             [[maybe_unused]] uint8_t c,
+             uint8_t d) noexcept
   {
-    (void)a;
-    (void)c;
     return static_cast<uint8_t>((b + d + 1) >> 1);
   }
 
-  uint8_t f4(uint8_t a, uint8_t b, uint8_t c, uint8_t d) noexcept
+  uint8_t f4(uint8_t a,
+             [[maybe_unused]] uint8_t b,
+             [[maybe_unused]] uint8_t c,
+             [[maybe_unused]] uint8_t d) noexcept
   {
-    (void)b;
-    (void)c;
-    (void)d;
     return a;
   }
 
-  uint8_t f5(uint8_t a, uint8_t b, uint8_t c, uint8_t d) noexcept
+  uint8_t f5([[maybe_unused]] uint8_t a,
+             uint8_t b,
+             [[maybe_unused]] uint8_t c,
+             [[maybe_unused]] uint8_t d) noexcept
   {
-    (void)a;
-    (void)c;
-    (void)d;
     return b;
   }
 
-  uint8_t f6(uint8_t a, uint8_t b, uint8_t c, uint8_t d) noexcept
+  uint8_t f6([[maybe_unused]] uint8_t a,
+             [[maybe_unused]] uint8_t b,
+             uint8_t c,
+             [[maybe_unused]] uint8_t d) noexcept
   {
-    (void)a;
-    (void)b;
-    (void)d;
     return c;
   }
 
-  uint8_t f7(uint8_t a, uint8_t b, uint8_t c, uint8_t d) noexcept
+  uint8_t f7([[maybe_unused]] uint8_t a,
+             [[maybe_unused]] uint8_t b,
+             [[maybe_unused]] uint8_t c,
+             uint8_t d) noexcept
   {
-    (void)a;
-    (void)b;
-    (void)c;
     return d;
   }
 

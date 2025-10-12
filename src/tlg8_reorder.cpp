@@ -432,6 +432,31 @@ namespace
     }
     return index;
   }
+
+  void apply_hilbert_sequence(tlg::v8::enc::component_colors &colors,
+                              uint32_t components,
+                              uint32_t value_count,
+                              const std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels> &sequence,
+                              bool to_hilbert)
+  {
+    // 並べ替え元と並べ替え先の両方で共通利用する一時領域。
+    std::array<int16_t, tlg::v8::enc::kMaxBlockPixels> temp{};
+    const uint32_t used_components = std::min<uint32_t>(components, colors.values.size());
+    for (uint32_t comp = 0; comp < used_components; ++comp)
+    {
+      auto &component_values = colors.values[comp];
+      for (uint32_t i = 0; i < value_count; ++i)
+      {
+        const uint32_t from_index = to_hilbert ? sequence[i] : i;
+        temp[i] = component_values[from_index];
+      }
+      for (uint32_t i = 0; i < value_count; ++i)
+      {
+        const uint32_t to_index = to_hilbert ? i : sequence[i];
+        component_values[to_index] = temp[i];
+      }
+    }
+  }
 }
 
 namespace tlg::v8::enc
@@ -446,16 +471,7 @@ namespace tlg::v8::enc
     const uint32_t sequence_size = build_hilbert_sequence(block_w, block_h, sequence);
     if (sequence_size != value_count)
       return;
-
-    std::array<int16_t, kMaxBlockPixels> temp{};
-    const uint32_t used_components = std::min<uint32_t>(components, colors.values.size());
-    for (uint32_t comp = 0; comp < used_components; ++comp)
-    {
-      for (uint32_t i = 0; i < value_count; ++i)
-        temp[i] = colors.values[comp][sequence[i]];
-      for (uint32_t i = 0; i < value_count; ++i)
-        colors.values[comp][i] = temp[i];
-    }
+    apply_hilbert_sequence(colors, components, value_count, sequence, true);
   }
 
   void reorder_from_hilbert(component_colors &colors, uint32_t components, uint32_t block_w, uint32_t block_h)
@@ -468,15 +484,6 @@ namespace tlg::v8::enc
     const uint32_t sequence_size = build_hilbert_sequence(block_w, block_h, sequence);
     if (sequence_size != value_count)
       return;
-
-    std::array<int16_t, kMaxBlockPixels> temp{};
-    const uint32_t used_components = std::min<uint32_t>(components, colors.values.size());
-    for (uint32_t comp = 0; comp < used_components; ++comp)
-    {
-      for (uint32_t i = 0; i < value_count; ++i)
-        temp[i] = colors.values[comp][i];
-      for (uint32_t i = 0; i < value_count; ++i)
-        colors.values[comp][sequence[i]] = temp[i];
-    }
+    apply_hilbert_sequence(colors, components, value_count, sequence, false);
   }
 }

@@ -1,10 +1,12 @@
 #include "tlg8_io.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 #include "tlg_io_common.h"
@@ -19,50 +21,54 @@ namespace
     return std::fwrite(data, 1, size, fp) == size;
   }
 
+  template <typename T>
+  bool write_little_endian(FILE *fp, T value)
+  {
+    static_assert(std::is_integral_v<T>, "write_little_endian は整数型専用です");
+    using UnsignedT = std::make_unsigned_t<T>;
+    std::array<uint8_t, sizeof(T)> buf{};
+    UnsignedT v = static_cast<UnsignedT>(value);
+    for (std::size_t i = 0; i < buf.size(); ++i)
+      buf[i] = static_cast<uint8_t>((v >> (i * 8)) & 0xffu);
+    return write_bytes(fp, buf.data(), buf.size());
+  }
+
+  template <typename T>
+  bool read_little_endian(FILE *fp, T &value)
+  {
+    static_assert(std::is_integral_v<T>, "read_little_endian は整数型専用です");
+    std::array<uint8_t, sizeof(T)> buf{};
+    if (!read_exact(fp, buf.data(), buf.size()))
+      return false;
+    using UnsignedT = std::make_unsigned_t<T>;
+    UnsignedT v = 0;
+    for (std::size_t i = buf.size(); i-- > 0;)
+    {
+      v <<= 8;
+      v |= static_cast<UnsignedT>(buf[i]);
+    }
+    value = static_cast<T>(v);
+    return true;
+  }
+
   bool write_u32le(FILE *fp, uint32_t value)
   {
-    uint8_t buf[4];
-    for (int i = 0; i < 4; ++i)
-      buf[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xffu);
-    return write_bytes(fp, buf, sizeof(buf));
+    return write_little_endian(fp, value);
   }
 
   bool write_u64le(FILE *fp, uint64_t value)
   {
-    uint8_t buf[8];
-    for (int i = 0; i < 8; ++i)
-      buf[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xffu);
-    return write_bytes(fp, buf, sizeof(buf));
+    return write_little_endian(fp, value);
   }
 
   bool read_u32le(FILE *fp, uint32_t &value)
   {
-    uint8_t buf[4];
-    if (!read_exact(fp, buf, sizeof(buf)))
-      return false;
-    uint32_t v = 0;
-    for (int i = 3; i >= 0; --i)
-    {
-      v <<= 8;
-      v |= static_cast<uint32_t>(buf[i]);
-    }
-    value = v;
-    return true;
+    return read_little_endian(fp, value);
   }
 
   bool read_u64le(FILE *fp, uint64_t &value)
   {
-    uint8_t buf[8];
-    if (!read_exact(fp, buf, sizeof(buf)))
-      return false;
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; --i)
-    {
-      v <<= 8;
-      v |= static_cast<uint64_t>(buf[i]);
-    }
-    value = v;
-    return true;
+    return read_little_endian(fp, value);
   }
 }
 

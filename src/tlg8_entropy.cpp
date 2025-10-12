@@ -225,6 +225,44 @@ namespace
     return zeros;
   }
 
+  inline uint32_t map_plain_value(int16_t value)
+  {
+    if (value >= 0)
+      return static_cast<uint32_t>(value) * 2u;
+    const int32_t abs_value = -static_cast<int32_t>(value);
+    return static_cast<uint32_t>(abs_value * 2 - 1);
+  }
+
+  inline uint32_t map_run_length_value(int16_t value)
+  {
+    const uint32_t mapped = map_plain_value(value);
+    return (mapped > 0) ? (mapped - 1u) : 0u;
+  }
+
+  inline uint32_t reduce_index(int a)
+  {
+    return static_cast<uint32_t>(reduce_a(a));
+  }
+
+  template <typename DirectHandler, typename GolombHandler>
+  inline void process_golomb_value(uint32_t m,
+                                   int k,
+                                   DirectHandler &&handle_direct,
+                                   GolombHandler &&handle_regular)
+  {
+    const uint32_t q = (k > 0) ? (m >> k) : m;
+    if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
+    {
+      const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
+      const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
+      handle_direct(base, direct_value);
+    }
+    else
+    {
+      handle_regular(q, k, m);
+    }
+  }
+
   inline void write_bits(BitWriter &writer, uint32_t value, unsigned count)
   {
     if (count == 0)
@@ -296,18 +334,16 @@ namespace
     int a = 0;
     for (uint32_t i = 0; i < count; ++i)
     {
-      const int e = static_cast<int>(values[i]);
-      const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
-      const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
-      const uint32_t q = (k > 0) ? (m >> k) : m;
-      if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
-      {
-        const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
-        const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
-        bits += static_cast<uint64_t>(base) + gamma_bits(direct_value);
-      }
-      else
-        bits += q + 1u + static_cast<uint32_t>(k);
+      const uint32_t m = map_plain_value(values[i]);
+      const int k = g_bit_length_table[reduce_index(a)][row];
+      process_golomb_value(
+          m, k,
+          [&](uint32_t base, uint32_t direct_value) {
+            bits += static_cast<uint64_t>(base) + gamma_bits(direct_value);
+          },
+          [&](uint32_t q, int k_bits, uint32_t) {
+            bits += q + 1u + static_cast<uint32_t>(k_bits);
+          });
       a = mix_a_m(a, m);
     }
     return bits;
@@ -345,22 +381,16 @@ namespace
         bits += run_length_bits(nonzero_count);
         for (uint32_t j = start; j < index; ++j)
         {
-          int64_t mapped = (values[j] >= 0) ? (static_cast<int64_t>(2) * values[j])
-                                            : (static_cast<int64_t>(-2) * values[j] - 1);
-          mapped -= 1;
-          if (mapped < 0)
-            mapped = 0;
-          const uint32_t m = static_cast<uint32_t>(mapped);
-          const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
-          const uint32_t q = (k > 0) ? (m >> k) : m;
-          if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
-          {
-            const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
-            const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
-            bits += static_cast<uint64_t>(base) + gamma_bits(direct_value);
-          }
-          else
-            bits += q + 1u + static_cast<uint32_t>(k);
+          const uint32_t m = map_run_length_value(values[j]);
+          const int k = g_bit_length_table[reduce_index(a)][row];
+          process_golomb_value(
+              m, k,
+              [&](uint32_t base, uint32_t direct_value) {
+                bits += static_cast<uint64_t>(base) + gamma_bits(direct_value);
+              },
+              [&](uint32_t q, int k_bits, uint32_t) {
+                bits += q + 1u + static_cast<uint32_t>(k_bits);
+              });
           a = mix_a_m(a, m);
         }
       }
@@ -393,28 +423,23 @@ namespace
     int a = 0;
     for (uint32_t i = 0; i < count; ++i)
     {
-      const int e = static_cast<int>(values[i]);
-      const uint32_t m = (e >= 0) ? static_cast<uint32_t>(2 * e) : static_cast<uint32_t>(-2 * e - 1);
-      const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
-      const uint32_t q = (k > 0) ? (m >> k) : m;
-      // printf("P e=%d q=%d m=%d, k=%d\n", (int)e, (int)(kGolombGiveUpQ > q ? q : kGolombGiveUpQ), (int)m, (int)k);
-      if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
-      {
-        const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
-        write_zero_bits(writer, base);
-        const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
-        put_gamma(writer, direct_value);
-      }
-      else
-      {
-        write_zero_bits(writer, q);
-        writer.put_upto8(1, 1);
-        if (k)
-        {
-          const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
-          write_bits(writer, m & mask, static_cast<unsigned>(k));
-        }
-      }
+      const uint32_t m = map_plain_value(values[i]);
+      const int k = g_bit_length_table[reduce_index(a)][row];
+      process_golomb_value(
+          m, k,
+          [&](uint32_t base, uint32_t direct_value) {
+            write_zero_bits(writer, base);
+            put_gamma(writer, direct_value);
+          },
+          [&](uint32_t q, int k_bits, uint32_t value) {
+            write_zero_bits(writer, q);
+            writer.put_upto8(1, 1);
+            if (k_bits)
+            {
+              const uint32_t mask = (static_cast<uint32_t>(1u) << k_bits) - 1u;
+              write_bits(writer, value & mask, static_cast<unsigned>(k_bits));
+            }
+          });
       a = mix_a_m(a, m);
     }
     return true;
@@ -450,32 +475,23 @@ namespace
         put_run_length(writer, nonzero_count);
         for (uint32_t j = start; j < index; ++j)
         {
-          int64_t mapped = (values[j] >= 0) ? (static_cast<int64_t>(2) * values[j])
-                                            : (static_cast<int64_t>(-2) * values[j] - 1);
-          mapped -= 1; // 0 を符号化する必要はないので -1 する
-          if (mapped < 0)
-            mapped = 0;
-          const uint32_t m = static_cast<uint32_t>(mapped);
-          const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
-          const uint32_t q = (k > 0) ? (m >> k) : m;
-          // printf("R e=%d q=%d m=%d k=%d\n", (int)values[j], (int)(kGolombGiveUpQ > q ? q : kGolombGiveUpQ), (int)m, (int)k);
-          if (q >= static_cast<uint32_t>(kGolombGiveUpQ))
-          {
-            const uint32_t base = static_cast<uint32_t>(kGolombGiveUpQ);
-            write_zero_bits(writer, base);
-            const uint32_t direct_value = (m >= base) ? (m - base + 1u) : 1u;
-            put_gamma(writer, direct_value);
-          }
-          else
-          {
-            write_zero_bits(writer, q);
-            writer.put_upto8(1, 1);
-            if (k)
-            {
-              const uint32_t mask = (static_cast<uint32_t>(1u) << k) - 1u;
-              write_bits(writer, m & mask, static_cast<unsigned>(k));
-            }
-          }
+          const uint32_t m = map_run_length_value(values[j]);
+          const int k = g_bit_length_table[reduce_index(a)][row];
+          process_golomb_value(
+              m, k,
+              [&](uint32_t base, uint32_t direct_value) {
+                write_zero_bits(writer, base);
+                put_gamma(writer, direct_value);
+              },
+              [&](uint32_t q, int k_bits, uint32_t value) {
+                write_zero_bits(writer, q);
+                writer.put_upto8(1, 1);
+                if (k_bits)
+                {
+                  const uint32_t mask = (static_cast<uint32_t>(1u) << k_bits) - 1u;
+                  write_bits(writer, value & mask, static_cast<unsigned>(k_bits));
+                }
+              });
           a = mix_a_m(a, m);
         }
       }
