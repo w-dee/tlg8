@@ -36,6 +36,7 @@ static void print_usage()
             << " [--tlg8-write-residuals-bmp=<path>]"
             << " [--tlg8-write-residuals-order=predictor|color|hilbert]"
             << " [--tlg8-write-residuals-emphasis=<F>]"
+            << " [--tlg8-dump-golomb-prediction=<path>]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
@@ -213,6 +214,16 @@ int main(int argc, char **argv)
         std::cerr << "Invalid --tlg8-write-residuals-order: " << order << "\n";
         return 2;
       }
+    }
+    else if (arg.rfind("--tlg8-dump-golomb-prediction=", 0) == 0)
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg8-dump-golomb-prediction option\n";
+        return 2;
+      }
+      tlgopt.tlg8_dump_golomb_prediction_path = arg.substr(eq + 1);
     }
     else if ((arg.rfind("--tlg8-write-residuals-emphasis=", 0) == 0) ||
              (arg.rfind("-tlg8-write-residuals-emphasis=", 0) == 0))

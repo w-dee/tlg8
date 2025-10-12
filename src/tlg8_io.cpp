@@ -407,6 +407,7 @@ namespace tlg::v8
                    int desired_colors,
                    const std::string &dump_residuals_path,
                    TlgOptions::DumpResidualsOrder dump_residuals_order,
+                   const std::string &dump_golomb_prediction_path,
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
@@ -442,6 +443,27 @@ namespace tlg::v8
         }
         dump_file.reset(dump_fp);
       }
+
+      std::unique_ptr<FILE, FileCloser> golomb_prediction_file;
+      if (!dump_golomb_prediction_path.empty())
+      {
+        FILE *prediction_fp = std::fopen(dump_golomb_prediction_path.c_str(), "w");
+        if (!prediction_fp)
+        {
+          err = "tlg8: ゴロム予測ダンプファイルを開けません: " + dump_golomb_prediction_path;
+          return false;
+        }
+        golomb_prediction_file.reset(prediction_fp);
+      }
+
+      tlg::v8::enc::set_golomb_prediction_dump_file(golomb_prediction_file.get());
+      struct PredictionDumpGuard
+      {
+        ~PredictionDumpGuard()
+        {
+          tlg::v8::enc::set_golomb_prediction_dump_file(nullptr);
+        }
+      } prediction_dump_guard;
 
       if (src.width == 0 || src.height == 0)
       {

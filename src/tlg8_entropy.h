@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 #include "tlg8_block.h"
@@ -90,6 +91,9 @@ namespace tlg::v8::enc
                     uint32_t value_count,
                     component_colors &out,
                     std::string &err);
+
+  // ゴロム予測ダンプ用のファイルポインタを設定する。
+  void set_golomb_prediction_dump_file(FILE *fp);
 
   bool rebuild_golomb_table_from_histogram(const golomb_histogram &histogram);
   const golomb_table_counts &current_golomb_table();

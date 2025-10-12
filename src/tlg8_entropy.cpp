@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -116,6 +117,7 @@ namespace
   std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
   bool g_table_ready = false;
   bool g_table_overridden = false;
+  FILE *g_golomb_prediction_dump_file = nullptr;
 
   inline constexpr int kGolombGiveUpQ = 16;
 
@@ -243,6 +245,16 @@ namespace
   inline uint32_t reduce_index(int a)
   {
     return static_cast<uint32_t>(reduce_a(a));
+  }
+
+  inline constexpr int bit_width(uint32_t v)
+  {
+    if (v == 0)
+      return 0;
+    uint32_t width = 1u;
+    while (width <= (v >> 1))
+      width <<= 1u;
+    return static_cast<int>(width);
   }
 
   template <typename DirectHandler, typename GolombHandler>
@@ -426,6 +438,13 @@ namespace
     {
       const uint32_t m = map_plain_value(values[i]);
       const int k = g_bit_length_table[reduce_index(a)][row];
+      if (g_golomb_prediction_dump_file)
+        std::fprintf(g_golomb_prediction_dump_file,
+                     "%d,%d,%d,%d\n",
+                     row,
+                     static_cast<int>(reduce_index(a)),
+                     bit_width(m),
+                     static_cast<int>(m));
       process_golomb_value(
           m, k,
           [&](uint32_t base, uint32_t direct_value) {
@@ -478,6 +497,13 @@ namespace
         {
           const uint32_t m = map_run_length_value(values[j]);
           const int k = g_bit_length_table[reduce_index(a)][row];
+          if (g_golomb_prediction_dump_file)
+            std::fprintf(g_golomb_prediction_dump_file,
+                         "%d,%d,%d,%d\n",
+                         row,
+                         static_cast<int>(reduce_index(a)),
+                         bit_width(m),
+                         static_cast<int>(m));
           process_golomb_value(
               m, k,
               [&](uint32_t base, uint32_t direct_value) {
@@ -942,6 +968,11 @@ namespace tlg::v8
 
 namespace tlg::v8::enc
 {
+  void set_golomb_prediction_dump_file(FILE *fp)
+  {
+    g_golomb_prediction_dump_file = fp;
+  }
+
   bool rebuild_golomb_table_from_histogram(const golomb_histogram &histogram)
   {
     GolombTable candidate = g_golomb_table;
