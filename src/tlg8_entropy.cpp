@@ -249,13 +249,20 @@ namespace
 
   inline constexpr int bit_width(uint32_t v)
   {
-    if (v == 0)
-      return 0;
-    uint32_t width = 1u;
-    while (width <= (v >> 1))
-      width <<= 1u;
-    return static_cast<int>(width);
+    int n = 0;
+    while (v != 0)
+    {
+      v >>= 1;
+      ++n;
+    }
+    return n;
   }
+
+  static_assert(0 == bit_width(0));
+  static_assert(1 == bit_width(1));
+  static_assert(2 == bit_width(2));
+  static_assert(2 == bit_width(3));
+  static_assert(3 == bit_width(4));
 
   template <typename DirectHandler, typename GolombHandler>
   inline void process_golomb_value(uint32_t m,
@@ -351,10 +358,12 @@ namespace
       const int k = g_bit_length_table[reduce_index(a)][row];
       process_golomb_value(
           m, k,
-          [&](uint32_t base, uint32_t direct_value) {
+          [&](uint32_t base, uint32_t direct_value)
+          {
             bits += static_cast<uint64_t>(base) + gamma_bits(direct_value);
           },
-          [&](uint32_t q, int k_bits, uint32_t) {
+          [&](uint32_t q, int k_bits, uint32_t)
+          {
             bits += q + 1u + static_cast<uint32_t>(k_bits);
           });
       a = mix_a_m(a, m);
@@ -398,10 +407,12 @@ namespace
           const int k = g_bit_length_table[reduce_index(a)][row];
           process_golomb_value(
               m, k,
-              [&](uint32_t base, uint32_t direct_value) {
+              [&](uint32_t base, uint32_t direct_value)
+              {
                 bits += static_cast<uint64_t>(base) + gamma_bits(direct_value);
               },
-              [&](uint32_t q, int k_bits, uint32_t) {
+              [&](uint32_t q, int k_bits, uint32_t)
+              {
                 bits += q + 1u + static_cast<uint32_t>(k_bits);
               });
           a = mix_a_m(a, m);
@@ -447,11 +458,13 @@ namespace
                      static_cast<int>(m));
       process_golomb_value(
           m, k,
-          [&](uint32_t base, uint32_t direct_value) {
+          [&](uint32_t base, uint32_t direct_value)
+          {
             write_zero_bits(writer, base);
             put_gamma(writer, direct_value);
           },
-          [&](uint32_t q, int k_bits, uint32_t value) {
+          [&](uint32_t q, int k_bits, uint32_t value)
+          {
             write_zero_bits(writer, q);
             writer.put_upto8(1, 1);
             if (k_bits)
@@ -506,11 +519,13 @@ namespace
                          static_cast<int>(m));
           process_golomb_value(
               m, k,
-              [&](uint32_t base, uint32_t direct_value) {
+              [&](uint32_t base, uint32_t direct_value)
+              {
                 write_zero_bits(writer, base);
                 put_gamma(writer, direct_value);
               },
-              [&](uint32_t q, int k_bits, uint32_t value) {
+              [&](uint32_t q, int k_bits, uint32_t value)
+              {
                 write_zero_bits(writer, q);
                 writer.put_upto8(1, 1);
                 if (k_bits)
