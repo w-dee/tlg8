@@ -44,14 +44,14 @@ namespace
   constexpr ParsedGolombTable parse_default_golomb_table()
   {
     constexpr char data[] = R"(
-0 4 5 11 18 102 258 497 129
-2 3 7 12 115 84 244 438 119
-3 2 3 10 88 94 265 431 128
-3 4 3 7 25 94 245 506 137
-3 3 5 16 63 95 263 461 115
-3 3 6 8 99 56 247 458 144
-4 2 3 16 18 110 244 504 123
-4 3 4 14 25 102 226 510 136
+0 5 3 12 18 98 257 496 135
+3 2 5 10 123 87 244 436 114
+3 2 2 12 96 86 264 430 129
+2 4 3 11 17 97 241 509 140
+2 2 1 15 68 94 269 456 117
+2 4 8 4 101 46 244 460 155
+5 2 6 9 27 107 248 508 112
+2 4 3 19 19 98 228 512 139
         )";
 
     ParsedGolombTable result{};
@@ -896,8 +896,8 @@ namespace tlg::v8
     {
       const std::size_t offending_row = static_cast<std::size_t>(kGolombRowCount);
       const std::size_t offending_line = (offending_row < parsed_line_numbers.size())
-                                           ? parsed_line_numbers[offending_row]
-                                           : line_number;
+                                             ? parsed_line_numbers[offending_row]
+                                             : line_number;
       err = "tlg8: extra data in Golomb table '" + path + "' at line " + std::to_string(offending_line);
       return false;
     }
