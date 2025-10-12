@@ -72,7 +72,6 @@ namespace tlg::v8
   {
     constexpr uint64_t TILE_WIDTH = 8192;
     constexpr uint64_t TILE_HEIGHT = 80;
-    constexpr uint8_t HEADER_FLAG_ADAPTIVE_UPDATE = 0x01;
 
     bool copy_pixels_to_buffer(const PixelBuffer &src,
                                int desired_colors,
@@ -175,7 +174,6 @@ namespace tlg::v8
                        uint32_t origin_x,
                        uint32_t origin_y,
                        uint32_t image_width,
-                       bool golomb_adaptive_update,
                        std::vector<uint8_t> &decoded,
                        std::string &err);
 
@@ -256,8 +254,6 @@ namespace tlg::v8
     std::vector<uint8_t> decoded(static_cast<size_t>(total_bytes));
     std::vector<uint8_t> tile_buffer;
 
-    const bool golomb_adaptive_update = (header_bytes[0] & HEADER_FLAG_ADAPTIVE_UPDATE) != 0;
-
     for (uint32_t origin_y = 0; origin_y < height; origin_y += tile_height)
     {
       const uint32_t tile_h = std::min<uint32_t>(tile_height, height - origin_y);
@@ -285,7 +281,6 @@ namespace tlg::v8
                              origin_x,
                              origin_y,
                              width,
-                             golomb_adaptive_update,
                              decoded,
                              err))
           return false;
@@ -317,7 +312,6 @@ namespace tlg::v8
                        PixelBuffer *residual_bitmap,
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
-                       bool golomb_adaptive_update,
                        std::string &err);
 
     bool write_raw(FILE *fp,
@@ -328,7 +322,6 @@ namespace tlg::v8
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
-                   bool golomb_adaptive_update,
                    std::string &err,
                    uint64_t *out_entropy_bits)
     {
@@ -396,9 +389,7 @@ namespace tlg::v8
         return false;
       }
 
-      uint8_t meta[5] = {HEADER_FLAG_ADAPTIVE_UPDATE, 0x00, 0x00, 0x00, 0x08};
-      if (!golomb_adaptive_update)
-        meta[0] &= static_cast<uint8_t>(~HEADER_FLAG_ADAPTIVE_UPDATE);
+      uint8_t meta[5] = {0x00, 0x00, 0x00, 0x00, 0x08};
       if (!write_bytes(fp, meta, sizeof(meta)))
       {
         err = "tlg8: failed to write header flags";
@@ -479,7 +470,6 @@ namespace tlg::v8
                                residual_bitmap_ptr,
                                effective_bitmap_order,
                                residual_bitmap_emphasis,
-                               golomb_adaptive_update,
                                err))
             return false;
           if (!writer.align_to_u32_zero() || !writer.finish())

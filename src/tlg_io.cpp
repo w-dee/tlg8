@@ -144,7 +144,6 @@ bool save_tlg(const std::string &path,
                                  opt.tlg8_write_residuals_bmp_path,
                                  opt.tlg8_write_residuals_order,
                                  opt.tlg8_write_residuals_emphasis,
-                                 opt.tlg8_golomb_adaptive_update,
                                  err,
                                  out_entropy_bits);
   }

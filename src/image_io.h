@@ -75,7 +75,6 @@ struct TlgOptions
   DumpResidualsOrder tlg8_write_residuals_order = DumpResidualsOrder::AfterPredictor;
   double tlg8_write_residuals_emphasis = 1.0; // 残差ビットマップの強調係数
   bool print_entropy_bits = false;     // エントロピー符号化で使用した正味ビット数を表示するか
-  bool tlg8_golomb_adaptive_update = true; // TLG8 ゴロムテーブルの動的更新を有効化するか
 };
 
 bool load_tlg(const std::string &path, PixelBuffer &out, std::string &err);
