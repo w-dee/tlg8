@@ -73,95 +73,108 @@ namespace tlg::v8
     constexpr uint64_t TILE_WIDTH = 8192;
     constexpr uint64_t TILE_HEIGHT = 80;
 
-    bool copy_pixels_to_buffer(const PixelBuffer &src,
-                               int desired_colors,
-                               std::vector<uint8_t> &out_data,
-                               std::string &err)
+    // コピー処理の前提条件を検証するヘルパー。
+    bool validate_copy_params(const PixelBuffer &src,
+                              int desired_colors,
+                              std::string &err,
+                              uint64_t &pixel_count,
+                              size_t &dst_required)
     {
       if (!(src.channels == 3 || src.channels == 4))
       {
         err = "tlg8: unsupported source channels";
         return false;
       }
-      const uint64_t pixel_count = static_cast<uint64_t>(src.width) * src.height;
+
+      pixel_count = static_cast<uint64_t>(src.width) * src.height;
       if (pixel_count == 0)
       {
         err = "tlg8: empty image";
         return false;
       }
-      if (pixel_count > std::numeric_limits<size_t>::max())
-      {
-        err = "tlg8: image too large";
-        return false;
-      }
+
       if (!(desired_colors == 3 || desired_colors == 4))
       {
         err = "tlg8: unsupported desired colors";
         return false;
       }
-      if (src.channels != 0 && pixel_count > std::numeric_limits<size_t>::max() / src.channels)
+
+      if (pixel_count > std::numeric_limits<size_t>::max())
       {
         err = "tlg8: image too large";
         return false;
       }
-      const size_t src_min = static_cast<size_t>(pixel_count) * src.channels;
-      if (src.data.size() < src_min)
+
+      if (pixel_count > std::numeric_limits<size_t>::max() / src.channels)
+      {
+        err = "tlg8: image too large";
+        return false;
+      }
+
+      const size_t src_required = static_cast<size_t>(pixel_count) * src.channels;
+      if (src.data.size() < src_required)
       {
         err = "tlg8: source buffer too small";
         return false;
       }
-      const uint64_t total_bytes = pixel_count * static_cast<uint64_t>(desired_colors);
-      if (total_bytes > std::numeric_limits<size_t>::max())
+
+      const uint64_t dst_bytes = pixel_count * static_cast<uint64_t>(desired_colors);
+      if (dst_bytes > std::numeric_limits<size_t>::max())
       {
         err = "tlg8: image too large";
         return false;
       }
-      out_data.resize(static_cast<size_t>(total_bytes));
-      size_t dst_index = 0;
+
+      dst_required = static_cast<size_t>(dst_bytes);
+      return true;
+    }
+
+    bool copy_pixels_to_buffer(const PixelBuffer &src,
+                               int desired_colors,
+                               std::vector<uint8_t> &out_data,
+                               std::string &err)
+    {
+      uint64_t pixel_count = 0;
+      size_t dst_required = 0;
+      if (!validate_copy_params(src, desired_colors, err, pixel_count, dst_required))
+        return false;
+
+      out_data.resize(dst_required);
+
       const uint8_t *src_ptr = src.data.data();
+      uint8_t *dst_ptr = out_data.data();
+      const uint32_t src_channels = src.channels;
+      const uint32_t desired = static_cast<uint32_t>(desired_colors);
+
+      if (desired == src_channels)
+      {
+        std::copy_n(src_ptr, dst_required, dst_ptr);
+        return true;
+      }
+
+      if (desired == 3)
+      {
+        for (uint64_t i = 0; i < pixel_count; ++i)
+        {
+          const uint8_t *rgba = src_ptr + i * src_channels;
+          // ARGB から RGB へ変換 (アルファは破棄)
+          dst_ptr[0] = rgba[1];
+          dst_ptr[1] = rgba[2];
+          dst_ptr[2] = rgba[3];
+          dst_ptr += 3;
+        }
+        return true;
+      }
+
       for (uint64_t i = 0; i < pixel_count; ++i)
       {
-        if (desired_colors == 3)
-        {
-          uint8_t r, g, b;
-          if (src.channels == 4)
-          {
-            r = src_ptr[i * 4 + 1];
-            g = src_ptr[i * 4 + 2];
-            b = src_ptr[i * 4 + 3];
-          }
-          else
-          {
-            r = src_ptr[i * 3 + 0];
-            g = src_ptr[i * 3 + 1];
-            b = src_ptr[i * 3 + 2];
-          }
-          out_data[dst_index++] = r;
-          out_data[dst_index++] = g;
-          out_data[dst_index++] = b;
-        }
-        else
-        {
-          uint8_t a, r, g, b;
-          if (src.channels == 4)
-          {
-            a = src_ptr[i * 4 + 0];
-            r = src_ptr[i * 4 + 1];
-            g = src_ptr[i * 4 + 2];
-            b = src_ptr[i * 4 + 3];
-          }
-          else
-          {
-            a = 255;
-            r = src_ptr[i * 3 + 0];
-            g = src_ptr[i * 3 + 1];
-            b = src_ptr[i * 3 + 2];
-          }
-          out_data[dst_index++] = a;
-          out_data[dst_index++] = r;
-          out_data[dst_index++] = g;
-          out_data[dst_index++] = b;
-        }
+        const uint8_t *rgb = src_ptr + i * src_channels;
+        // RGB から ARGB へ変換 (アルファは 255 固定)
+        dst_ptr[0] = 255;
+        dst_ptr[1] = rgb[0];
+        dst_ptr[2] = rgb[1];
+        dst_ptr[3] = rgb[2];
+        dst_ptr += 4;
       }
       return true;
     }
