@@ -148,6 +148,22 @@ namespace
       28,
   };
 
+  // 値の配列を走査し、連続する同値のラン情報を列挙するユーティリティ。
+  template <typename Callback>
+  void for_each_run(const std::vector<uint32_t> &values, const Callback &callback)
+  {
+    std::size_t index = 0;
+    while (index < values.size())
+    {
+      const uint32_t current = values[index];
+      std::size_t run_end = index + 1;
+      while (run_end < values.size() && values[run_end] == current)
+        ++run_end;
+      callback(current, static_cast<uint32_t>(run_end - index));
+      index = run_end;
+    }
+  }
+
   inline uint32_t select_best_k(uint32_t m)
   {
     uint32_t best_k = 0;
@@ -206,18 +222,11 @@ namespace
     case BlockChoiceEncoding::RunLength:
     {
       uint64_t bits = 0;
-      std::size_t index = 0;
-      while (index < values.size())
-      {
-        const uint32_t current = values[index];
-        std::size_t run_end = index + 1;
-        while (run_end < values.size() && values[run_end] == current)
-          ++run_end;
-        const uint32_t run_length = static_cast<uint32_t>(run_end - index);
+      for_each_run(values, [&](uint32_t value, uint32_t run_length) {
+        static_cast<void>(value);
         bits += value_bits;
         bits += varuint_bits(run_length - 1);
-        index = run_end;
-      }
+      });
       return bits;
     }
 
@@ -287,18 +296,10 @@ namespace
 
     case BlockChoiceEncoding::RunLength:
     {
-      std::size_t index = 0;
-      while (index < values.size())
-      {
-        const uint32_t current = values[index];
-        std::size_t run_end = index + 1;
-        while (run_end < values.size() && values[run_end] == current)
-          ++run_end;
-        const uint32_t run_length = static_cast<uint32_t>(run_end - index);
+      for_each_run(values, [&](uint32_t current, uint32_t run_length) {
         writer.put_upto8(current, value_bits);
         put_varuint(writer, run_length - 1);
-        index = run_end;
-      }
+      });
       break;
     }
 

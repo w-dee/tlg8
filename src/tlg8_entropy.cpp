@@ -216,6 +216,15 @@ namespace
       writer.put_upto8(0, static_cast<unsigned>(count));
   }
 
+  // ガンマ符号の前置ゼロの個数を求めるユーティリティ。
+  inline uint32_t gamma_zero_count(uint32_t value)
+  {
+    uint32_t zeros = 0;
+    for (uint32_t t = value >> 1; t != 0; t >>= 1)
+      ++zeros;
+    return zeros;
+  }
+
   inline void write_bits(BitWriter &writer, uint32_t value, unsigned count)
   {
     if (count == 0)
@@ -232,20 +241,9 @@ namespace
   {
     if (value == 0)
       return;
-    uint32_t t = value >> 1;
-    while (t)
-    {
-      writer.put_upto8(0, 1);
-      t >>= 1;
-    }
+    const uint32_t zeros = gamma_zero_count(value);
+    write_zero_bits(writer, zeros);
     writer.put_upto8(1, 1);
-    uint32_t zeros = 0;
-    t = value >> 1;
-    while (t)
-    {
-      ++zeros;
-      t >>= 1;
-    }
     for (uint32_t i = 0; i < zeros; ++i)
       writer.put_upto8((value >> i) & 1u, 1);
   }
@@ -274,13 +272,7 @@ namespace
   {
     if (value == 0)
       return 0;
-    uint32_t t = value >> 1;
-    uint32_t zeros = 0;
-    while (t)
-    {
-      ++zeros;
-      t >>= 1;
-    }
+    const uint32_t zeros = gamma_zero_count(value);
     return static_cast<uint64_t>(zeros) * 2u + 1u;
   }
 
