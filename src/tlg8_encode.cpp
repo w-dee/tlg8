@@ -30,6 +30,7 @@ namespace
   using tlg::v8::enc::kGolombRowCount;
   using tlg::v8::enc::kGolombRowSum;
   using tlg::v8::enc::kNumPredictors;
+  using tlg::v8::enc::component_colors;
   using tlg::v8::enc::adaptation::mix_a_m;
   using tlg::v8::enc::adaptation::reduce_a;
   using tlg::v8::detail::bitio::BitWriter;
@@ -308,7 +309,7 @@ namespace
     }
   }
 
-  // タイル全体を 8x8 ブロックへ分割し、予測→カラー相関フィルター→
+  // タイル全体を 8x8 ブロックへ分割し、カラー相関フィルター→予測→
   // ヒルベルト曲線による並び替え→エントロピー符号と流すパイプライン。
   // 並び替え段はタイル端で縮むブロックにも対応させている。
   struct tile_accessor
@@ -395,9 +396,64 @@ namespace
     }
   };
 
-  // predictor の出力後にカラー相関フィルターを適用し、その結果を
+  struct filtered_workspace
+  {
+    uint32_t stride = 0;
+    std::array<std::vector<int16_t>, 4> padded{};
+  };
+
+  void prepare_filtered_workspace(const block_workspace &workspace,
+                                  filtered_workspace &filtered,
+                                  tlg::v8::enc::component_colors &filtered_block,
+                                  uint32_t components,
+                                  uint32_t block_w,
+                                  uint32_t block_h,
+                                  int filter_code)
+  {
+    filtered.stride = workspace.stride;
+    const uint32_t padded_height = block_h + 1u;
+    const size_t total = static_cast<size_t>(filtered.stride) * padded_height;
+    for (auto &plane : filtered.padded)
+      plane.assign(total, 0);
+    for (auto &component : filtered_block.values)
+      component.fill(0);
+
+    component_colors pixel{};
+    for (int32_t local_y = -1; local_y < static_cast<int32_t>(block_h); ++local_y)
+    {
+      for (int32_t local_x = -1; local_x <= static_cast<int32_t>(block_w); ++local_x)
+      {
+        const size_t index = static_cast<size_t>(local_y + 1) * filtered.stride + static_cast<size_t>(local_x + 1);
+        for (uint32_t comp = 0; comp < pixel.values.size(); ++comp)
+          pixel.values[comp][0] = 0;
+        for (uint32_t comp = 0; comp < components; ++comp)
+        {
+          const auto &plane = workspace.padded[comp];
+          const int value = (index < plane.size()) ? static_cast<int>(plane[index]) : 0;
+          pixel.values[comp][0] = static_cast<int16_t>(value);
+        }
+        if (components >= 3)
+          apply_color_filter(filter_code, pixel, components, 1);
+        for (uint32_t comp = 0; comp < components; ++comp)
+          filtered.padded[comp][index] = pixel.values[comp][0];
+        for (uint32_t comp = components; comp < filtered.padded.size(); ++comp)
+          filtered.padded[comp][index] = 0;
+
+        if (local_x >= 0 && local_y >= 0)
+        {
+          const size_t block_index = static_cast<size_t>(local_y) * block_w + static_cast<size_t>(local_x);
+          for (uint32_t comp = 0; comp < components; ++comp)
+            filtered_block.values[comp][block_index] = pixel.values[comp][0];
+          for (uint32_t comp = components; comp < filtered_block.values.size(); ++comp)
+            filtered_block.values[comp][block_index] = 0;
+        }
+      }
+    }
+  }
+
+  // カラー相関フィルター適用後の信号に predictor を適用し、予測誤差を
   // component_colors へ格納する。
-  void compute_residual_block(const block_workspace &workspace,
+  void compute_residual_block(const filtered_workspace &workspace,
                               tlg::v8::enc::component_colors &out,
                               tlg::v8::enc::predictor_fn predictor,
                               uint32_t components,
@@ -416,12 +472,12 @@ namespace
         {
           const auto &plane = workspace.padded[comp];
           const size_t base = static_cast<size_t>(by + 1) * workspace.stride + static_cast<size_t>(bx + 1);
-          const uint8_t a = plane[base - 1];
-          const uint8_t b = plane[base - workspace.stride];
-          const uint8_t c = plane[base - workspace.stride - 1];
-          const uint8_t d = plane[base - workspace.stride + 1];
-          const uint8_t actual = plane[base];
-          const uint8_t predicted = predictor(a, b, c, d);
+          const int16_t a = plane[base - 1];
+          const int16_t b = plane[base - workspace.stride];
+          const int16_t c = plane[base - workspace.stride - 1];
+          const int16_t d = plane[base - workspace.stride + 1];
+          const int16_t actual = plane[base];
+          const int16_t predicted = predictor(a, b, c, d);
           out.values[comp][index] = static_cast<int16_t>(static_cast<int32_t>(actual) - static_cast<int32_t>(predicted));
         }
         ++index;
@@ -617,44 +673,50 @@ namespace tlg::v8::enc
         workspace.prepare(accessor, block_x, block_y, block_w, block_h, components);
         double best_residual_energy = std::numeric_limits<double>::infinity();
         double best_filtered_energy = std::numeric_limits<double>::infinity();
-        for (uint32_t predictor_order_index = 0; predictor_order_index < kNumPredictors; ++predictor_order_index)
+        for (uint32_t filter_order_index = 0; filter_order_index < filter_count; ++filter_order_index)
         {
-          const uint32_t predictor_index = kPredictorTrialOrder[predictor_order_index];
-          compute_residual_block(workspace,
-                                 candidate,
-                                 predictors[predictor_index],
-                                 components,
-                                 block_w,
-                                 block_h);
-          const double residual_energy = compute_energy(candidate, components, value_count);
-          if (best_residual_energy < std::numeric_limits<double>::infinity() &&
-              residual_energy > best_residual_energy * kEarlyExitGiveUpRate)
+          const uint32_t filter_code =
+              (components >= 3) ? kColorFilterTrialOrder[filter_order_index] : filter_order_index;
+          filtered_workspace filtered_ws{};
+          component_colors filtered_block{};
+          prepare_filtered_workspace(workspace,
+                                     filtered_ws,
+                                     filtered_block,
+                                     components,
+                                     block_w,
+                                     block_h,
+                                     static_cast<int>(filter_code));
+
+          const double filtered_energy = compute_energy(filtered_block, components, value_count);
+          if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
+              filtered_energy > best_filtered_energy * kEarlyExitGiveUpRate)
           {
-            // 予測誤差の自乗和が閾値を超えた場合は、この predictor を早期に諦める。
+            // フィルター適用後の信号エネルギーが大きすぎる候補は以降の処理へ進めない。
             continue;
           }
-          if (residual_energy < best_residual_energy)
-            best_residual_energy = residual_energy;
-          for (uint32_t filter_order_index = 0; filter_order_index < filter_count; ++filter_order_index)
-          {
-            const uint32_t filter_code =
-                (components >= 3) ? kColorFilterTrialOrder[filter_order_index] : filter_order_index;
-            component_colors filtered = candidate;
-            if (components >= 3)
-              apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
+          if (filtered_energy < best_filtered_energy)
+            best_filtered_energy = filtered_energy;
 
-            component_colors filtered_before_hilbert = filtered;
-            const double filtered_energy = compute_energy(filtered, components, value_count);
-            if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
-                filtered_energy > best_filtered_energy * kEarlyExitGiveUpRate)
+          for (uint32_t predictor_order_index = 0; predictor_order_index < kNumPredictors; ++predictor_order_index)
+          {
+            const uint32_t predictor_index = kPredictorTrialOrder[predictor_order_index];
+            compute_residual_block(filtered_ws,
+                                   candidate,
+                                   predictors[predictor_index],
+                                   components,
+                                   block_w,
+                                   block_h);
+            const double residual_energy = compute_energy(candidate, components, value_count);
+            if (best_residual_energy < std::numeric_limits<double>::infinity() &&
+                residual_energy > best_residual_energy * kEarlyExitGiveUpRate)
             {
-              // フィルター適用後の誤差エネルギーが大きすぎる候補は以降の処理へ進めない。
+              // 予測誤差の自乗和が閾値を超えた場合は、この predictor を早期に諦める。
               continue;
             }
-            if (filtered_energy < best_filtered_energy)
-              best_filtered_energy = filtered_energy;
+            if (residual_energy < best_residual_energy)
+              best_residual_energy = residual_energy;
 
-            component_colors reordered = filtered;
+            component_colors reordered = candidate;
             reorder_to_hilbert(reordered, components, block_w, block_h);
 
             for (uint32_t interleave_index = 0; interleave_index < kNumInterleaveFilter; ++interleave_index)
@@ -682,7 +744,7 @@ namespace tlg::v8::enc
                   best_interleave = interleave_index;
                   best_after_interleave = interleaved;
                   best_after_hilbert = reordered;
-                  best_after_color = filtered_before_hilbert;
+                  best_after_color = filtered_block;
                   best_after_predictor = candidate;
                 }
               }

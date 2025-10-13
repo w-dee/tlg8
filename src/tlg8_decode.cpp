@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -21,33 +22,56 @@ namespace tlg::v8
 {
   namespace
   {
-    uint8_t sample_pixel(const std::vector<uint8_t> &decoded,
-                         const std::vector<uint8_t> &decoded_mask,
-                         uint32_t image_width,
-                         uint32_t components,
-                         uint32_t origin_x,
-                         uint32_t origin_y,
-                         uint32_t tile_w,
-                         uint32_t tile_h,
-                         int32_t tx,
-                         int32_t ty,
-                         uint32_t component)
+    int16_t sample_filtered_value(const enc::component_colors &filtered_block,
+                                  uint32_t block_x,
+                                  uint32_t block_y,
+                                  uint32_t block_w,
+                                  uint32_t block_h,
+                                  uint32_t filter_index,
+                                  int32_t tx,
+                                  int32_t ty,
+                                  uint32_t component,
+                                  uint32_t tile_w,
+                                  uint32_t tile_h,
+                                  uint32_t components,
+                                  const std::vector<uint8_t> &decoded,
+                                  uint32_t image_width,
+                                  uint32_t origin_x,
+                                  uint32_t origin_y)
     {
       if (tx < 0 || ty < 0)
         return 0;
       if (tx >= static_cast<int32_t>(tile_w) || ty >= static_cast<int32_t>(tile_h))
         return 0;
-      const size_t tile_offset = (static_cast<size_t>(ty) * tile_w + static_cast<size_t>(tx)) * components + component;
-      if (tile_offset >= decoded_mask.size())
-        return 0;
-      if (!decoded_mask[tile_offset])
-        return 0;
-      const uint32_t gx = origin_x + static_cast<uint32_t>(tx);
-      const uint32_t gy = origin_y + static_cast<uint32_t>(ty);
-      const size_t index = (static_cast<size_t>(gy) * image_width + gx) * components + component;
-      if (index >= decoded.size())
-        return 0;
-      return decoded[index];
+
+      if (tx >= static_cast<int32_t>(block_x) &&
+          tx < static_cast<int32_t>(block_x + block_w) &&
+          ty >= static_cast<int32_t>(block_y) &&
+          ty < static_cast<int32_t>(block_y + block_h))
+      {
+        const uint32_t local_x = static_cast<uint32_t>(tx) - block_x;
+        const uint32_t local_y = static_cast<uint32_t>(ty) - block_y;
+        const uint32_t index = local_y * block_w + local_x;
+        return filtered_block.values[component][index];
+      }
+
+      enc::component_colors pixel{};
+      for (uint32_t comp = 0; comp < components; ++comp)
+      {
+        const size_t src_index =
+            (static_cast<size_t>(origin_y + static_cast<uint32_t>(ty)) * image_width +
+             static_cast<size_t>(origin_x + static_cast<uint32_t>(tx))) *
+                components +
+            comp;
+        if (src_index >= decoded.size())
+          return 0;
+        pixel.values[comp][0] = static_cast<int16_t>(decoded[src_index]);
+      }
+      for (uint32_t comp = components; comp < static_cast<uint32_t>(pixel.values.size()); ++comp)
+        pixel.values[comp][0] = 0;
+
+      enc::apply_color_filter(static_cast<int>(filter_index), pixel, components, 1);
+      return pixel.values[component][0];
     }
   }
 
@@ -71,8 +95,6 @@ namespace tlg::v8
     const auto &entropy_encoders = enc::entropy_encoder_table();
     const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(tlg::v8::enc::kColorFilterCodeCount) : 1u;
 
-    std::vector<uint8_t> decoded_mask(static_cast<size_t>(tile_w) * tile_h * components, 0);
-
     struct block_decode_state
     {
       uint32_t block_x;
@@ -83,6 +105,7 @@ namespace tlg::v8
       uint32_t interleave_index;
       uint32_t value_count;
       enc::component_colors residuals;
+      enc::component_colors filtered;
     };
 
     struct block_row_state
@@ -428,15 +451,14 @@ namespace tlg::v8
                                     components,
                                     state.value_count);
         enc::reorder_from_hilbert(state.residuals, components, state.block_w, row_state.block_h);
-        enc::undo_color_filter(state.filter_index, state.residuals, components, state.value_count);
       }
     }
 
-    for (const auto &row_state : block_rows)
+    for (auto &row_state : block_rows)
     {
       for (uint32_t local_y = 0; local_y < row_state.block_h; ++local_y)
       {
-        for (const auto &state : row_state.blocks)
+        for (auto &state : row_state.blocks)
         {
           const auto predictor = predictors[state.predictor_index];
           for (uint32_t bx = 0; bx < state.block_w; ++bx)
@@ -446,18 +468,92 @@ namespace tlg::v8
             const uint32_t value_index = local_y * state.block_w + bx;
             for (uint32_t comp = 0; comp < components; ++comp)
             {
-              const uint8_t a = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
-                                             tx - 1, ty, comp);
-              const uint8_t b = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
-                                             tx, ty - 1, comp);
-              const uint8_t c = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
-                                             tx - 1, ty - 1, comp);
-              const uint8_t d = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
-                                             tx + 1, ty - 1, comp);
-              const uint8_t predicted = predictor(a, b, c, d);
+              const int16_t a = sample_filtered_value(state.filtered,
+                                                     state.block_x,
+                                                     row_state.block_y,
+                                                     state.block_w,
+                                                     row_state.block_h,
+                                                     state.filter_index,
+                                                     tx - 1,
+                                                     ty,
+                                                     comp,
+                                                     tile_w,
+                                                     tile_h,
+                                                     components,
+                                                     decoded,
+                                                     image_width,
+                                                     origin_x,
+                                                     origin_y);
+              const int16_t b = sample_filtered_value(state.filtered,
+                                                     state.block_x,
+                                                     row_state.block_y,
+                                                     state.block_w,
+                                                     row_state.block_h,
+                                                     state.filter_index,
+                                                     tx,
+                                                     ty - 1,
+                                                     comp,
+                                                     tile_w,
+                                                     tile_h,
+                                                     components,
+                                                     decoded,
+                                                     image_width,
+                                                     origin_x,
+                                                     origin_y);
+              const int16_t c = sample_filtered_value(state.filtered,
+                                                     state.block_x,
+                                                     row_state.block_y,
+                                                     state.block_w,
+                                                     row_state.block_h,
+                                                     state.filter_index,
+                                                     tx - 1,
+                                                     ty - 1,
+                                                     comp,
+                                                     tile_w,
+                                                     tile_h,
+                                                     components,
+                                                     decoded,
+                                                     image_width,
+                                                     origin_x,
+                                                     origin_y);
+              const int16_t d = sample_filtered_value(state.filtered,
+                                                     state.block_x,
+                                                     row_state.block_y,
+                                                     state.block_w,
+                                                     row_state.block_h,
+                                                     state.filter_index,
+                                                     tx + 1,
+                                                     ty - 1,
+                                                     comp,
+                                                     tile_w,
+                                                     tile_h,
+                                                     components,
+                                                     decoded,
+                                                     image_width,
+                                                     origin_x,
+                                                     origin_y);
+              const int16_t predicted = predictor(a, b, c, d);
               const int16_t residual = state.residuals.values[comp][value_index];
               int32_t value = static_cast<int32_t>(predicted) + static_cast<int32_t>(residual);
-              value = std::clamp(value, 0, 255);
+              value = std::clamp(value,
+                                 static_cast<int32_t>(std::numeric_limits<int16_t>::min()),
+                                 static_cast<int32_t>(std::numeric_limits<int16_t>::max()));
+              const int16_t filtered_value = static_cast<int16_t>(value);
+              state.filtered.values[comp][value_index] = filtered_value;
+            }
+            for (uint32_t comp = components; comp < static_cast<uint32_t>(state.filtered.values.size()); ++comp)
+              state.filtered.values[comp][value_index] = 0;
+
+            enc::component_colors pixel_values{};
+            for (uint32_t comp = 0; comp < components; ++comp)
+              pixel_values.values[comp][0] = state.filtered.values[comp][value_index];
+            for (uint32_t comp = components; comp < static_cast<uint32_t>(pixel_values.values.size()); ++comp)
+              pixel_values.values[comp][0] = 0;
+            enc::undo_color_filter(state.filter_index, pixel_values, components, 1);
+            for (uint32_t comp = 0; comp < components; ++comp)
+            {
+              int32_t original = static_cast<int32_t>(pixel_values.values[comp][0]);
+              original = std::clamp(original, 0, 255);
               const size_t dst_index =
                   (static_cast<size_t>(origin_y + static_cast<uint32_t>(ty)) * image_width +
                    static_cast<size_t>(origin_x + static_cast<uint32_t>(tx))) *
@@ -468,10 +564,7 @@ namespace tlg::v8
                 err = "tlg8: 出力バッファ範囲外に書き込もうとしました";
                 return false;
               }
-              decoded[dst_index] = static_cast<uint8_t>(value);
-              const size_t tile_offset = (static_cast<size_t>(ty) * tile_w + static_cast<size_t>(tx)) * components + comp;
-              if (tile_offset < decoded_mask.size())
-                decoded_mask[tile_offset] = 1;
+              decoded[dst_index] = static_cast<uint8_t>(original);
             }
           }
         }

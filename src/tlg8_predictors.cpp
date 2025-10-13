@@ -1,79 +1,97 @@
 #include "tlg8_predictors.h"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <limits>
+
 namespace
 {
   using tlg::v8::enc::predictor_fn;
 
+  constexpr int16_t clamp_to_i16(int32_t value) noexcept
+  {
+    if (value > std::numeric_limits<int16_t>::max())
+      return std::numeric_limits<int16_t>::max();
+    if (value < std::numeric_limits<int16_t>::min())
+      return std::numeric_limits<int16_t>::min();
+    return static_cast<int16_t>(value);
+  }
+
   // JPEG-LS 同様の MED 関数。今後 predictor の差し替えが必要になっても
   // ここを通じて共有できるため、無名名前空間内で保持する。
-  constexpr uint8_t med(uint8_t a, uint8_t b, uint8_t c) noexcept
+  constexpr int16_t med(int16_t a, int16_t b, int16_t c) noexcept
   {
-    const uint8_t max_a_b = a > b ? a : b;
-    const uint8_t min_a_b = a < b ? a : b;
+    const int16_t max_a_b = a > b ? a : b;
+    const int16_t min_a_b = a < b ? a : b;
     if (c > max_a_b)
       return min_a_b;
     if (c < min_a_b)
       return max_a_b;
-    return static_cast<uint8_t>(a + b - c);
+    const int32_t sum = static_cast<int32_t>(a) + static_cast<int32_t>(b) - static_cast<int32_t>(c);
+    return clamp_to_i16(sum);
   }
 
-  uint8_t f0(uint8_t a, uint8_t b, uint8_t c, [[maybe_unused]] uint8_t d) noexcept
+  int16_t f0(int16_t a, int16_t b, int16_t c, [[maybe_unused]] int16_t d) noexcept
   {
     return med(a, b, c);
   }
 
-  uint8_t f1(uint8_t a,
-             [[maybe_unused]] uint8_t b,
-             uint8_t c,
-             [[maybe_unused]] uint8_t d) noexcept
+  int16_t f1(int16_t a,
+             [[maybe_unused]] int16_t b,
+             int16_t c,
+             [[maybe_unused]] int16_t d) noexcept
   {
-    return static_cast<uint8_t>((a + c + 1) >> 1);
+    const int32_t sum = static_cast<int32_t>(a) + static_cast<int32_t>(c) + 1;
+    return clamp_to_i16(sum >> 1);
   }
 
-  uint8_t f2([[maybe_unused]] uint8_t a,
-             uint8_t b,
-             uint8_t c,
-             [[maybe_unused]] uint8_t d) noexcept
+  int16_t f2([[maybe_unused]] int16_t a,
+             int16_t b,
+             int16_t c,
+             [[maybe_unused]] int16_t d) noexcept
   {
-    return static_cast<uint8_t>((b + c + 1) >> 1);
+    const int32_t sum = static_cast<int32_t>(b) + static_cast<int32_t>(c) + 1;
+    return clamp_to_i16(sum >> 1);
   }
 
-  uint8_t f3([[maybe_unused]] uint8_t a,
-             uint8_t b,
-             [[maybe_unused]] uint8_t c,
-             uint8_t d) noexcept
+  int16_t f3([[maybe_unused]] int16_t a,
+             int16_t b,
+             [[maybe_unused]] int16_t c,
+             int16_t d) noexcept
   {
-    return static_cast<uint8_t>((b + d + 1) >> 1);
+    const int32_t sum = static_cast<int32_t>(b) + static_cast<int32_t>(d) + 1;
+    return clamp_to_i16(sum >> 1);
   }
 
-  uint8_t f4(uint8_t a,
-             [[maybe_unused]] uint8_t b,
-             [[maybe_unused]] uint8_t c,
-             [[maybe_unused]] uint8_t d) noexcept
+  int16_t f4(int16_t a,
+             [[maybe_unused]] int16_t b,
+             [[maybe_unused]] int16_t c,
+             [[maybe_unused]] int16_t d) noexcept
   {
     return a;
   }
 
-  uint8_t f5([[maybe_unused]] uint8_t a,
-             uint8_t b,
-             [[maybe_unused]] uint8_t c,
-             [[maybe_unused]] uint8_t d) noexcept
+  int16_t f5([[maybe_unused]] int16_t a,
+             int16_t b,
+             [[maybe_unused]] int16_t c,
+             [[maybe_unused]] int16_t d) noexcept
   {
     return b;
   }
 
-  uint8_t f6([[maybe_unused]] uint8_t a,
-             [[maybe_unused]] uint8_t b,
-             uint8_t c,
-             [[maybe_unused]] uint8_t d) noexcept
+  int16_t f6([[maybe_unused]] int16_t a,
+             [[maybe_unused]] int16_t b,
+             int16_t c,
+             [[maybe_unused]] int16_t d) noexcept
   {
     return c;
   }
 
-  uint8_t f7([[maybe_unused]] uint8_t a,
-             [[maybe_unused]] uint8_t b,
-             [[maybe_unused]] uint8_t c,
-             uint8_t d) noexcept
+  int16_t f7([[maybe_unused]] int16_t a,
+             [[maybe_unused]] int16_t b,
+             [[maybe_unused]] int16_t c,
+             int16_t d) noexcept
   {
     return d;
   }
