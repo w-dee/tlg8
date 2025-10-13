@@ -29,24 +29,11 @@ namespace
   using tlg::v8::enc::kGolombColumnCount;
   using tlg::v8::enc::kGolombRowCount;
   using tlg::v8::enc::kGolombRowSum;
-  using tlg::v8::enc::kNumPredictors;
   using tlg::v8::enc::adaptation::mix_a_m;
   using tlg::v8::enc::adaptation::reduce_a;
   using tlg::v8::detail::bitio::BitWriter;
   using tlg::v8::detail::bitio::put_varuint;
   using tlg::v8::detail::bitio::varuint_bits;
-
-  // ヒストグラムで得た頻度の高い順に predictor を試行するためのインデックス列。
-  constexpr std::array<uint32_t, kNumPredictors> kPredictorTrialOrder = {
-      0,
-      4,
-      1,
-      3,
-      5,
-      2,
-      7,
-      6,
-  };
 
   // ヒストグラムで得た頻度の高い順にカラー相関フィルターを試行するためのインデックス列。
   constexpr std::array<uint32_t, kColorFilterCodeCount> kColorFilterTrialOrder = {
@@ -184,7 +171,6 @@ namespace
   // ブロック毎に選ばれたメタデータを一時保持する構造体。
   struct block_choice
   {
-    uint32_t predictor = 0;
     uint32_t filter = 0;
     uint32_t entropy = 0;
     uint32_t interleave = 0;
@@ -372,7 +358,7 @@ namespace
       block_w = width;
       block_h = height;
       stride = block_w + 2u;
-      const uint32_t padded_height = block_h + 1u;
+      const uint32_t padded_height = block_h + 2u;
       const size_t required = static_cast<size_t>(stride) * padded_height;
       for (auto &plane : padded)
         plane.assign(required, 0);
@@ -380,54 +366,20 @@ namespace
       for (uint32_t comp = 0; comp < components; ++comp)
       {
         auto &plane = padded[comp];
-        for (int32_t local_y = -1; local_y < static_cast<int32_t>(block_h); ++local_y)
+        for (int32_t local_y = -2; local_y < static_cast<int32_t>(block_h); ++local_y)
         {
           for (int32_t local_x = -1; local_x <= static_cast<int32_t>(block_w); ++local_x)
           {
             const uint8_t sample = accessor.sample(static_cast<int32_t>(block_x) + local_x,
                                                    static_cast<int32_t>(block_y) + local_y,
                                                    comp);
-            const size_t index = static_cast<size_t>(local_y + 1) * stride + static_cast<size_t>(local_x + 1);
+            const size_t index = static_cast<size_t>(local_y + 2) * stride + static_cast<size_t>(local_x + 1);
             plane[index] = sample;
           }
         }
       }
     }
   };
-
-  // predictor の出力後にカラー相関フィルターを適用し、その結果を
-  // component_colors へ格納する。
-  void compute_residual_block(const block_workspace &workspace,
-                              tlg::v8::enc::component_colors &out,
-                              tlg::v8::enc::predictor_fn predictor,
-                              uint32_t components,
-                              uint32_t block_w,
-                              uint32_t block_h)
-  {
-    for (auto &component : out.values)
-      component.fill(0);
-
-    uint32_t index = 0;
-    for (uint32_t by = 0; by < block_h; ++by)
-    {
-      for (uint32_t bx = 0; bx < block_w; ++bx)
-      {
-        for (uint32_t comp = 0; comp < components; ++comp)
-        {
-          const auto &plane = workspace.padded[comp];
-          const size_t base = static_cast<size_t>(by + 1) * workspace.stride + static_cast<size_t>(bx + 1);
-          const uint8_t a = plane[base - 1];
-          const uint8_t b = plane[base - workspace.stride];
-          const uint8_t c = plane[base - workspace.stride - 1];
-          const uint8_t d = plane[base - workspace.stride + 1];
-          const uint8_t actual = plane[base];
-          const uint8_t predicted = predictor(a, b, c, d);
-          out.values[comp][index] = static_cast<int16_t>(static_cast<int32_t>(actual) - static_cast<int32_t>(predicted));
-        }
-        ++index;
-      }
-    }
-  }
 
   // 残差ブロックをテキストでダンプするユーティリティ。
   void dump_residual_block(FILE *fp,
@@ -563,7 +515,8 @@ namespace tlg::v8::enc
     const bool dump_after_hilbert = dump_fp &&
                                     (dump_order == TlgOptions::DumpResidualsOrder::AfterHilbert);
 
-    const auto &predictors = predictor_table();
+    tlg::v8::enc::Cas8Predictor cas8_predictor;
+    cas8_predictor.reset(components);
     const auto &entropy_encoders = entropy_encoder_table();
     std::array<std::vector<int16_t>, kGolombRowCount> entropy_values;
     const size_t reserve_per_row = static_cast<size_t>(tile_w) * tile_h;
@@ -571,7 +524,7 @@ namespace tlg::v8::enc
       values.reserve(reserve_per_row);
     // 将来的にはここで並び替え候補も列挙し、
     // predictor × filter × reorder × entropy の全組み合わせを評価する。
-    // 現状は reorder をヒルベルト固定とし、predictor × filter × entropy の
+    // 現状は predictor を CAS-8 固定とし、filter × reorder × entropy の
     // 組み合わせを探索している。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
     const uint32_t block_cols = (tile_w + kBlockSize - 1) / kBlockSize;
@@ -594,107 +547,126 @@ namespace tlg::v8::enc
       return energy;
     };
 
-    block_workspace workspace;
     for (uint32_t block_y = 0; block_y < tile_h; block_y += kBlockSize)
     {
       const uint32_t block_h = std::min(kBlockSize, tile_h - block_y);
+
+      std::vector<uint32_t> row_block_xs;
+      std::vector<uint32_t> row_block_ws;
+      std::vector<block_workspace> row_workspaces;
+      std::vector<component_colors> row_candidates;
+
       for (uint32_t block_x = 0; block_x < tile_w; block_x += kBlockSize)
       {
         const uint32_t block_w = std::min(kBlockSize, tile_w - block_x);
+        row_block_xs.push_back(block_x);
+        row_block_ws.push_back(block_w);
+        row_workspaces.emplace_back();
+        row_workspaces.back().prepare(accessor, block_x, block_y, block_w, block_h, components);
+        row_candidates.emplace_back();
+      }
+
+      for (uint32_t local_y = 0; local_y < block_h; ++local_y)
+      {
+        for (std::size_t block_index = 0; block_index < row_workspaces.size(); ++block_index)
+        {
+          const uint32_t block_w = row_block_ws[block_index];
+          auto &workspace_local = row_workspaces[block_index];
+          auto &candidate = row_candidates[block_index];
+          for (uint32_t bx = 0; bx < block_w; ++bx)
+          {
+            const size_t base = static_cast<size_t>(local_y + 2) * workspace_local.stride + static_cast<size_t>(bx + 1);
+            const size_t index = static_cast<size_t>(local_y) * block_w + bx;
+            for (uint32_t comp = 0; comp < components; ++comp)
+            {
+              const auto &plane = workspace_local.padded[comp];
+              const uint8_t a = plane[base - 1];
+              const uint8_t b = plane[base - workspace_local.stride];
+              const uint8_t c = plane[base - workspace_local.stride - 1];
+              const uint8_t d = plane[base - workspace_local.stride + 1];
+              const uint8_t f = plane[base - workspace_local.stride * 2];
+              const uint8_t actual = plane[base];
+              const auto predicted = cas8_predictor.predict(comp, a, b, c, d, f);
+              const int32_t residual = static_cast<int32_t>(actual) - static_cast<int32_t>(predicted.first);
+              candidate.values[comp][index] = static_cast<int16_t>(residual);
+              cas8_predictor.update(comp, predicted.second, residual >= 0 ? residual : -residual);
+            }
+          }
+        }
+      }
+
+      for (std::size_t block_index = 0; block_index < row_block_xs.size(); ++block_index)
+      {
+        const uint32_t block_x = row_block_xs[block_index];
+        const uint32_t block_w = row_block_ws[block_index];
         const uint32_t value_count = block_w * block_h;
 
+        component_colors &candidate = row_candidates[block_index];
         component_colors best_after_interleave{};
         component_colors best_after_hilbert{};
         component_colors best_after_color{};
-        component_colors best_after_predictor{};
+        component_colors best_after_predictor = candidate;
         uint32_t best_predictor = 0;
         uint32_t best_filter = 0;
         uint32_t best_entropy = 0;
         uint32_t best_interleave = 0;
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
-        component_colors candidate{};
-        workspace.prepare(accessor, block_x, block_y, block_w, block_h, components);
-        double best_residual_energy = std::numeric_limits<double>::infinity();
         double best_filtered_energy = std::numeric_limits<double>::infinity();
-        for (uint32_t predictor_order_index = 0; predictor_order_index < kNumPredictors; ++predictor_order_index)
+        for (uint32_t filter_order_index = 0; filter_order_index < filter_count; ++filter_order_index)
         {
-          const uint32_t predictor_index = kPredictorTrialOrder[predictor_order_index];
-          compute_residual_block(workspace,
-                                 candidate,
-                                 predictors[predictor_index],
-                                 components,
-                                 block_w,
-                                 block_h);
-          const double residual_energy = compute_energy(candidate, components, value_count);
-          if (best_residual_energy < std::numeric_limits<double>::infinity() &&
-              residual_energy > best_residual_energy * kEarlyExitGiveUpRate)
+          const uint32_t filter_code =
+              (components >= 3) ? kColorFilterTrialOrder[filter_order_index] : filter_order_index;
+          component_colors filtered = candidate;
+          if (components >= 3)
+            apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
+
+          component_colors filtered_before_hilbert = filtered;
+          const double filtered_energy = compute_energy(filtered, components, value_count);
+          if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
+              filtered_energy > best_filtered_energy * kEarlyExitGiveUpRate)
           {
-            // 予測誤差の自乗和が閾値を超えた場合は、この predictor を早期に諦める。
             continue;
           }
-          if (residual_energy < best_residual_energy)
-            best_residual_energy = residual_energy;
-          for (uint32_t filter_order_index = 0; filter_order_index < filter_count; ++filter_order_index)
+          if (filtered_energy < best_filtered_energy)
+            best_filtered_energy = filtered_energy;
+
+          component_colors reordered = filtered;
+          reorder_to_hilbert(reordered, components, block_w, block_h);
+
+          for (uint32_t interleave_index = 0; interleave_index < kNumInterleaveFilter; ++interleave_index)
           {
-            const uint32_t filter_code =
-                (components >= 3) ? kColorFilterTrialOrder[filter_order_index] : filter_order_index;
-            component_colors filtered = candidate;
-            if (components >= 3)
-              apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
+            component_colors interleaved = reordered;
+            apply_interleave_filter(static_cast<InterleaveFilter>(interleave_index),
+                                    interleaved,
+                                    components,
+                                    value_count);
 
-            component_colors filtered_before_hilbert = filtered;
-            const double filtered_energy = compute_energy(filtered, components, value_count);
-            if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
-                filtered_energy > best_filtered_energy * kEarlyExitGiveUpRate)
+            for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
             {
-              // フィルター適用後の誤差エネルギーが大きすぎる候補は以降の処理へ進めない。
-              continue;
-            }
-            if (filtered_energy < best_filtered_energy)
-              best_filtered_energy = filtered_energy;
-
-            component_colors reordered = filtered;
-            reorder_to_hilbert(reordered, components, block_w, block_h);
-
-            for (uint32_t interleave_index = 0; interleave_index < kNumInterleaveFilter; ++interleave_index)
-            {
-              component_colors interleaved = reordered;
-              apply_interleave_filter(static_cast<InterleaveFilter>(interleave_index),
-                                      interleaved,
-                                      components,
-                                      value_count);
-
-              for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
+              const bool uses_interleave_candidate =
+                  (interleave_index == static_cast<uint32_t>(InterleaveFilter::Interleave));
+              const uint64_t estimated_bits = entropy_encoders[entropy_index].estimate_bits(interleaved,
+                                                                                            components,
+                                                                                            value_count,
+                                                                                            uses_interleave_candidate);
+              if (estimated_bits < best_bits)
               {
-                const bool uses_interleave_candidate =
-                    (interleave_index == static_cast<uint32_t>(InterleaveFilter::Interleave));
-                const uint64_t estimated_bits = entropy_encoders[entropy_index].estimate_bits(interleaved,
-                                                                                              components,
-                                                                                              value_count,
-                                                                                              uses_interleave_candidate);
-                if (estimated_bits < best_bits)
-                {
-                  best_bits = estimated_bits;
-                  best_predictor = predictor_index;
-                  best_filter = filter_code;
-                  best_entropy = entropy_index;
-                  best_interleave = interleave_index;
-                  best_after_interleave = interleaved;
-                  best_after_hilbert = reordered;
-                  best_after_color = filtered_before_hilbert;
-                  best_after_predictor = candidate;
-                }
+                best_bits = estimated_bits;
+                best_predictor = 0;
+                best_filter = filter_code;
+                best_entropy = entropy_index;
+                best_interleave = interleave_index;
+                best_after_interleave = interleaved;
+                best_after_hilbert = reordered;
+                best_after_color = filtered_before_hilbert;
+                best_after_predictor = candidate;
               }
             }
           }
         }
 
-        // 最小の推定ビット長を与えた組み合わせを採用する。
-        // reorder は固定だが、filter やエントロピー符号化方式と同じ基準で
-        // 比較する設計とし、将来的に並び替え候補を増やしても流用できるよう
-        // にしている。
-        block_choices.push_back(block_choice{best_predictor, best_filter, best_entropy, best_interleave});
+        block_choices.push_back(block_choice{best_filter, best_entropy, best_interleave});
 
         if (dump_fp)
         {
@@ -827,40 +799,33 @@ namespace tlg::v8::enc
         }
       }
     }
-    const uint32_t predictor_bits = tlg::detail::bit_width(kNumPredictors);
     const uint32_t filter_bits = tlg::detail::bit_width(filter_count);
     const uint32_t entropy_bits = tlg::detail::bit_width(kNumEntropyEncoders);
     const uint32_t interleave_bits = tlg::detail::bit_width(kNumInterleaveFilter);
 
-    std::vector<uint32_t> predictor_stream;
     std::vector<uint32_t> filter_stream;
     std::vector<uint32_t> entropy_stream;
     std::vector<uint32_t> interleave_stream;
-    predictor_stream.reserve(block_choices.size());
     filter_stream.reserve(block_choices.size());
     entropy_stream.reserve(block_choices.size());
     interleave_stream.reserve(block_choices.size());
     for (const auto &choice : block_choices)
     {
-      predictor_stream.push_back(choice.predictor);
       filter_stream.push_back(choice.filter);
       entropy_stream.push_back(choice.entropy);
       interleave_stream.push_back(choice.interleave);
     }
 
-    const BlockChoiceEncoding predictor_mode = select_best_sequence_mode(predictor_stream, predictor_bits);
     const BlockChoiceEncoding filter_mode = select_best_sequence_mode(filter_stream, filter_bits);
     const BlockChoiceEncoding entropy_mode = select_best_sequence_mode(entropy_stream, entropy_bits);
     const BlockChoiceEncoding interleave_mode = select_best_sequence_mode(interleave_stream, interleave_bits);
 
-    writer.put_upto8(static_cast<uint32_t>(predictor_mode), 2);
     writer.put_upto8(static_cast<uint32_t>(filter_mode), 2);
     writer.put_upto8(static_cast<uint32_t>(entropy_mode), 2);
     writer.put_upto8(static_cast<uint32_t>(interleave_mode), 2);
 
     if (!block_choices.empty())
     {
-      encode_value_sequence(writer, predictor_mode, predictor_stream, predictor_bits);
       encode_value_sequence(writer, filter_mode, filter_stream, filter_bits);
       encode_value_sequence(writer, entropy_mode, entropy_stream, entropy_bits);
       encode_value_sequence(writer, interleave_mode, interleave_stream, interleave_bits);

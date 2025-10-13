@@ -67,7 +67,6 @@ namespace tlg::v8
       return false;
     }
 
-    const auto &predictors = enc::predictor_table();
     const auto &entropy_encoders = enc::entropy_encoder_table();
     const uint32_t filter_count = (components >= 3) ? static_cast<uint32_t>(tlg::v8::enc::kColorFilterCodeCount) : 1u;
 
@@ -77,7 +76,6 @@ namespace tlg::v8
     {
       uint32_t block_x;
       uint32_t block_w;
-      uint32_t predictor_index;
       uint32_t filter_index;
       uint32_t entropy_index;
       uint32_t interleave_index;
@@ -97,7 +95,6 @@ namespace tlg::v8
 
     struct block_choice
     {
-      uint32_t predictor = 0;
       uint32_t filter = 0;
       uint32_t entropy = 0;
       uint32_t interleave = 0;
@@ -110,12 +107,11 @@ namespace tlg::v8
     std::vector<block_choice> block_choices;
     block_choices.reserve(block_count);
 
-    const uint32_t predictor_bits = tlg::detail::bit_width(enc::kNumPredictors);
     const uint32_t filter_bits = tlg::detail::bit_width(filter_count);
     const uint32_t entropy_bits = tlg::detail::bit_width(enc::kNumEntropyEncoders);
     const uint32_t interleave_bits = tlg::detail::bit_width(enc::kNumInterleaveFilter);
 
-    std::array<enc::BlockChoiceEncoding, 4> field_modes{};
+    std::array<enc::BlockChoiceEncoding, 3> field_modes{};
     for (auto &mode : field_modes)
     {
       const uint32_t mode_bits = reader.get_upto8(2);
@@ -127,11 +123,9 @@ namespace tlg::v8
       mode = static_cast<enc::BlockChoiceEncoding>(mode_bits);
     }
 
-    std::vector<uint32_t> predictor_stream;
     std::vector<uint32_t> filter_stream;
     std::vector<uint32_t> entropy_stream;
     std::vector<uint32_t> interleave_stream;
-    predictor_stream.reserve(block_count);
     filter_stream.reserve(block_count);
     entropy_stream.reserve(block_count);
     interleave_stream.reserve(block_count);
@@ -243,19 +237,16 @@ namespace tlg::v8
       return false;
     };
 
-    if (!decode_stream(field_modes[0], predictor_bits, enc::kNumPredictors, predictor_stream, "tlg8: 不正な予測器インデックスです"))
+    if (!decode_stream(field_modes[0], filter_bits, filter_count, filter_stream, "tlg8: 不正なカラーフィルターインデックスです"))
       return false;
-    if (!decode_stream(field_modes[1], filter_bits, filter_count, filter_stream, "tlg8: 不正なカラーフィルターインデックスです"))
+    if (!decode_stream(field_modes[1], entropy_bits, enc::kNumEntropyEncoders, entropy_stream, "tlg8: 不正なエントロピーインデックスです"))
       return false;
-    if (!decode_stream(field_modes[2], entropy_bits, enc::kNumEntropyEncoders, entropy_stream, "tlg8: 不正なエントロピーインデックスです"))
-      return false;
-    if (!decode_stream(field_modes[3], interleave_bits, enc::kNumInterleaveFilter, interleave_stream, "tlg8: 不正なインターリーブフィルターです"))
+    if (!decode_stream(field_modes[2], interleave_bits, enc::kNumInterleaveFilter, interleave_stream, "tlg8: 不正なインターリーブフィルターです"))
       return false;
 
     for (uint32_t index = 0; index < block_count; ++index)
     {
       block_choice choice{};
-      choice.predictor = (index < predictor_stream.size()) ? predictor_stream[index] : 0u;
       choice.filter = (index < filter_stream.size()) ? filter_stream[index] : 0u;
       choice.entropy = (index < entropy_stream.size()) ? entropy_stream[index] : 0u;
       choice.interleave = (index < interleave_stream.size()) ? interleave_stream[index] : 0u;
@@ -281,7 +272,6 @@ namespace tlg::v8
         }
 
         const auto &choice = block_choices[block_choice_index++];
-        const uint32_t predictor_index = choice.predictor;
         const uint32_t filter_index = choice.filter;
         const uint32_t entropy_index = choice.entropy;
         const uint32_t interleave_index = choice.interleave;
@@ -290,7 +280,6 @@ namespace tlg::v8
         block_decode_state state{};
         state.block_x = block_x;
         state.block_w = block_w;
-        state.predictor_index = predictor_index;
         state.filter_index = filter_index;
         state.entropy_index = entropy_index;
         state.interleave_index = interleave_index;
@@ -432,13 +421,15 @@ namespace tlg::v8
       }
     }
 
+    tlg::v8::enc::Cas8Predictor cas8_predictor;
+    cas8_predictor.reset(components);
+
     for (const auto &row_state : block_rows)
     {
       for (uint32_t local_y = 0; local_y < row_state.block_h; ++local_y)
       {
         for (const auto &state : row_state.blocks)
         {
-          const auto predictor = predictors[state.predictor_index];
           for (uint32_t bx = 0; bx < state.block_w; ++bx)
           {
             const int32_t tx = static_cast<int32_t>(state.block_x + bx);
@@ -454,14 +445,25 @@ namespace tlg::v8
                                              tx - 1, ty - 1, comp);
               const uint8_t d = sample_pixel(decoded, decoded_mask, image_width, components, origin_x, origin_y, tile_w, tile_h,
                                              tx + 1, ty - 1, comp);
-              const uint8_t predicted = predictor(a, b, c, d);
+              const uint8_t f = sample_pixel(decoded,
+                                             decoded_mask,
+                                             image_width,
+                                             components,
+                                             origin_x,
+                                             origin_y,
+                                             tile_w,
+                                             tile_h,
+                                             tx,
+                                             ty - 2,
+                                             comp);
+              const auto predicted = cas8_predictor.predict(comp, a, b, c, d, f);
               const int16_t residual = state.residuals.values[comp][value_index];
-              int32_t value = static_cast<int32_t>(predicted) + static_cast<int32_t>(residual);
+              int32_t value = static_cast<int32_t>(predicted.first) + static_cast<int32_t>(residual);
               value = std::clamp(value, 0, 255);
               const size_t dst_index =
                   (static_cast<size_t>(origin_y + static_cast<uint32_t>(ty)) * image_width +
                    static_cast<size_t>(origin_x + static_cast<uint32_t>(tx))) *
-                      components +
+                       components +
                   comp;
               if (dst_index >= decoded.size())
               {
@@ -472,6 +474,9 @@ namespace tlg::v8
               const size_t tile_offset = (static_cast<size_t>(ty) * tile_w + static_cast<size_t>(tx)) * components + comp;
               if (tile_offset < decoded_mask.size())
                 decoded_mask[tile_offset] = 1;
+              const int residual_value = static_cast<int>(residual);
+              const int abs_residual = (residual_value >= 0) ? residual_value : -residual_value;
+              cas8_predictor.update(comp, predicted.second, abs_residual);
             }
           }
         }
