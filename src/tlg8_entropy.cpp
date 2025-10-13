@@ -50,14 +50,14 @@ namespace
   constexpr ParsedGolombTable parse_default_golomb_table()
   {
     constexpr char data[] = R"(
-8 8 0 4 5 9 23 104 261 488 130
-8 8 3 2 4 11 124 95 229 435 121
-8 8 3 3 4 14 109 87 264 425 115
-8 8 2 2 5 10 17 97 243 515 133
-8 8 2 4 5 7 74 91 274 454 113
-8 8 3 2 4 4 96 44 269 443 159
-8 8 13 1 1 4 31 112 262 499 101
-8 8 3 2 4 15 20 101 237 507 135
+8 7 | 1 2 4 9 26 103 260 487 132
+2 4 | 1 3 5 11 125 95 229 435 120
+8 8 | 1 4 4 16 110 88 263 423 115
+15 7 | 1 4 5 10 19 95 242 516 132
+14 6 | 3 3 4 7 75 91 275 455 111
+8 5 | 3 3 4 5 97 46 267 441 158
+9 8 | 12 2 1 6 34 111 261 496 101
+11 4 | 3 2 5 14 22 102 239 501 136
         )";
 
     ParsedGolombTable result{};
@@ -69,7 +69,7 @@ namespace
 
     while (index < sizeof(data) - 1)
     {
-      while (index < sizeof(data) - 1 && is_whitespace(data[index]))
+      while (index < sizeof(data) - 1 && (data[index] == '|' || is_whitespace(data[index])))
         ++index;
       if (index >= sizeof(data) - 1)
         break;
