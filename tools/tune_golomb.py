@@ -9,18 +9,20 @@ from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
 DEFAULT_GOLOMB_TABLE: List[List[int]] = [
-    [0, 4, 4, 7, 24, 89, 270, 489, 137],
-    [2, 2, 5, 13, 67, 98, 230, 476, 131],
-    [3, 2, 5, 15, 77, 92, 238, 462, 130],
-    [2, 2, 4, 10, 51, 108, 237, 482, 128],
-    [2, 3, 7, 33, 74, 81, 237, 450, 137],
-    [3, 1, 5, 28, 66, 92, 246, 452, 131],
-    [0, 4, 4, 7, 24, 89, 270, 489, 137],
-    [2, 2, 4, 10, 51, 108, 237, 482, 128],
+    [8, 8, 0, 4, 5, 9, 23, 104, 261, 488, 130],
+    [8, 8, 3, 2, 4, 11, 124, 95, 229, 435, 121],
+    [8, 8, 3, 3, 4, 14, 109, 87, 264, 425, 115],
+    [8, 8, 2, 2, 5, 10, 17, 97, 243, 515, 133],
+    [8, 8, 2, 4, 5, 7, 74, 91, 274, 454, 113],
+    [8, 8, 3, 2, 4, 4, 96, 44, 269, 443, 159],
+    [8, 8, 13, 1, 1, 4, 31, 112, 262, 499, 101],
+    [8, 8, 3, 2, 4, 15, 20, 101, 237, 507, 135],
 ]
 GOLOMB_ROW_SUM = 1024
 GOLOMB_ROWS = len(DEFAULT_GOLOMB_TABLE)
-GOLOMB_COLS = len(DEFAULT_GOLOMB_TABLE[0])
+GOLOMB_RATIO_FIELDS = 2
+GOLOMB_VALUE_COLS = len(DEFAULT_GOLOMB_TABLE[0]) - GOLOMB_RATIO_FIELDS
+GOLOMB_TOTAL_COLS = GOLOMB_RATIO_FIELDS + GOLOMB_VALUE_COLS
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,18 +108,30 @@ def load_table(path: Path) -> List[List[int]]:
             line = raw.split("#", 1)[0].split(";", 1)[0].strip()
             if not line:
                 continue
-            parts = line.split()
-            if len(parts) != GOLOMB_COLS:
-                raise ValueError(f"{path}: line {line_no}: expected {GOLOMB_COLS} integers, got {len(parts)}")
             try:
-                values = [int(p) for p in parts]
+                numbers = [int(p) for p in line.replace("|", " ").split()]
             except ValueError as exc:  # pragma: no cover - defensive
                 raise ValueError(f"{path}: line {line_no}: invalid integer") from exc
-            if any(v < 0 for v in values):
+
+            if len(numbers) == GOLOMB_VALUE_COLS:
+                ratios = [8, 8]
+                counts = numbers
+            elif len(numbers) == GOLOMB_TOTAL_COLS:
+                ratios = numbers[:GOLOMB_RATIO_FIELDS]
+                counts = numbers[GOLOMB_RATIO_FIELDS:]
+            else:
+                raise ValueError(
+                    f"{path}: line {line_no}: expected {GOLOMB_TOTAL_COLS} integers (including ratios) "
+                    f"or legacy {GOLOMB_VALUE_COLS} integers, got {len(numbers)}"
+                )
+
+            if any(r < 1 or r > 16 for r in ratios):
+                raise ValueError(f"{path}: line {line_no}: ratio values must be between 1 and 16")
+            if any(v < 0 for v in counts):
                 raise ValueError(f"{path}: line {line_no}: negative values are not allowed")
-            if sum(values) != GOLOMB_ROW_SUM:
+            if sum(counts) != GOLOMB_ROW_SUM:
                 raise ValueError(f"{path}: line {line_no}: row sum must be {GOLOMB_ROW_SUM}")
-            rows.append(values)
+            rows.append(ratios + counts)
 
     if not rows:
         raise ValueError(f"{path}: no rows found")
@@ -141,7 +155,13 @@ def write_table(path: Path, table: Sequence[Sequence[int]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for row in table:
-            handle.write(" ".join(str(v) for v in row))
+            if len(row) != GOLOMB_TOTAL_COLS:
+                raise ValueError("Unexpected Golomb table row length")
+            ratios = row[:GOLOMB_RATIO_FIELDS]
+            counts = row[GOLOMB_RATIO_FIELDS:]
+            handle.write(" ".join(str(v) for v in ratios))
+            handle.write(" | ")
+            handle.write(" ".join(str(v) for v in counts))
             handle.write("\n")
 
 
@@ -155,13 +175,24 @@ def mutate_table(table: Sequence[Sequence[int]], rng: random.Random) -> List[Lis
         for _ in range(change_count):
             row_idx = rng.randrange(GOLOMB_ROWS)
             row = candidate[row_idx]
-            positive_indices = [idx for idx, value in enumerate(row) if value > 0]
+            if rng.random() < 0.2:
+                ratio_idx = rng.randrange(GOLOMB_RATIO_FIELDS)
+                current = row[ratio_idx]
+                new_value = rng.randint(1, 16)
+                if new_value == current:
+                    new_value = 1 + (current % 16)
+                if new_value != current:
+                    row[ratio_idx] = new_value
+                    changed = True
+                continue
+            positive_indices = [idx for idx, value in enumerate(row[GOLOMB_RATIO_FIELDS:]) if value > 0]
             if not positive_indices:
                 continue
-            src_idx = rng.choice(positive_indices)
-            dst_idx = rng.randrange(GOLOMB_COLS - 1)
-            if dst_idx >= src_idx:
+            src_idx = rng.choice(positive_indices) + GOLOMB_RATIO_FIELDS
+            dst_idx = rng.randrange(GOLOMB_VALUE_COLS - 1)
+            if dst_idx >= src_idx - GOLOMB_RATIO_FIELDS:
                 dst_idx += 1
+            dst_idx += GOLOMB_RATIO_FIELDS
             row[src_idx] -= 1
             row[dst_idx] += 1
             changed = True
@@ -172,14 +203,16 @@ def mutate_table(table: Sequence[Sequence[int]], rng: random.Random) -> List[Lis
             # Force a minimal change to guarantee progress.
             forced = [row[:] for row in original]
             row = forced[attempt % GOLOMB_ROWS]
-            donors = [idx for idx, value in enumerate(row) if value > 0]
-            if not donors:
-                attempt += 1
-                continue
-            src_idx = rng.choice(donors)
-            dst_idx = (src_idx + 1) % GOLOMB_COLS
-            row[src_idx] -= 1
-            row[dst_idx] += 1
+            donors = [idx for idx, value in enumerate(row[GOLOMB_RATIO_FIELDS:]) if value > 0]
+            if donors:
+                src_idx = rng.choice(donors) + GOLOMB_RATIO_FIELDS
+                dst_idx = ((src_idx - GOLOMB_RATIO_FIELDS + 1) % GOLOMB_VALUE_COLS) + GOLOMB_RATIO_FIELDS
+                row[src_idx] -= 1
+                row[dst_idx] += 1
+            else:
+                ratio_idx = attempt % GOLOMB_RATIO_FIELDS
+                current = row[ratio_idx]
+                row[ratio_idx] = 1 if current != 1 else 16
             return forced
 
 

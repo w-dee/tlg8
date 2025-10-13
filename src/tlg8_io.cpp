@@ -18,8 +18,9 @@ namespace
   using tlg::detail::read_exact;
 
   constexpr uint8_t kHeaderFlagHasGolombTable = 0x01;
+  constexpr std::size_t kGolombSerializedFieldCount = tlg::v8::enc::kGolombColumnCount + 2;
   constexpr std::size_t kSerializedGolombTableSize =
-      static_cast<std::size_t>(tlg::v8::enc::kGolombRowCount) * tlg::v8::enc::kGolombColumnCount * sizeof(uint16_t);
+      static_cast<std::size_t>(tlg::v8::enc::kGolombRowCount) * kGolombSerializedFieldCount * sizeof(uint16_t);
 
   bool write_bytes(FILE *fp, const void *data, size_t size)
   {
@@ -317,18 +318,33 @@ namespace tlg::v8
         return false;
       }
       enc::golomb_table_counts table{};
+      enc::golomb_ratio_array raise_ratios{};
+      enc::golomb_ratio_array fall_ratios{};
       std::size_t offset = 0;
+      auto read_u16 = [&]() {
+        const uint16_t low = table_bytes[offset];
+        const uint16_t high = table_bytes[offset + 1];
+        offset += 2;
+        return static_cast<uint16_t>(low | static_cast<uint16_t>(high << 8));
+      };
       for (std::size_t row = 0; row < table.size(); ++row)
       {
+        const uint16_t raise_value = read_u16();
+        const uint16_t fall_value = read_u16();
+        if (raise_value == 0 || raise_value > 16 || fall_value == 0 || fall_value > 16)
+        {
+          err = "tlg8: ゴロムテーブルの適応比率が不正です";
+          return false;
+        }
+        raise_ratios[row] = static_cast<uint8_t>(raise_value);
+        fall_ratios[row] = static_cast<uint8_t>(fall_value);
+
         uint32_t row_sum = 0;
         for (std::size_t col = 0; col < table[row].size(); ++col)
         {
-          const uint16_t low = table_bytes[offset];
-          const uint16_t high = table_bytes[offset + 1];
-          const uint16_t value = static_cast<uint16_t>(low | static_cast<uint16_t>(high << 8));
+          const uint16_t value = read_u16();
           table[row][col] = value;
           row_sum += value;
-          offset += 2;
         }
         if (row_sum != enc::kGolombRowSum)
         {
@@ -336,7 +352,7 @@ namespace tlg::v8
           return false;
         }
       }
-      (void)enc::apply_golomb_table(table);
+      (void)enc::apply_golomb_table(table, raise_ratios, fall_ratios);
     }
 
     std::vector<uint8_t> decoded(static_cast<size_t>(total_bytes));
@@ -528,14 +544,23 @@ namespace tlg::v8
       }
 
       const auto &golomb_table = current_golomb_table();
+      const auto &raise_ratios = current_m_raise_ratios();
+      const auto &fall_ratios = current_m_fall_ratios();
       std::array<uint8_t, kSerializedGolombTableSize> table_bytes{};
       std::size_t table_offset = 0;
-      for (const auto &row : golomb_table)
+      for (std::size_t row_index = 0; row_index < golomb_table.size(); ++row_index)
       {
-        for (uint16_t value : row)
-        {
+        const uint16_t raise_value = static_cast<uint16_t>(raise_ratios[row_index]);
+        const uint16_t fall_value = static_cast<uint16_t>(fall_ratios[row_index]);
+        const auto write_value = [&](uint16_t value) {
           table_bytes[table_offset++] = static_cast<uint8_t>(value & 0xFFu);
           table_bytes[table_offset++] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+        };
+        write_value(raise_value);
+        write_value(fall_value);
+        for (uint16_t value : golomb_table[row_index])
+        {
+          write_value(value);
         }
       }
       if (!write_bytes(fp, table_bytes.data(), table_bytes.size()))

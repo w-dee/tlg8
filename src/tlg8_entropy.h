@@ -21,11 +21,11 @@ namespace tlg::v8::enc
       return (a + kAParameterBias) >> kAParameterShift;
     }
 
-    inline constexpr int mix_a_m(int a, int m)
+    inline constexpr int mix_a_m(int a, int m, int m_raise_ratio, int m_fall_ratio)
     {
       if (a < m)
-        return ((m << kAParameterShift) * 3 + a * 5 + 4) >> 3; // 3:5 の比率で混合
-      return ((m << kAParameterShift) + a * 3 + 2) >> 2;        // m を 25%、a を 75% 混合
+        return ((m << kAParameterShift) * m_raise_ratio + a * (16 - m_raise_ratio) + 8) >> 4;
+      return ((m << kAParameterShift) * m_fall_ratio + a * (16 - m_fall_ratio) + 8) >> 4;
     }
   }
 
@@ -47,6 +47,7 @@ namespace tlg::v8::enc
 
   using golomb_histogram = std::array<std::array<uint64_t, kGolombColumnCount>, kGolombRowCount>;
   using golomb_table_counts = std::array<std::array<uint16_t, kGolombColumnCount>, kGolombRowCount>;
+  using golomb_ratio_array = std::array<uint8_t, kGolombRowCount>;
 
   struct entropy_encoder
   {
@@ -97,6 +98,11 @@ namespace tlg::v8::enc
 
   bool rebuild_golomb_table_from_histogram(const golomb_histogram &histogram);
   const golomb_table_counts &current_golomb_table();
+  const golomb_ratio_array &current_m_raise_ratios();
+  const golomb_ratio_array &current_m_fall_ratios();
+  bool apply_golomb_table(const golomb_table_counts &table,
+                          const golomb_ratio_array &raise_ratios,
+                          const golomb_ratio_array &fall_ratios);
   bool apply_golomb_table(const golomb_table_counts &table);
   bool is_golomb_table_overridden();
   uint64_t estimate_row_bits(GolombCodingKind kind,

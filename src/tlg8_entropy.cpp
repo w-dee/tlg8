@@ -25,12 +25,15 @@ namespace
 
   using GolombRow = std::array<uint16_t, kGolombColumnCount>;
   using GolombTable = golomb_table_counts;
+  using GolombRatioArray = golomb_ratio_array;
 
   constexpr std::size_t kLegacyGolombRowCount = 6;
 
   struct ParsedGolombTable
   {
     GolombTable table{};
+    GolombRatioArray raise_ratios{};
+    GolombRatioArray fall_ratios{};
     bool filled = false;
   };
 
@@ -47,19 +50,20 @@ namespace
   constexpr ParsedGolombTable parse_default_golomb_table()
   {
     constexpr char data[] = R"(
-0 4 5 9 23 104 261 488 130
-3 2 4 11 124 95 229 435 121
-3 3 4 14 109 87 264 425 115
-2 2 5 10 17 97 243 515 133
-2 4 5 7 74 91 274 454 113
-3 2 4 4 96 44 269 443 159
-13 1 1 4 31 112 262 499 101
-3 2 4 15 20 101 237 507 135
+8 8 0 4 5 9 23 104 261 488 130
+8 8 3 2 4 11 124 95 229 435 121
+8 8 3 3 4 14 109 87 264 425 115
+8 8 2 2 5 10 17 97 243 515 133
+8 8 2 4 5 7 74 91 274 454 113
+8 8 3 2 4 4 96 44 269 443 159
+8 8 13 1 1 4 31 112 262 499 101
+8 8 3 2 4 15 20 101 237 507 135
         )";
 
     ParsedGolombTable result{};
     std::size_t row = 0;
     std::size_t col = 0;
+    std::size_t ratio_index = 0;
     std::size_t index = 0;
     bool overflow = false;
 
@@ -87,12 +91,36 @@ namespace
 
       if (row < result.table.size())
       {
-        result.table[row][col] = value;
-        ++col;
-        if (col == result.table[row].size())
+        if (ratio_index == 0)
         {
-          col = 0;
-          ++row;
+          if (value == 0 || value > 16)
+          {
+            overflow = true;
+            break;
+          }
+          result.raise_ratios[row] = static_cast<uint8_t>(value);
+          ++ratio_index;
+        }
+        else if (ratio_index == 1)
+        {
+          if (value == 0 || value > 16)
+          {
+            overflow = true;
+            break;
+          }
+          result.fall_ratios[row] = static_cast<uint8_t>(value);
+          ++ratio_index;
+        }
+        else
+        {
+          result.table[row][col] = value;
+          ++col;
+          if (col == result.table[row].size())
+          {
+            col = 0;
+            ratio_index = 0;
+            ++row;
+          }
         }
       }
       else
@@ -101,18 +129,20 @@ namespace
       }
     }
 
-    result.filled = (row == result.table.size() && col == 0 && !overflow);
+    result.filled = (row == result.table.size() && col == 0 && ratio_index == 0 && !overflow);
     return result;
   }
 
-  inline constexpr GolombTable DEFAULT_GOLOMB_TABLE = []() constexpr
-  {
-    constexpr auto parsed = parse_default_golomb_table();
-    static_assert(parsed.filled, "DEFAULT_GOLOMB_TABLE のデータが不足しています");
-    return parsed.table;
-  }();
+  constexpr ParsedGolombTable kDefaultGolombData = parse_default_golomb_table();
+  static_assert(kDefaultGolombData.filled, "DEFAULT_GOLOMB_TABLE のデータが不足しています");
+
+  inline constexpr GolombTable DEFAULT_GOLOMB_TABLE = kDefaultGolombData.table;
+  inline constexpr GolombRatioArray DEFAULT_M_RAISE_RATIOS = kDefaultGolombData.raise_ratios;
+  inline constexpr GolombRatioArray DEFAULT_M_FALL_RATIOS = kDefaultGolombData.fall_ratios;
 
   GolombTable g_golomb_table = DEFAULT_GOLOMB_TABLE;
+  GolombRatioArray g_m_raise_ratios = DEFAULT_M_RAISE_RATIOS;
+  GolombRatioArray g_m_fall_ratios = DEFAULT_M_FALL_RATIOS;
 
   std::array<std::array<uint8_t, kGolombRowCount>, kGolombRowSum> g_bit_length_table{};
   bool g_table_ready = false;
@@ -352,6 +382,9 @@ namespace
     ensure_table_initialized();
     uint64_t bits = 0;
     int a = 0;
+    const std::size_t row_index = static_cast<std::size_t>(row);
+    const int raise_ratio = static_cast<int>(g_m_raise_ratios[row_index]);
+    const int fall_ratio = static_cast<int>(g_m_fall_ratios[row_index]);
     for (uint32_t i = 0; i < count; ++i)
     {
       const uint32_t m = map_plain_value(values[i]);
@@ -366,7 +399,7 @@ namespace
           {
             bits += q + 1u + static_cast<uint32_t>(k_bits);
           });
-      a = mix_a_m(a, m);
+      a = mix_a_m(a, m, raise_ratio, fall_ratio);
     }
     return bits;
   }
@@ -386,6 +419,9 @@ namespace
     int a = 0;
     uint32_t index = 0;
     int zero_run = 0;
+    const std::size_t row_index = static_cast<std::size_t>(row);
+    const int raise_ratio = static_cast<int>(g_m_raise_ratios[row_index]);
+    const int fall_ratio = static_cast<int>(g_m_fall_ratios[row_index]);
     while (index < count)
     {
       const int16_t value = values[index];
@@ -415,7 +451,7 @@ namespace
               {
                 bits += q + 1u + static_cast<uint32_t>(k_bits);
               });
-          a = mix_a_m(a, m);
+          a = mix_a_m(a, m, raise_ratio, fall_ratio);
         }
       }
       else
@@ -445,6 +481,9 @@ namespace
     ensure_table_initialized();
     const int row = golomb_row_index(GolombCodingKind::Plain, component);
     int a = 0;
+    const std::size_t row_index = static_cast<std::size_t>(row);
+    const int raise_ratio = static_cast<int>(g_m_raise_ratios[row_index]);
+    const int fall_ratio = static_cast<int>(g_m_fall_ratios[row_index]);
     for (uint32_t i = 0; i < count; ++i)
     {
       const uint32_t m = map_plain_value(values[i]);
@@ -473,7 +512,7 @@ namespace
               write_bits(writer, value & mask, static_cast<unsigned>(k_bits));
             }
           });
-      a = mix_a_m(a, m);
+      a = mix_a_m(a, m, raise_ratio, fall_ratio);
     }
     return true;
   }
@@ -489,6 +528,9 @@ namespace
     writer.put_upto8(values[0] ? 1u : 0u, 1);
     const int row = golomb_row_index(GolombCodingKind::RunLength, component);
     int a = 0;
+    const std::size_t row_index = static_cast<std::size_t>(row);
+    const int raise_ratio = static_cast<int>(g_m_raise_ratios[row_index]);
+    const int fall_ratio = static_cast<int>(g_m_fall_ratios[row_index]);
     uint32_t index = 0;
     int zero_run = 0;
     while (index < count)
@@ -534,7 +576,7 @@ namespace
                   write_bits(writer, value & mask, static_cast<unsigned>(k_bits));
                 }
               });
-          a = mix_a_m(a, m);
+          a = mix_a_m(a, m, raise_ratio, fall_ratio);
         }
       }
       else
@@ -618,6 +660,9 @@ namespace
     ensure_table_initialized();
     const int row = golomb_row_index(GolombCodingKind::Plain, component);
     int a = 0;
+    const std::size_t row_index = static_cast<std::size_t>(row);
+    const int raise_ratio = static_cast<int>(g_m_raise_ratios[row_index]);
+    const int fall_ratio = static_cast<int>(g_m_fall_ratios[row_index]);
     for (uint32_t produced = 0; produced < expected_count; ++produced)
     {
       const int k = g_bit_length_table[static_cast<uint32_t>(reduce_a(a))][row];
@@ -654,7 +699,7 @@ namespace
       dst[produced] = static_cast<int16_t>(residual);
 
       // printf("P e=%d q=%d m=%d, k=%d\n", (int)residual, (int)q, (int)m, (int)k);
-      a = mix_a_m(a, m);
+      a = mix_a_m(a, m, raise_ratio, fall_ratio);
     }
     return true;
   }
@@ -673,6 +718,9 @@ namespace
     bool expect_nonzero = (first_bit != 0);
     const int row = golomb_row_index(GolombCodingKind::RunLength, component);
     int a = 0;
+    const std::size_t row_index = static_cast<std::size_t>(row);
+    const int raise_ratio = static_cast<int>(g_m_raise_ratios[row_index]);
+    const int fall_ratio = static_cast<int>(g_m_fall_ratios[row_index]);
     uint32_t produced = 0;
     while (produced < expected_count)
     {
@@ -732,7 +780,7 @@ namespace
 
         // printf("R e=%d q=%d m=%d, k=%d\n", (int)residual, (int)q, (int)m, (int)k);
         dst[produced++] = static_cast<int16_t>(residual);
-        a = mix_a_m(a, m);
+        a = mix_a_m(a, m, raise_ratio, fall_ratio);
       }
       expect_nonzero = false;
     }
@@ -843,6 +891,8 @@ namespace tlg::v8
         g_golomb_table = DEFAULT_GOLOMB_TABLE;
         g_table_ready = false;
       }
+      g_m_raise_ratios = DEFAULT_M_RAISE_RATIOS;
+      g_m_fall_ratios = DEFAULT_M_FALL_RATIOS;
       g_table_overridden = false;
       err.clear();
       return true;
@@ -859,6 +909,10 @@ namespace tlg::v8
     std::size_t line_number = 0;
     std::vector<GolombRow> parsed_rows;
     parsed_rows.reserve(static_cast<std::size_t>(kGolombRowCount));
+    std::vector<uint8_t> parsed_raise;
+    parsed_raise.reserve(static_cast<std::size_t>(kGolombRowCount));
+    std::vector<uint8_t> parsed_fall;
+    parsed_fall.reserve(static_cast<std::size_t>(kGolombRowCount));
     std::vector<std::size_t> parsed_line_numbers;
     parsed_line_numbers.reserve(static_cast<std::size_t>(kGolombRowCount));
 
@@ -873,13 +927,67 @@ namespace tlg::v8
         continue;
 
       const std::size_t row_index = parsed_rows.size();
+      std::replace(line.begin(), line.end(), '|', ' ');
       std::istringstream iss(line);
-      GolombRow row_values{};
-      int sum = 0;
-      int value = 0;
-      std::size_t col = 0;
-      while (col < row_values.size() && (iss >> value))
+      std::vector<int> tokens;
+      int token_value = 0;
+      while (iss >> token_value)
+        tokens.push_back(token_value);
+
+      if (iss.fail() && !iss.eof())
       {
+        err = "tlg8: invalid token in Golomb table '" + path + "' at line " + std::to_string(line_number);
+        return false;
+      }
+
+      GolombRow row_values{};
+      const std::size_t expected_counts = row_values.size();
+      const std::size_t token_count = tokens.size();
+      std::size_t start_index = 0;
+      uint16_t raise_ratio = 8;
+      uint16_t fall_ratio = 8;
+
+      if (token_count == expected_counts + 2)
+      {
+        const int raise_value = tokens[0];
+        const int fall_value = tokens[1];
+        if (raise_value < 1 || raise_value > 16)
+        {
+          err = "tlg8: m_raise_ratio must be between 1 and 16 in Golomb table '" + path + "' at row " +
+                std::to_string(row_index + 1);
+          return false;
+        }
+        if (fall_value < 1 || fall_value > 16)
+        {
+          err = "tlg8: m_fall_ratio must be between 1 and 16 in Golomb table '" + path + "' at row " +
+                std::to_string(row_index + 1);
+          return false;
+        }
+        raise_ratio = static_cast<uint16_t>(raise_value);
+        fall_ratio = static_cast<uint16_t>(fall_value);
+        start_index = 2;
+      }
+      else if (token_count == expected_counts)
+      {
+        start_index = 0;
+      }
+      else
+      {
+        err = "tlg8: expected 11 values (including 2 ratios) or legacy 9 values in Golomb table '" + path +
+              "' at row " + std::to_string(row_index + 1);
+        return false;
+      }
+
+      if (token_count - start_index != expected_counts)
+      {
+        err = "tlg8: row length mismatch in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
+        return false;
+      }
+
+      int sum = 0;
+      for (std::size_t col = 0; col < expected_counts; ++col)
+      {
+        const int value = tokens[start_index + col];
         if (value < 0)
         {
           err = "tlg8: negative value in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
@@ -890,27 +998,8 @@ namespace tlg::v8
           err = "tlg8: value too large in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
           return false;
         }
-        row_values[col++] = static_cast<uint16_t>(value);
+        row_values[col] = static_cast<uint16_t>(value);
         sum += value;
-      }
-
-      if (col != row_values.size())
-      {
-        if (iss.fail() && !iss.eof())
-        {
-          err = "tlg8: invalid token in Golomb table '" + path + "' at line " + std::to_string(line_number);
-        }
-        else
-        {
-          err = "tlg8: expected 9 values in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
-        }
-        return false;
-      }
-
-      if (iss >> value)
-      {
-        err = "tlg8: too many values in Golomb table '" + path + "' at row " + std::to_string(row_index + 1);
-        return false;
       }
 
       if (sum != static_cast<int>(kGolombRowSum))
@@ -920,6 +1009,8 @@ namespace tlg::v8
       }
 
       parsed_rows.push_back(row_values);
+      parsed_raise.push_back(static_cast<uint8_t>(raise_ratio));
+      parsed_fall.push_back(static_cast<uint8_t>(fall_ratio));
       parsed_line_numbers.push_back(line_number);
     }
 
@@ -930,6 +1021,8 @@ namespace tlg::v8
     }
 
     std::vector<GolombRow> expanded_rows;
+    std::vector<uint8_t> expanded_raise;
+    std::vector<uint8_t> expanded_fall;
     const std::size_t parsed_count = parsed_rows.size();
     if (parsed_count > static_cast<std::size_t>(kGolombRowCount))
     {
@@ -944,6 +1037,8 @@ namespace tlg::v8
     if (parsed_count == static_cast<std::size_t>(kGolombRowCount))
     {
       expanded_rows = parsed_rows;
+      expanded_raise = parsed_raise;
+      expanded_fall = parsed_fall;
     }
     else if (parsed_count == kLegacyGolombRowCount)
     {
@@ -951,13 +1046,25 @@ namespace tlg::v8
       expanded_rows = parsed_rows;
       expanded_rows.push_back(parsed_rows[0]);
       expanded_rows.push_back(parsed_rows[3]);
+      expanded_raise = parsed_raise;
+      expanded_fall = parsed_fall;
+      expanded_raise.push_back(parsed_raise[0]);
+      expanded_fall.push_back(parsed_fall[0]);
+      expanded_raise.push_back(parsed_raise[3]);
+      expanded_fall.push_back(parsed_fall[3]);
     }
     else if (static_cast<std::size_t>(kGolombRowCount) % parsed_count == 0)
     {
       const std::size_t repeat = static_cast<std::size_t>(kGolombRowCount) / parsed_count;
       expanded_rows.reserve(static_cast<std::size_t>(kGolombRowCount));
+      expanded_raise.reserve(static_cast<std::size_t>(kGolombRowCount));
+      expanded_fall.reserve(static_cast<std::size_t>(kGolombRowCount));
       for (std::size_t i = 0; i < repeat; ++i)
+      {
         expanded_rows.insert(expanded_rows.end(), parsed_rows.begin(), parsed_rows.end());
+        expanded_raise.insert(expanded_raise.end(), parsed_raise.begin(), parsed_raise.end());
+        expanded_fall.insert(expanded_fall.end(), parsed_fall.begin(), parsed_fall.end());
+      }
     }
     else
     {
@@ -966,15 +1073,31 @@ namespace tlg::v8
       return false;
     }
 
+    if (expanded_rows.size() != static_cast<std::size_t>(kGolombRowCount) ||
+        expanded_raise.size() != static_cast<std::size_t>(kGolombRowCount) ||
+        expanded_fall.size() != static_cast<std::size_t>(kGolombRowCount))
+    {
+      err = "tlg8: failed to expand Golomb table '" + path + "' to required row count";
+      return false;
+    }
+
     GolombTable candidate{};
+    GolombRatioArray raise_array{};
+    GolombRatioArray fall_array{};
     for (std::size_t i = 0; i < static_cast<std::size_t>(kGolombRowCount); ++i)
+    {
       candidate[i] = expanded_rows[i];
+      raise_array[i] = expanded_raise[i];
+      fall_array[i] = expanded_fall[i];
+    }
 
     if (candidate != g_golomb_table)
     {
       g_golomb_table = candidate;
       g_table_ready = false;
     }
+    g_m_raise_ratios = raise_array;
+    g_m_fall_ratios = fall_array;
     g_table_overridden = true;
     err.clear();
     return true;
@@ -1016,15 +1139,43 @@ namespace tlg::v8::enc
     return g_golomb_table;
   }
 
-  bool apply_golomb_table(const golomb_table_counts &table)
+  const golomb_ratio_array &current_m_raise_ratios()
   {
+    return g_m_raise_ratios;
+  }
+
+  const golomb_ratio_array &current_m_fall_ratios()
+  {
+    return g_m_fall_ratios;
+  }
+
+  bool apply_golomb_table(const golomb_table_counts &table,
+                          const golomb_ratio_array &raise_ratios,
+                          const golomb_ratio_array &fall_ratios)
+  {
+    bool changed = false;
     if (table != g_golomb_table)
     {
       g_golomb_table = table;
       g_table_ready = false;
-      return true;
+      changed = true;
     }
-    return false;
+    if (raise_ratios != g_m_raise_ratios)
+    {
+      g_m_raise_ratios = raise_ratios;
+      changed = true;
+    }
+    if (fall_ratios != g_m_fall_ratios)
+    {
+      g_m_fall_ratios = fall_ratios;
+      changed = true;
+    }
+    return changed;
+  }
+
+  bool apply_golomb_table(const golomb_table_counts &table)
+  {
+    return apply_golomb_table(table, g_m_raise_ratios, g_m_fall_ratios);
   }
 
   bool is_golomb_table_overridden()
