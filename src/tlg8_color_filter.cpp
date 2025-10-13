@@ -71,6 +71,12 @@ namespace
       processor(params, perm, b[i], g[i], r[i]);
   }
 
+  inline constexpr int get_half(int v)
+  {
+    return v / 2;
+    // return v < 0 ? ((v - 1) / 2) : ((v + 1) / 2); // this is "right" in theory but worsen the compression ratio
+  }
+
   inline int predict_primary(int mode, int c0)
   {
     switch (mode & 0x3)
@@ -80,9 +86,9 @@ namespace
     case 1:
       return c0;
     case 2:
-      return (c0) / 2;
+      return get_half(c0);
     case 3:
-      return (3 * c0) / 2;
+      return get_half(3 * c0);
     default:
       return 0;
     }
@@ -99,7 +105,7 @@ namespace
     case 2:
       return reference1;
     case 3:
-      return (c0 + reference1) / 2;
+      return get_half(c0 + reference1);
     default:
       return 0;
     }
@@ -120,7 +126,8 @@ namespace tlg::v8::enc
            const std::array<uint8_t, 3> &perm,
            int16_t &b,
            int16_t &g,
-           int16_t &r) {
+           int16_t &r)
+        {
           const std::array<int, 3> source = {
               static_cast<int>(b),
               static_cast<int>(g),
@@ -154,7 +161,8 @@ namespace tlg::v8::enc
            const std::array<uint8_t, 3> &perm,
            int16_t &b,
            int16_t &g,
-           int16_t &r) {
+           int16_t &r)
+        {
           const int c0 = static_cast<int>(b);
           const int c1 = static_cast<int>(g);
           const int c2 = static_cast<int>(r);
