@@ -13,7 +13,7 @@ namespace tlg::v8::enc
   namespace adaptation
   {
     // 適応パラメータを共有するための定数と関数。
-    inline constexpr int kAParameterShift = 2;
+    inline constexpr int kAParameterShift = 4;
     inline constexpr int kAParameterBias = 1 << (kAParameterShift - 1);
 
     inline constexpr int reduce_a(int a)
