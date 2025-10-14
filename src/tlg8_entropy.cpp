@@ -172,72 +172,6 @@ namespace
     g_table_ready = true;
   }
 
-  bool normalize_histogram_row(const std::array<uint64_t, kGolombColumnCount> &hist,
-                               GolombRow &row)
-  {
-    row.fill(0);
-    uint64_t total = 0;
-    for (auto value : hist)
-      total += value;
-    if (total == 0)
-      return false;
-
-    std::array<uint64_t, kGolombColumnCount> remainders{};
-    uint32_t assigned = 0;
-    for (std::size_t col = 0; col < kGolombColumnCount; ++col)
-    {
-      const uint64_t numerator = hist[col] * static_cast<uint64_t>(kGolombRowSum);
-      const uint16_t base = static_cast<uint16_t>(std::min<uint64_t>(numerator / total, kGolombRowSum));
-      row[col] = base;
-      remainders[col] = numerator % total;
-      assigned += base;
-    }
-
-    if (assigned > kGolombRowSum)
-    {
-      uint32_t overflow = assigned - kGolombRowSum;
-      for (std::size_t col = kGolombColumnCount; col-- > 0 && overflow > 0;)
-      {
-        const uint16_t reducible = static_cast<uint16_t>(std::min<uint32_t>(overflow, row[col]));
-        row[col] = static_cast<uint16_t>(row[col] - reducible);
-        overflow -= reducible;
-      }
-      assigned = kGolombRowSum;
-    }
-
-    while (assigned < kGolombRowSum)
-    {
-      std::size_t best_col = kGolombColumnCount - 1;
-      uint64_t best_remainder = 0;
-      for (std::size_t col = 0; col < kGolombColumnCount; ++col)
-      {
-        if (row[col] >= kGolombRowSum)
-          continue;
-        if (remainders[col] > best_remainder)
-        {
-          best_remainder = remainders[col];
-          best_col = col;
-        }
-      }
-      if (best_remainder == 0)
-      {
-        for (std::size_t col = 0; col < kGolombColumnCount; ++col)
-        {
-          if (row[col] >= kGolombRowSum)
-            continue;
-          best_col = col;
-          if (hist[col] > 0)
-            break;
-        }
-      }
-      ++row[best_col];
-      if (remainders[best_col] > 0)
-        --remainders[best_col];
-      ++assigned;
-    }
-    return true;
-  }
-
   inline void write_zero_bits(BitWriter &writer, uint32_t count)
   {
     while (count >= 8)
@@ -1121,29 +1055,6 @@ namespace tlg::v8::enc
   void set_golomb_prediction_dump_file(FILE *fp)
   {
     g_golomb_prediction_dump_file = fp;
-  }
-
-  bool rebuild_golomb_table_from_histogram(const golomb_histogram &histogram)
-  {
-    GolombTable candidate = g_golomb_table;
-    bool changed = false;
-    for (std::size_t row = 0; row < candidate.size(); ++row)
-    {
-      GolombRow new_row{};
-      if (!normalize_histogram_row(histogram[row], new_row))
-        continue;
-      if (candidate[row] != new_row)
-      {
-        candidate[row] = new_row;
-        changed = true;
-      }
-    }
-    if (changed)
-    {
-      g_golomb_table = candidate;
-      g_table_ready = false;
-    }
-    return changed;
   }
 
   const golomb_table_counts &current_golomb_table()
