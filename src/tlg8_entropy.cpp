@@ -258,7 +258,7 @@ namespace
     return zeros;
   }
 
-  inline uint32_t map_plain_value(int16_t value)
+  inline constexpr uint32_t map_plain_value(int16_t value)
   {
     if (value >= 0)
       return static_cast<uint32_t>(value) * 2u;
@@ -266,11 +266,23 @@ namespace
     return static_cast<uint32_t>(abs_value * 2 - 1);
   }
 
-  inline uint32_t map_run_length_value(int16_t value)
+  static_assert(map_plain_value(0) == 0);
+  static_assert(map_plain_value(-1) == 1);
+  static_assert(map_plain_value(1) == 2);
+  static_assert(map_plain_value(-2) == 3);
+  static_assert(map_plain_value(2) == 4);
+
+  inline constexpr uint32_t map_run_length_value(int16_t value)
   {
     const uint32_t mapped = map_plain_value(value);
     return (mapped > 0) ? (mapped - 1u) : 0u;
   }
+
+  static_assert(map_run_length_value(0) == 0); // この値は実際には使われない
+  static_assert(map_run_length_value(-1) == 0);
+  static_assert(map_run_length_value(1) == 1);
+  static_assert(map_run_length_value(-2) == 2);
+  static_assert(map_run_length_value(2) == 3);
 
   inline uint32_t reduce_index(int a)
   {
