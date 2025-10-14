@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_GOLOMB_TABLE: List[List[int]] = [
     [8, 8, 0, 4, 5, 9, 23, 104, 261, 488, 130],
@@ -81,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=6,
         help="Number of mutation attempts per round (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--population-size",
+        type=int,
+        default=8,
+        help="Number of Golomb table individuals to evaluate per generation (default: %(default)s)",
     )
     parser.add_argument(
         "--max-generations",
@@ -165,14 +171,20 @@ def write_table(path: Path, table: Sequence[Sequence[int]]) -> None:
             handle.write("\n")
 
 
-def mutate_table(table: Sequence[Sequence[int]], rng: random.Random) -> List[List[int]]:
+def mutate_table(
+    table: Sequence[Sequence[int]],
+    rng: random.Random,
+    change_count: Optional[int] = None,
+) -> List[List[int]]:
     original = [list(row) for row in table]
     attempt = 0
     while True:
         candidate = [row[:] for row in original]
-        change_count = rng.randint(1, GOLOMB_ROWS)
+        # 変異の強さを制御する。指定が無ければランダム。
+        steps = change_count if change_count is not None else rng.randint(1, GOLOMB_ROWS)
+        steps = max(1, min(steps, GOLOMB_ROWS))
         changed = False
-        for _ in range(change_count):
+        for _ in range(steps):
             row_idx = rng.randrange(GOLOMB_ROWS)
             row = candidate[row_idx]
             if rng.random() < 0.2:
@@ -353,6 +365,8 @@ def main() -> None:
         raise ValueError("attempts must be positive")
     if args.max_generations <= 0:
         raise ValueError("max-generations must be positive")
+    if args.population_size <= 0:
+        raise ValueError("population-size must be positive")
     if args.max_parallel <= 0:
         raise ValueError("max-parallel must be positive")
 
@@ -384,41 +398,98 @@ def main() -> None:
             print(f"[round {iteration}] evaluating {len(active_images)} images")
             for attempt in range(1, args.attempts + 1):
                 print(f"  [attempt {attempt}] start")
-                search_table = [row[:] for row in best_table]
-                search_bits = best_bits
+                current_table = [row[:] for row in best_table]
+                current_bits = best_bits
                 success = False
                 for generation in range(1, args.max_generations + 1):
-                    candidate_table = mutate_table(search_table, rng)
-                    candidate_bits = evaluate_table(
-                        binary_path,
-                        active_images,
-                        candidate_table,
-                        work_dir,
-                        args.fast_mode,
-                        args.max_parallel,
+                    print(
+                        "    [generation {gen}] evaluating {count} individuals".format(
+                            gen=generation,
+                            count=args.population_size,
+                        )
                     )
-                    if candidate_bits < best_bits:
-                        best_bits = candidate_bits
-                        best_table = [row[:] for row in candidate_table]
-                        search_table = [row[:] for row in candidate_table]
+                    individuals: List[Tuple[List[List[int]], int]] = []
+                    for idx in range(args.population_size):
+                        if args.population_size == 1:
+                            intensity = 1
+                        else:
+                            intensity = 1 + ((GOLOMB_ROWS - 1) * idx) // (args.population_size - 1)
+                        individual = mutate_table(current_table, rng, intensity)
+                        individuals.append((individual, intensity))
+
+                    best_candidate = current_table
+                    best_candidate_bits = current_bits
+                    best_intensity = 0
+                    for idx, (candidate_table, intensity) in enumerate(individuals, 1):
+                        candidate_bits = evaluate_table(
+                            binary_path,
+                            active_images,
+                            candidate_table,
+                            work_dir,
+                            args.fast_mode,
+                            args.max_parallel,
+                        )
+                        print(
+                            "        individual {idx}/{total}: bits={bits}".format(
+                                idx=idx,
+                                total=args.population_size,
+                                bits=candidate_bits,
+                            )
+                        )
+                        if candidate_bits < best_candidate_bits:
+                            best_candidate = candidate_table
+                            best_candidate_bits = candidate_bits
+                            best_intensity = intensity
+                        elif (
+                            candidate_bits == best_candidate_bits
+                            and best_candidate is current_table
+                        ):
+                            best_candidate = candidate_table
+                            best_intensity = intensity
+
+                    if best_candidate_bits < current_bits:
+                        best_bits = best_candidate_bits
+                        best_table = [row[:] for row in best_candidate]
                         write_table(best_table_path, best_table)
                         print(
-                            "    [generation {gen}] improvement: best_bits={bits}".format(
+                            "    [generation {gen}] improvement: best_bits={bits} (intensity={intensity})".format(
                                 gen=generation,
                                 bits=best_bits,
+                                intensity=best_intensity,
                             )
                         )
                         success = True
                         break
-                    if candidate_bits < search_bits:
-                        search_table = [row[:] for row in candidate_table]
-                        search_bits = candidate_bits
+
+                    if best_candidate_bits == current_bits and best_candidate is not current_table:
+                        best_table = [row[:] for row in best_candidate]
+                        write_table(best_table_path, best_table)
                         print(
-                            "    [generation {gen}] new search seed (bits={bits})".format(
+                            "    [generation {gen}] silent mutation preserved (intensity={intensity})".format(
                                 gen=generation,
-                                bits=candidate_bits,
+                                intensity=best_intensity,
                             )
                         )
+                        success = True
+                        break
+
+                    if best_candidate is not current_table:
+                        current_table = [row[:] for row in best_candidate]
+                        current_bits = best_candidate_bits
+                        print(
+                            "    [generation {gen}] new seed (bits={bits}, intensity={intensity})".format(
+                                gen=generation,
+                                bits=current_bits,
+                                intensity=best_intensity,
+                            )
+                        )
+                    else:
+                        print(
+                            "    [generation {gen}] no better individual found".format(
+                                gen=generation,
+                            )
+                        )
+
                 if not success:
                     print(
                         "  [attempt {idx}] no improvement after {gen} generations".format(
