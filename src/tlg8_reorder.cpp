@@ -411,19 +411,47 @@ namespace
   static_assert(_check_reorder_array(kZigzagNEESWWOrder), "kZigzagNEESWWOrder の内容が不正です");
   static_assert(_check_reorder_array(kZigzagNWWSEEOrder), "kZigzagNWWSEEOrder の内容が不正です");
 
-  inline uint32_t build_hilbert_sequence(uint32_t block_w,
+  inline constexpr const std::array<uint8_t, 64> &order_from_pattern(tlg::v8::enc::ReorderPattern pattern)
+  {
+    using tlg::v8::enc::ReorderPattern;
+    switch (pattern)
+    {
+    case ReorderPattern::Hilbert:
+      return kHilbertOrder;
+    case ReorderPattern::ZigzagDiag:
+      return kZigzagDiagOrder;
+    case ReorderPattern::ZigzagAntiDiag:
+      return kZigzagAntiDiagOrder;
+    case ReorderPattern::ZigzagHorz:
+      return kZigzagHorzOrder;
+    case ReorderPattern::ZigzagVert:
+      return kZigzagVertOrder;
+    case ReorderPattern::ZigzagNNESSW:
+      return kZigzagNNESSWOrder;
+    case ReorderPattern::ZigzagNEESWW:
+      return kZigzagNEESWWOrder;
+    case ReorderPattern::ZigzagNWWSEE:
+      return kZigzagNWWSEEOrder;
+    default:
+      return kHilbertOrder;
+    }
+  }
+
+  inline uint32_t build_reorder_sequence(uint32_t block_w,
                                          uint32_t block_h,
-                                         std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels> &sequence)
+                                         std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels> &sequence,
+                                         tlg::v8::enc::ReorderPattern pattern)
   {
     const uint32_t value_count = block_w * block_h;
     if (value_count == 0)
       return 0;
 
+    const auto &order = order_from_pattern(pattern);
     uint32_t index = 0;
-    for (uint8_t order : kHilbertOrder)
+    for (uint8_t entry : order)
     {
-      const uint32_t x = order % tlg::v8::enc::kBlockSize;
-      const uint32_t y = order / tlg::v8::enc::kBlockSize;
+      const uint32_t x = entry % tlg::v8::enc::kBlockSize;
+      const uint32_t y = entry / tlg::v8::enc::kBlockSize;
       if (x >= block_w || y >= block_h)
         continue;
       if (index < sequence.size())
@@ -433,11 +461,11 @@ namespace
     return index;
   }
 
-  void apply_hilbert_sequence(tlg::v8::enc::component_colors &colors,
+  void apply_reorder_sequence(tlg::v8::enc::component_colors &colors,
                               uint32_t components,
                               uint32_t value_count,
                               const std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels> &sequence,
-                              bool to_hilbert)
+                              bool to_scan)
   {
     // 並べ替え元と並べ替え先の両方で共通利用する一時領域。
     std::array<int16_t, tlg::v8::enc::kMaxBlockPixels> temp{};
@@ -447,12 +475,12 @@ namespace
       auto &component_values = colors.values[comp];
       for (uint32_t i = 0; i < value_count; ++i)
       {
-        const uint32_t from_index = to_hilbert ? sequence[i] : i;
+        const uint32_t from_index = to_scan ? sequence[i] : i;
         temp[i] = component_values[from_index];
       }
       for (uint32_t i = 0; i < value_count; ++i)
       {
-        const uint32_t to_index = to_hilbert ? i : sequence[i];
+        const uint32_t to_index = to_scan ? i : sequence[i];
         component_values[to_index] = temp[i];
       }
     }
@@ -461,7 +489,11 @@ namespace
 
 namespace tlg::v8::enc
 {
-  void reorder_to_hilbert(component_colors &colors, uint32_t components, uint32_t block_w, uint32_t block_h)
+  void reorder_to_scan(component_colors &colors,
+                       uint32_t components,
+                       uint32_t block_w,
+                       uint32_t block_h,
+                       ReorderPattern pattern)
   {
     if (block_w != 8 || block_h != 8)
     {
@@ -473,13 +505,17 @@ namespace tlg::v8::enc
       return;
 
     std::array<uint8_t, kMaxBlockPixels> sequence{};
-    const uint32_t sequence_size = build_hilbert_sequence(block_w, block_h, sequence);
+    const uint32_t sequence_size = build_reorder_sequence(block_w, block_h, sequence, pattern);
     if (sequence_size != value_count)
       return;
-    apply_hilbert_sequence(colors, components, value_count, sequence, true);
+    apply_reorder_sequence(colors, components, value_count, sequence, true);
   }
 
-  void reorder_from_hilbert(component_colors &colors, uint32_t components, uint32_t block_w, uint32_t block_h)
+  void reorder_from_scan(component_colors &colors,
+                         uint32_t components,
+                         uint32_t block_w,
+                         uint32_t block_h,
+                         ReorderPattern pattern)
   {
     if (block_w != 8 || block_h != 8)
     {
@@ -491,9 +527,9 @@ namespace tlg::v8::enc
       return;
 
     std::array<uint8_t, kMaxBlockPixels> sequence{};
-    const uint32_t sequence_size = build_hilbert_sequence(block_w, block_h, sequence);
+    const uint32_t sequence_size = build_reorder_sequence(block_w, block_h, sequence, pattern);
     if (sequence_size != value_count)
       return;
-    apply_hilbert_sequence(colors, components, value_count, sequence, false);
+    apply_reorder_sequence(colors, components, value_count, sequence, false);
   }
 }

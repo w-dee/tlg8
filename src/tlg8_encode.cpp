@@ -186,6 +186,7 @@ namespace
   {
     uint32_t predictor = 0;
     uint32_t filter = 0;
+    uint32_t reorder = 0;
     uint32_t entropy = 0;
     uint32_t interleave = 0;
   };
@@ -560,7 +561,7 @@ namespace tlg::v8::enc
     const bool dump_after_color = dump_fp &&
                                   (dump_order == TlgOptions::DumpResidualsOrder::AfterColorFilter ||
                                    dump_order == TlgOptions::DumpResidualsOrder::BeforeHilbert);
-    const bool dump_after_hilbert = dump_fp &&
+    const bool dump_after_reorder = dump_fp &&
                                     (dump_order == TlgOptions::DumpResidualsOrder::AfterHilbert);
 
     const auto &predictors = predictor_table();
@@ -569,10 +570,8 @@ namespace tlg::v8::enc
     const size_t reserve_per_row = static_cast<size_t>(tile_w) * tile_h;
     for (auto &values : entropy_values)
       values.reserve(reserve_per_row);
-    // 将来的にはここで並び替え候補も列挙し、
-    // predictor × filter × reorder × entropy の全組み合わせを評価する。
-    // 現状は reorder をヒルベルト固定とし、predictor × filter × entropy の
-    // 組み合わせを探索している。
+    // predictor × filter × 並び替え × entropy の全組み合わせを評価して
+    // ブロック毎に最適な構成を選ぶ。
     tile_accessor accessor(image_base, image_width, components, origin_x, origin_y, tile_w, tile_h);
     const uint32_t block_cols = (tile_w + kBlockSize - 1) / kBlockSize;
     const uint32_t block_rows = (tile_h + kBlockSize - 1) / kBlockSize;
@@ -604,13 +603,15 @@ namespace tlg::v8::enc
         const uint32_t value_count = block_w * block_h;
 
         component_colors best_after_interleave{};
-        component_colors best_after_hilbert{};
+        component_colors best_after_reorder{};
         component_colors best_after_color{};
         component_colors best_after_predictor{};
         uint32_t best_predictor = 0;
         uint32_t best_filter = 0;
         uint32_t best_entropy = 0;
         uint32_t best_interleave = 0;
+        ReorderPattern best_reorder_pattern = ReorderPattern::Hilbert;
+        uint32_t best_reorder_index = 0;
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
 
         component_colors candidate{};
@@ -643,7 +644,7 @@ namespace tlg::v8::enc
             if (components >= 3)
               apply_color_filter(static_cast<int>(filter_code), filtered, components, value_count);
 
-            component_colors filtered_before_hilbert = filtered;
+            component_colors filtered_before_reorder = filtered;
             const double filtered_energy = compute_energy(filtered, components, value_count);
             if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
                 filtered_energy > best_filtered_energy * kEarlyExitGiveUpRate)
@@ -654,36 +655,42 @@ namespace tlg::v8::enc
             if (filtered_energy < best_filtered_energy)
               best_filtered_energy = filtered_energy;
 
-            component_colors reordered = filtered;
-            reorder_to_hilbert(reordered, components, block_w, block_h);
-
-            for (uint32_t interleave_index = 0; interleave_index < kNumInterleaveFilter; ++interleave_index)
+            for (uint32_t reorder_index = 0; reorder_index < kReorderPatternCount; ++reorder_index)
             {
-              component_colors interleaved = reordered;
-              apply_interleave_filter(static_cast<InterleaveFilter>(interleave_index),
-                                      interleaved,
-                                      components,
-                                      value_count);
+              const ReorderPattern reorder_pattern = static_cast<ReorderPattern>(reorder_index);
+              component_colors reordered = filtered;
+              reorder_to_scan(reordered, components, block_w, block_h, reorder_pattern);
 
-              for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
+              for (uint32_t interleave_index = 0; interleave_index < kNumInterleaveFilter; ++interleave_index)
               {
-                const bool uses_interleave_candidate =
-                    (interleave_index == static_cast<uint32_t>(InterleaveFilter::Interleave));
-                const uint64_t estimated_bits = entropy_encoders[entropy_index].estimate_bits(interleaved,
-                                                                                              components,
-                                                                                              value_count,
-                                                                                              uses_interleave_candidate);
-                if (estimated_bits < best_bits)
+                component_colors interleaved = reordered;
+                apply_interleave_filter(static_cast<InterleaveFilter>(interleave_index),
+                                        interleaved,
+                                        components,
+                                        value_count);
+
+                for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
                 {
-                  best_bits = estimated_bits;
-                  best_predictor = predictor_index;
-                  best_filter = filter_code;
-                  best_entropy = entropy_index;
-                  best_interleave = interleave_index;
-                  best_after_interleave = interleaved;
-                  best_after_hilbert = reordered;
-                  best_after_color = filtered_before_hilbert;
-                  best_after_predictor = candidate;
+                  const bool uses_interleave_candidate =
+                      (interleave_index == static_cast<uint32_t>(InterleaveFilter::Interleave));
+                  const uint64_t estimated_bits = entropy_encoders[entropy_index].estimate_bits(interleaved,
+                                                                                                components,
+                                                                                                value_count,
+                                                                                                uses_interleave_candidate);
+                  if (estimated_bits < best_bits)
+                  {
+                    best_bits = estimated_bits;
+                    best_predictor = predictor_index;
+                    best_filter = filter_code;
+                    best_entropy = entropy_index;
+                    best_interleave = interleave_index;
+                    best_after_interleave = interleaved;
+                    best_after_reorder = reordered;
+                    best_after_color = filtered_before_reorder;
+                    best_after_predictor = candidate;
+                    best_reorder_pattern = reorder_pattern;
+                    best_reorder_index = reorder_index;
+                  }
                 }
               }
             }
@@ -694,7 +701,7 @@ namespace tlg::v8::enc
         // reorder は固定だが、filter やエントロピー符号化方式と同じ基準で
         // 比較する設計とし、将来的に並び替え候補を増やしても流用できるよう
         // にしている。
-        block_choices.push_back(block_choice{best_predictor, best_filter, best_entropy, best_interleave});
+        block_choices.push_back(block_choice{best_predictor, best_filter, best_reorder_index, best_entropy, best_interleave});
 
         if (dump_fp)
         {
@@ -730,7 +737,7 @@ namespace tlg::v8::enc
                                 best_bits,
                                 best_after_color,
                                 "after_color");
-          if (dump_after_hilbert)
+          if (dump_after_reorder)
             dump_residual_block(dump_fp,
                                 origin_x,
                                 origin_y,
@@ -744,7 +751,7 @@ namespace tlg::v8::enc
                                 best_entropy,
                                 best_interleave,
                                 best_bits,
-                                best_after_hilbert,
+                                best_after_reorder,
                                 "after_hilbert");
         }
 
@@ -763,8 +770,8 @@ namespace tlg::v8::enc
           }
           else if (residual_bitmap_order == TlgOptions::DumpResidualsOrder::AfterHilbert)
           {
-            reordered_values = best_after_hilbert;
-            reorder_from_hilbert(reordered_values, components, block_w, block_h);
+            reordered_values = best_after_reorder;
+            reorder_from_scan(reordered_values, components, block_w, block_h, best_reorder_pattern);
             source = &reordered_values;
           }
 
@@ -829,32 +836,38 @@ namespace tlg::v8::enc
     }
     const uint32_t predictor_bits = tlg::detail::bit_width(kNumPredictors);
     const uint32_t filter_bits = tlg::detail::bit_width(filter_count);
+    const uint32_t reorder_bits = tlg::detail::bit_width(kReorderPatternCount);
     const uint32_t entropy_bits = tlg::detail::bit_width(kNumEntropyEncoders);
     const uint32_t interleave_bits = tlg::detail::bit_width(kNumInterleaveFilter);
 
     std::vector<uint32_t> predictor_stream;
     std::vector<uint32_t> filter_stream;
+    std::vector<uint32_t> reorder_stream;
     std::vector<uint32_t> entropy_stream;
     std::vector<uint32_t> interleave_stream;
     predictor_stream.reserve(block_choices.size());
     filter_stream.reserve(block_choices.size());
+    reorder_stream.reserve(block_choices.size());
     entropy_stream.reserve(block_choices.size());
     interleave_stream.reserve(block_choices.size());
     for (const auto &choice : block_choices)
     {
       predictor_stream.push_back(choice.predictor);
       filter_stream.push_back(choice.filter);
+      reorder_stream.push_back(choice.reorder);
       entropy_stream.push_back(choice.entropy);
       interleave_stream.push_back(choice.interleave);
     }
 
     const BlockChoiceEncoding predictor_mode = select_best_sequence_mode(predictor_stream, predictor_bits);
     const BlockChoiceEncoding filter_mode = select_best_sequence_mode(filter_stream, filter_bits);
+    const BlockChoiceEncoding reorder_mode = select_best_sequence_mode(reorder_stream, reorder_bits);
     const BlockChoiceEncoding entropy_mode = select_best_sequence_mode(entropy_stream, entropy_bits);
     const BlockChoiceEncoding interleave_mode = select_best_sequence_mode(interleave_stream, interleave_bits);
 
     writer.put_upto8(static_cast<uint32_t>(predictor_mode), 2);
     writer.put_upto8(static_cast<uint32_t>(filter_mode), 2);
+    writer.put_upto8(static_cast<uint32_t>(reorder_mode), 2);
     writer.put_upto8(static_cast<uint32_t>(entropy_mode), 2);
     writer.put_upto8(static_cast<uint32_t>(interleave_mode), 2);
 
@@ -862,6 +875,7 @@ namespace tlg::v8::enc
     {
       encode_value_sequence(writer, predictor_mode, predictor_stream, predictor_bits);
       encode_value_sequence(writer, filter_mode, filter_stream, filter_bits);
+      encode_value_sequence(writer, reorder_mode, reorder_stream, reorder_bits);
       encode_value_sequence(writer, entropy_mode, entropy_stream, entropy_bits);
       encode_value_sequence(writer, interleave_mode, interleave_stream, interleave_bits);
     }

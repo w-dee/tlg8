@@ -79,6 +79,7 @@ namespace tlg::v8
       uint32_t block_w;
       uint32_t predictor_index;
       uint32_t filter_index;
+      uint32_t reorder_index;
       uint32_t entropy_index;
       uint32_t interleave_index;
       uint32_t value_count;
@@ -99,6 +100,7 @@ namespace tlg::v8
     {
       uint32_t predictor = 0;
       uint32_t filter = 0;
+      uint32_t reorder = 0;
       uint32_t entropy = 0;
       uint32_t interleave = 0;
     };
@@ -112,10 +114,11 @@ namespace tlg::v8
 
     const uint32_t predictor_bits = tlg::detail::bit_width(enc::kNumPredictors);
     const uint32_t filter_bits = tlg::detail::bit_width(filter_count);
+    const uint32_t reorder_bits = tlg::detail::bit_width(enc::kReorderPatternCount);
     const uint32_t entropy_bits = tlg::detail::bit_width(enc::kNumEntropyEncoders);
     const uint32_t interleave_bits = tlg::detail::bit_width(enc::kNumInterleaveFilter);
 
-    std::array<enc::BlockChoiceEncoding, 4> field_modes{};
+    std::array<enc::BlockChoiceEncoding, 5> field_modes{};
     for (auto &mode : field_modes)
     {
       const uint32_t mode_bits = reader.get_upto8(2);
@@ -129,10 +132,12 @@ namespace tlg::v8
 
     std::vector<uint32_t> predictor_stream;
     std::vector<uint32_t> filter_stream;
+    std::vector<uint32_t> reorder_stream;
     std::vector<uint32_t> entropy_stream;
     std::vector<uint32_t> interleave_stream;
     predictor_stream.reserve(block_count);
     filter_stream.reserve(block_count);
+    reorder_stream.reserve(block_count);
     entropy_stream.reserve(block_count);
     interleave_stream.reserve(block_count);
 
@@ -247,9 +252,11 @@ namespace tlg::v8
       return false;
     if (!decode_stream(field_modes[1], filter_bits, filter_count, filter_stream, "tlg8: 不正なカラーフィルターインデックスです"))
       return false;
-    if (!decode_stream(field_modes[2], entropy_bits, enc::kNumEntropyEncoders, entropy_stream, "tlg8: 不正なエントロピーインデックスです"))
+    if (!decode_stream(field_modes[2], reorder_bits, enc::kReorderPatternCount, reorder_stream, "tlg8: 不正な並び替えインデックスです"))
       return false;
-    if (!decode_stream(field_modes[3], interleave_bits, enc::kNumInterleaveFilter, interleave_stream, "tlg8: 不正なインターリーブフィルターです"))
+    if (!decode_stream(field_modes[3], entropy_bits, enc::kNumEntropyEncoders, entropy_stream, "tlg8: 不正なエントロピーインデックスです"))
+      return false;
+    if (!decode_stream(field_modes[4], interleave_bits, enc::kNumInterleaveFilter, interleave_stream, "tlg8: 不正なインターリーブフィルターです"))
       return false;
 
     for (uint32_t index = 0; index < block_count; ++index)
@@ -257,6 +264,7 @@ namespace tlg::v8
       block_choice choice{};
       choice.predictor = (index < predictor_stream.size()) ? predictor_stream[index] : 0u;
       choice.filter = (index < filter_stream.size()) ? filter_stream[index] : 0u;
+      choice.reorder = (index < reorder_stream.size()) ? reorder_stream[index] : 0u;
       choice.entropy = (index < entropy_stream.size()) ? entropy_stream[index] : 0u;
       choice.interleave = (index < interleave_stream.size()) ? interleave_stream[index] : 0u;
       block_choices.push_back(choice);
@@ -283,6 +291,12 @@ namespace tlg::v8
         const auto &choice = block_choices[block_choice_index++];
         const uint32_t predictor_index = choice.predictor;
         const uint32_t filter_index = choice.filter;
+        const uint32_t reorder_index = choice.reorder;
+        if (reorder_index >= enc::kReorderPatternCount)
+        {
+          err = "tlg8: 不正な並び替えインデックスです";
+          return false;
+        }
         const uint32_t entropy_index = choice.entropy;
         const uint32_t interleave_index = choice.interleave;
 
@@ -292,6 +306,7 @@ namespace tlg::v8
         state.block_w = block_w;
         state.predictor_index = predictor_index;
         state.filter_index = filter_index;
+        state.reorder_index = reorder_index;
         state.entropy_index = entropy_index;
         state.interleave_index = interleave_index;
         state.value_count = value_count;
@@ -427,7 +442,12 @@ namespace tlg::v8
                                     state.residuals,
                                     components,
                                     state.value_count);
-        enc::reorder_from_hilbert(state.residuals, components, state.block_w, row_state.block_h);
+        const auto reorder_pattern = static_cast<enc::ReorderPattern>(state.reorder_index);
+        enc::reorder_from_scan(state.residuals,
+                               components,
+                               state.block_w,
+                               row_state.block_h,
+                               reorder_pattern);
         enc::undo_color_filter(state.filter_index, state.residuals, components, state.value_count);
       }
     }
