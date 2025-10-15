@@ -463,6 +463,11 @@ namespace tlg::v8::enc
 {
   void reorder_to_hilbert(component_colors &colors, uint32_t components, uint32_t block_w, uint32_t block_h)
   {
+    if (block_w != 8 || block_h != 8)
+    {
+      // 8x8 ブロック以外は処理を簡略化するためリオーダーを行わない
+      return;
+    }
     const uint32_t value_count = block_w * block_h;
     if (value_count == 0)
       return;
@@ -476,6 +481,11 @@ namespace tlg::v8::enc
 
   void reorder_from_hilbert(component_colors &colors, uint32_t components, uint32_t block_w, uint32_t block_h)
   {
+    if (block_w != 8 || block_h != 8)
+    {
+      // 8x8 ブロック以外は処理を簡略化するためリオーダーを行わない
+      return;
+    }
     const uint32_t value_count = block_w * block_h;
     if (value_count == 0)
       return;
