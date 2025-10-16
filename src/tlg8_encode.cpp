@@ -548,6 +548,7 @@ namespace tlg::v8::enc
                        PixelBuffer *residual_bitmap,
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
+                       std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
                        std::string &err)
   {
     if (components == 0 || components > 4)
@@ -702,6 +703,8 @@ namespace tlg::v8::enc
         // 比較する設計とし、将来的に並び替え候補を増やしても流用できるよう
         // にしている。
         block_choices.push_back(block_choice{best_predictor, best_filter, best_reorder_index, best_entropy, best_interleave});
+        if (reorder_histogram && best_reorder_index < kReorderPatternCount)
+          ++(*reorder_histogram)[best_reorder_index];
 
         if (dump_fp)
         {

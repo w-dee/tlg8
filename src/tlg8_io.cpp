@@ -12,6 +12,7 @@
 #include "tlg_io_common.h"
 #include "tlg8_bit_io.h"
 #include "tlg8_entropy.h"
+#include "tlg8_reorder.h"
 
 namespace
 {
@@ -401,6 +402,20 @@ namespace tlg::v8
     return true;
   }
 
+  namespace
+  {
+    constexpr std::array<const char *, tlg::v8::enc::kReorderPatternCount> kReorderPatternNames = {
+        "hilbert",
+        "zigzag_diag",
+        "zigzag_antidiag",
+        "zigzag_horz",
+        "zigzag_vert",
+        "zigzag_nne_ssw",
+        "zigzag_nee_sww",
+        "zigzag_nww_see",
+    };
+  }
+
   namespace enc
   {
   bool encode_for_tile(detail::bitio::BitWriter &writer,
@@ -416,6 +431,7 @@ namespace tlg::v8
                        PixelBuffer *residual_bitmap,
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
+                       std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
                        std::string &err);
 
     bool write_raw(FILE *fp,
@@ -424,6 +440,7 @@ namespace tlg::v8
                    const std::string &dump_residuals_path,
                    TlgOptions::DumpResidualsOrder dump_residuals_order,
                    const std::string &dump_golomb_prediction_path,
+                   const std::string &reorder_histogram_path,
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
@@ -500,6 +517,8 @@ namespace tlg::v8
       PixelBuffer *residual_bitmap_ptr = nullptr;
       TlgOptions::DumpResidualsOrder effective_bitmap_order = residual_bmp_order;
       const double residual_bitmap_emphasis = residual_bmp_emphasis;
+      std::array<uint64_t, kReorderPatternCount> reorder_histogram{};
+      auto *reorder_histogram_ptr = reorder_histogram_path.empty() ? nullptr : &reorder_histogram;
 
       const unsigned char mark[11] = {'T', 'L', 'G', '8', '.', '0', 0, 'r', 'a', 'w', 0x1a};
       if (!write_bytes(fp, mark, sizeof(mark)))
@@ -628,6 +647,7 @@ namespace tlg::v8
                                residual_bitmap_ptr,
                                effective_bitmap_order,
                                residual_bitmap_emphasis,
+                               reorder_histogram_ptr,
                                err))
             return false;
           if (!writer.align_to_u32_zero() || !writer.finish())
@@ -670,6 +690,27 @@ namespace tlg::v8
         {
           err = "tlg8: 残差ビットマップを書き出せません: " + bmp_err;
           return false;
+        }
+      }
+
+      if (reorder_histogram_ptr)
+      {
+        FILE *hist_fp = std::fopen(reorder_histogram_path.c_str(), "w");
+        if (!hist_fp)
+        {
+          err = "tlg8: 並び替えヒストグラムを書き出すファイルを開けません: " + reorder_histogram_path;
+          return false;
+        }
+        std::unique_ptr<FILE, FileCloser> histogram_file(hist_fp);
+        for (uint32_t index = 0; index < kReorderPatternCount; ++index)
+        {
+          const char *name = kReorderPatternNames[index];
+          if (std::fprintf(histogram_file.get(), "%u\t%s\t%llu\n", index, name,
+                           static_cast<unsigned long long>((*reorder_histogram_ptr)[index])) < 0)
+          {
+            err = "tlg8: 並び替えヒストグラムを書き出せません";
+            return false;
+          }
         }
       }
 

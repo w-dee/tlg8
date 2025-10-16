@@ -37,6 +37,7 @@ static void print_usage()
             << " [--tlg8-write-residuals-order=predictor|color|hilbert]"
             << " [--tlg8-write-residuals-emphasis=<F>]"
             << " [--tlg8-dump-golomb-prediction=<path>]"
+            << " [--dump-reorder-histogram=<path>]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
@@ -243,6 +244,16 @@ int main(int argc, char **argv)
         return 2;
       }
       tlgopt.tlg8_write_residuals_emphasis = emphasis;
+    }
+    else if (arg.rfind("--dump-reorder-histogram=", 0) == 0)
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --dump-reorder-histogram option\n";
+        return 2;
+      }
+      tlgopt.tlg8_dump_reorder_histogram_path = arg.substr(eq + 1);
     }
     else if (arg == "--print-entropy-bits")
     {

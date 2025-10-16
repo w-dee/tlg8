@@ -72,6 +72,7 @@ struct TlgOptions
   std::string tlg8_dump_residuals_path; // TLG8 エンコーダで残差をダンプする場合の出力先
   DumpResidualsOrder tlg8_dump_residuals_order = DumpResidualsOrder::AfterHilbert;
   std::string tlg8_dump_golomb_prediction_path; // TLG8 エンコーダでゴロム予測をダンプする場合の出力先
+  std::string tlg8_dump_reorder_histogram_path; // TLG8 エンコーダで並び替えヒストグラムを書き出す場合の出力先
   std::string tlg8_write_residuals_bmp_path; // TLG8 残差をビットマップ書き出しする際の出力先
   DumpResidualsOrder tlg8_write_residuals_order = DumpResidualsOrder::AfterPredictor;
   double tlg8_write_residuals_emphasis = 1.0; // 残差ビットマップの強調係数
