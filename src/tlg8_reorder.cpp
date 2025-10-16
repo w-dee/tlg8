@@ -415,57 +415,70 @@ namespace
   static_assert(_check_reorder_array(kZigzagNEESWWOrder), "kZigzagNEESWWOrder の内容が不正です");
   static_assert(_check_reorder_array(kZigzagNWWSEEOrder), "kZigzagNWWSEEOrder の内容が不正です");
 
-  inline constexpr const reorder_table &order_from_pattern(tlg::v8::enc::ReorderPattern pattern)
-  {
-    using tlg::v8::enc::ReorderPattern;
-    switch (pattern)
-    {
-    case ReorderPattern::Hilbert:
-      return kHilbertOrder;
-    case ReorderPattern::ZigzagDiag:
-      return kZigzagDiagOrder;
-    case ReorderPattern::ZigzagAntiDiag:
-      return kZigzagAntiDiagOrder;
-    case ReorderPattern::ZigzagHorz:
-      return kZigzagHorzOrder;
-    case ReorderPattern::ZigzagVert:
-      return kZigzagVertOrder;
-    case ReorderPattern::ZigzagNNESSW:
-      return kZigzagNNESSWOrder;
-    case ReorderPattern::ZigzagNEESWW:
-      return kZigzagNEESWWOrder;
-    case ReorderPattern::ZigzagNWWSEE:
-      return kZigzagNWWSEEOrder;
-    default:
-      return kHilbertOrder;
-    }
-  }
-
-  template <bool ToScan, size_t... Indices>
+  template <bool ToScan, const reorder_table &Table, size_t... Indices>
   inline void reorder_component_impl(component_values_array &component_values,
-                                     const reorder_table &table,
                                      component_values_array &temp,
                                      std::index_sequence<Indices...>)
   {
     if constexpr (ToScan)
     {
-      ((void)(temp[Indices] = component_values[static_cast<size_t>(table[Indices])]), ...);
+      ((void)(temp[Indices] =
+                  component_values[static_cast<size_t>(std::get<Indices>(Table))]), ...);
       ((void)(component_values[Indices] = temp[Indices]), ...);
     }
     else
     {
       ((void)(temp[Indices] = component_values[Indices]), ...);
-      ((void)(component_values[static_cast<size_t>(table[Indices])] = temp[Indices]), ...);
+      ((void)(component_values[static_cast<size_t>(std::get<Indices>(Table))] = temp[Indices]),
+       ...);
     }
+  }
+
+  template <bool ToScan, const reorder_table &Table>
+  inline void reorder_component_with_table(component_values_array &component_values,
+                                           component_values_array &temp)
+  {
+    reorder_component_impl<ToScan, Table>(
+        component_values, temp,
+        std::make_index_sequence<tlg::v8::enc::kMaxBlockPixels>{});
   }
 
   template <bool ToScan>
   inline void reorder_component(component_values_array &component_values,
-                                const reorder_table &table,
+                                tlg::v8::enc::ReorderPattern pattern,
                                 component_values_array &temp)
   {
-    reorder_component_impl<ToScan>(component_values, table, temp,
-                                   std::make_index_sequence<tlg::v8::enc::kMaxBlockPixels>{});
+    using tlg::v8::enc::ReorderPattern;
+    switch (pattern)
+    {
+    case ReorderPattern::Hilbert:
+      reorder_component_with_table<ToScan, kHilbertOrder>(component_values, temp);
+      break;
+    case ReorderPattern::ZigzagDiag:
+      reorder_component_with_table<ToScan, kZigzagDiagOrder>(component_values, temp);
+      break;
+    case ReorderPattern::ZigzagAntiDiag:
+      reorder_component_with_table<ToScan, kZigzagAntiDiagOrder>(component_values, temp);
+      break;
+    case ReorderPattern::ZigzagHorz:
+      reorder_component_with_table<ToScan, kZigzagHorzOrder>(component_values, temp);
+      break;
+    case ReorderPattern::ZigzagVert:
+      reorder_component_with_table<ToScan, kZigzagVertOrder>(component_values, temp);
+      break;
+    case ReorderPattern::ZigzagNNESSW:
+      reorder_component_with_table<ToScan, kZigzagNNESSWOrder>(component_values, temp);
+      break;
+    case ReorderPattern::ZigzagNEESWW:
+      reorder_component_with_table<ToScan, kZigzagNEESWWOrder>(component_values, temp);
+      break;
+    case ReorderPattern::ZigzagNWWSEE:
+      reorder_component_with_table<ToScan, kZigzagNWWSEEOrder>(component_values, temp);
+      break;
+    default:
+      reorder_component_with_table<ToScan, kHilbertOrder>(component_values, temp);
+      break;
+    }
   }
 }
 
@@ -482,12 +495,11 @@ namespace tlg::v8::enc
       // 8x8 ブロック以外は処理を簡略化するためリオーダーを行わない
       return;
     }
-    const auto &table = order_from_pattern(pattern);
     component_colors::values_64 temp{};
     const uint32_t used_components = std::min<uint32_t>(components, colors.values.size());
     for (uint32_t comp = 0; comp < used_components; ++comp)
     {
-      reorder_component<true>(colors.values[comp], table, temp);
+      reorder_component<true>(colors.values[comp], pattern, temp);
     }
   }
 
@@ -502,12 +514,11 @@ namespace tlg::v8::enc
       // 8x8 ブロック以外は処理を簡略化するためリオーダーを行わない
       return;
     }
-    const auto &table = order_from_pattern(pattern);
     component_colors::values_64 temp{};
     const uint32_t used_components = std::min<uint32_t>(components, colors.values.size());
     for (uint32_t comp = 0; comp < used_components; ++comp)
     {
-      reorder_component<false>(colors.values[comp], table, temp);
+      reorder_component<false>(colors.values[comp], pattern, temp);
     }
   }
 }
