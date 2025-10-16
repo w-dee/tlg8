@@ -1,10 +1,14 @@
 #include "tlg8_reorder.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace
 {
-  constexpr std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels> kHilbertOrder = {
+  using reorder_table = std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels>;
+  using component_values_array = tlg::v8::enc::component_colors::values_64;
+
+  constexpr reorder_table kHilbertOrder = {
       8 * 0 + 0,
       8 * 1 + 0,
       8 * 1 + 1,
@@ -71,7 +75,7 @@ namespace
       8 * 0 + 7,
   };
 
-  inline constexpr std::array<uint8_t, 64> kZigzagDiagOrder = {
+  inline constexpr reorder_table kZigzagDiagOrder = {
       0, 1, 8, 16, 9, 2, 3, 10,
       17, 24, 32, 25, 18, 11, 4, 5, 12,
       19, 26, 33, 40, 48, 41, 34, 27, 20,
@@ -84,9 +88,9 @@ namespace
       55, 62, 63};
 
   // vertical mirror of given array
-  constexpr std::array<uint8_t, 64> vert_mirror_of(const std::array<uint8_t, 64> &arr)
+  constexpr reorder_table vert_mirror_of(const reorder_table &arr)
   {
-    std::array<uint8_t, 64> mirror{};
+    reorder_table mirror{};
     for (uint8_t i = 0; i < 64; ++i)
     {
       int x = i % 8;
@@ -97,9 +101,9 @@ namespace
   }
 
   // horizontal mirror of given array
-  constexpr std::array<uint8_t, 64> horz_mirror_of(const std::array<uint8_t, 64> &arr)
+  constexpr reorder_table horz_mirror_of(const reorder_table &arr)
   {
-    std::array<uint8_t, 64> mirror{};
+    reorder_table mirror{};
     for (uint8_t i = 0; i < 64; ++i)
     {
       int x = i % 8;
@@ -109,9 +113,9 @@ namespace
     return mirror;
   }
 
-  inline constexpr std::array<uint8_t, 64> kZigzagAntiDiagOrder = vert_mirror_of(kZigzagDiagOrder);
+  inline constexpr reorder_table kZigzagAntiDiagOrder = vert_mirror_of(kZigzagDiagOrder);
 
-  inline constexpr std::array<uint8_t, 64> kZigzagHorzOrder = {
+  inline constexpr reorder_table kZigzagHorzOrder = {
       8 * 0 + 0,
       8 * 0 + 1,
       8 * 0 + 2,
@@ -178,7 +182,7 @@ namespace
       8 * 7 + 0,
   };
 
-  inline constexpr std::array<uint8_t, 64> kZigzagVertOrder = {
+  inline constexpr reorder_table kZigzagVertOrder = {
       8 * 0 + 0,
       8 * 1 + 0,
       8 * 2 + 0,
@@ -245,7 +249,7 @@ namespace
       8 * 0 + 7,
   };
 
-  inline constexpr std::array<uint8_t, 64> kZigzagNNESSWOrder = {
+  inline constexpr reorder_table kZigzagNNESSWOrder = {
       0,
       2,
       11,
@@ -312,9 +316,9 @@ namespace
       63,
   };
 
-  inline constexpr std::array<uint8_t, 64> kZigzagNNWSSEOrder = vert_mirror_of(kZigzagNNESSWOrder);
+  inline constexpr reorder_table kZigzagNNWSSEOrder = vert_mirror_of(kZigzagNNESSWOrder);
 
-  inline constexpr std::array<uint8_t, 64> kZigzagNEESWWOrder = {
+  inline constexpr reorder_table kZigzagNEESWWOrder = {
       0,
       1,
       4,
@@ -381,11 +385,11 @@ namespace
       63,
   };
 
-  inline constexpr std::array<uint8_t, 64> kZigzagNWWSEEOrder = horz_mirror_of(kZigzagNEESWWOrder);
+  inline constexpr reorder_table kZigzagNWWSEEOrder = horz_mirror_of(kZigzagNEESWWOrder);
 
-  constexpr bool _check_reorder_array(const std::array<uint8_t, 64> &arr)
+  constexpr bool _check_reorder_array(const reorder_table &arr)
   {
-    std::array<bool, 64> seen{};
+    std::array<bool, tlg::v8::enc::kMaxBlockPixels> seen{};
     for (uint8_t v : arr)
     {
       if (v >= seen.size())
@@ -411,7 +415,7 @@ namespace
   static_assert(_check_reorder_array(kZigzagNEESWWOrder), "kZigzagNEESWWOrder の内容が不正です");
   static_assert(_check_reorder_array(kZigzagNWWSEEOrder), "kZigzagNWWSEEOrder の内容が不正です");
 
-  inline constexpr const std::array<uint8_t, 64> &order_from_pattern(tlg::v8::enc::ReorderPattern pattern)
+  inline constexpr const reorder_table &order_from_pattern(tlg::v8::enc::ReorderPattern pattern)
   {
     using tlg::v8::enc::ReorderPattern;
     switch (pattern)
@@ -437,53 +441,31 @@ namespace
     }
   }
 
-  inline uint32_t build_reorder_sequence(uint32_t block_w,
-                                         uint32_t block_h,
-                                         std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels> &sequence,
-                                         tlg::v8::enc::ReorderPattern pattern)
+  template <bool ToScan, size_t... Indices>
+  inline void reorder_component_impl(component_values_array &component_values,
+                                     const reorder_table &table,
+                                     component_values_array &temp,
+                                     std::index_sequence<Indices...>)
   {
-    const uint32_t value_count = block_w * block_h;
-    if (value_count == 0)
-      return 0;
-
-    const auto &order = order_from_pattern(pattern);
-    uint32_t index = 0;
-    for (uint8_t entry : order)
+    if constexpr (ToScan)
     {
-      const uint32_t x = entry % tlg::v8::enc::kBlockSize;
-      const uint32_t y = entry / tlg::v8::enc::kBlockSize;
-      if (x >= block_w || y >= block_h)
-        continue;
-      if (index < sequence.size())
-        sequence[index] = static_cast<uint8_t>(y * block_w + x);
-      ++index;
+      ((void)(temp[Indices] = component_values[static_cast<size_t>(table[Indices])]), ...);
+      ((void)(component_values[Indices] = temp[Indices]), ...);
     }
-    return index;
+    else
+    {
+      ((void)(temp[Indices] = component_values[Indices]), ...);
+      ((void)(component_values[static_cast<size_t>(table[Indices])] = temp[Indices]), ...);
+    }
   }
 
-  void apply_reorder_sequence(tlg::v8::enc::component_colors &colors,
-                              uint32_t components,
-                              uint32_t value_count,
-                              const std::array<uint8_t, tlg::v8::enc::kMaxBlockPixels> &sequence,
-                              bool to_scan)
+  template <bool ToScan>
+  inline void reorder_component(component_values_array &component_values,
+                                const reorder_table &table,
+                                component_values_array &temp)
   {
-    // 並べ替え元と並べ替え先の両方で共通利用する一時領域。
-    std::array<int16_t, tlg::v8::enc::kMaxBlockPixels> temp{};
-    const uint32_t used_components = std::min<uint32_t>(components, colors.values.size());
-    for (uint32_t comp = 0; comp < used_components; ++comp)
-    {
-      auto &component_values = colors.values[comp];
-      for (uint32_t i = 0; i < value_count; ++i)
-      {
-        const uint32_t from_index = to_scan ? sequence[i] : i;
-        temp[i] = component_values[from_index];
-      }
-      for (uint32_t i = 0; i < value_count; ++i)
-      {
-        const uint32_t to_index = to_scan ? i : sequence[i];
-        component_values[to_index] = temp[i];
-      }
-    }
+    reorder_component_impl<ToScan>(component_values, table, temp,
+                                   std::make_index_sequence<tlg::v8::enc::kMaxBlockPixels>{});
   }
 }
 
@@ -495,20 +477,18 @@ namespace tlg::v8::enc
                        uint32_t block_h,
                        ReorderPattern pattern)
   {
-    if (block_w != 8 || block_h != 8)
+    if (block_w != kBlockSize || block_h != kBlockSize)
     {
       // 8x8 ブロック以外は処理を簡略化するためリオーダーを行わない
       return;
     }
-    const uint32_t value_count = block_w * block_h;
-    if (value_count == 0)
-      return;
-
-    std::array<uint8_t, kMaxBlockPixels> sequence{};
-    const uint32_t sequence_size = build_reorder_sequence(block_w, block_h, sequence, pattern);
-    if (sequence_size != value_count)
-      return;
-    apply_reorder_sequence(colors, components, value_count, sequence, true);
+    const auto &table = order_from_pattern(pattern);
+    component_colors::values_64 temp{};
+    const uint32_t used_components = std::min<uint32_t>(components, colors.values.size());
+    for (uint32_t comp = 0; comp < used_components; ++comp)
+    {
+      reorder_component<true>(colors.values[comp], table, temp);
+    }
   }
 
   void reorder_from_scan(component_colors &colors,
@@ -517,19 +497,17 @@ namespace tlg::v8::enc
                          uint32_t block_h,
                          ReorderPattern pattern)
   {
-    if (block_w != 8 || block_h != 8)
+    if (block_w != kBlockSize || block_h != kBlockSize)
     {
       // 8x8 ブロック以外は処理を簡略化するためリオーダーを行わない
       return;
     }
-    const uint32_t value_count = block_w * block_h;
-    if (value_count == 0)
-      return;
-
-    std::array<uint8_t, kMaxBlockPixels> sequence{};
-    const uint32_t sequence_size = build_reorder_sequence(block_w, block_h, sequence, pattern);
-    if (sequence_size != value_count)
-      return;
-    apply_reorder_sequence(colors, components, value_count, sequence, false);
+    const auto &table = order_from_pattern(pattern);
+    component_colors::values_64 temp{};
+    const uint32_t used_components = std::min<uint32_t>(components, colors.values.size());
+    for (uint32_t comp = 0; comp < used_components; ++comp)
+    {
+      reorder_component<false>(colors.values[comp], table, temp);
+    }
   }
 }
