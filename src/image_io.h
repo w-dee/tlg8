@@ -76,6 +76,7 @@ struct TlgOptions
   std::string tlg8_write_residuals_bmp_path; // TLG8 残差をビットマップ書き出しする際の出力先
   DumpResidualsOrder tlg8_write_residuals_order = DumpResidualsOrder::AfterPredictor;
   double tlg8_write_residuals_emphasis = 1.0; // 残差ビットマップの強調係数
+  bool tlg8_force_hilbert_reorder = false;   // TLG8 並び替えをヒルベルト走査に固定するか
   bool print_entropy_bits = false;     // エントロピー符号化で使用した正味ビット数を表示するか
 };
 

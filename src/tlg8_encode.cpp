@@ -549,6 +549,7 @@ namespace tlg::v8::enc
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
                        std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
+                       bool force_hilbert_reorder,
                        std::string &err)
   {
     if (components == 0 || components > 4)
@@ -656,9 +657,11 @@ namespace tlg::v8::enc
             if (filtered_energy < best_filtered_energy)
               best_filtered_energy = filtered_energy;
 
-            for (uint32_t reorder_index = 0; reorder_index < kReorderPatternCount; ++reorder_index)
+            const uint32_t reorder_candidate_count = force_hilbert_reorder ? 1u : kReorderPatternCount;
+            for (uint32_t reorder_index = 0; reorder_index < reorder_candidate_count; ++reorder_index)
             {
-              const ReorderPattern reorder_pattern = static_cast<ReorderPattern>(reorder_index);
+              const uint32_t actual_reorder_index = force_hilbert_reorder ? 0u : reorder_index;
+              const ReorderPattern reorder_pattern = static_cast<ReorderPattern>(actual_reorder_index);
               component_colors reordered = filtered;
               reorder_to_scan(reordered, components, block_w, block_h, reorder_pattern);
 
@@ -690,7 +693,7 @@ namespace tlg::v8::enc
                     best_after_color = filtered_before_reorder;
                     best_after_predictor = candidate;
                     best_reorder_pattern = reorder_pattern;
-                    best_reorder_index = reorder_index;
+                    best_reorder_index = actual_reorder_index;
                   }
                 }
               }

@@ -179,7 +179,7 @@ def roundtrip(
 FORMATS: tuple[FormatSpec, ...] = (
     FormatSpec("png", ".png", (), ()),
     FormatSpec("tlg6", ".tlg6", ("--tlg-version=6",), ()),
-    FormatSpec("tlg8", ".tlg8", ("--tlg-version=8",), ()),
+    FormatSpec("tlg8", ".tlg8", ("--tlg-version=8", "--tlg8-reorder=hilbert-only"), ()),
 )
 
 

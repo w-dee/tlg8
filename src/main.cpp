@@ -38,6 +38,7 @@ static void print_usage()
             << " [--tlg8-write-residuals-emphasis=<F>]"
             << " [--tlg8-dump-golomb-prediction=<path>]"
             << " [--dump-reorder-histogram=<path>]"
+            << " [--tlg8-reorder=hilbert-only]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
 }
@@ -245,6 +246,20 @@ int main(int argc, char **argv)
       }
       tlgopt.tlg8_write_residuals_emphasis = emphasis;
     }
+    else if (arg.rfind("--tlg8-reorder=", 0) == 0)
+    {
+      std::string mode = arg.substr(15);
+      to_lower_inplace(mode);
+      if (mode == "hilbert-only")
+        tlgopt.tlg8_force_hilbert_reorder = true;
+      else if (mode == "auto")
+        tlgopt.tlg8_force_hilbert_reorder = false;
+      else
+      {
+        std::cerr << "Invalid --tlg8-reorder: " << mode << "\n";
+        return 2;
+      }
+    }
     else if (arg.rfind("--dump-reorder-histogram=", 0) == 0)
     {
       const auto eq = arg.find('=');
@@ -269,6 +284,12 @@ int main(int argc, char **argv)
   if (tlgopt.print_entropy_bits && tlgopt.version != 8)
   {
     std::cerr << "--print-entropy-bits は TLG8 エンコード時のみ使用できます\n";
+    return 2;
+  }
+
+  if (tlgopt.tlg8_force_hilbert_reorder && tlgopt.version != 8)
+  {
+    std::cerr << "--tlg8-reorder=hilbert-only は TLG8 エンコード時のみ使用できます\n";
     return 2;
   }
 

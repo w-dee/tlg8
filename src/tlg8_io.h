@@ -22,6 +22,7 @@ namespace tlg::v8
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
+                   bool force_hilbert_reorder,
                    std::string &err,
                    uint64_t *out_entropy_bits = nullptr);
   }

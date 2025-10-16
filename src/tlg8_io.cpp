@@ -432,6 +432,7 @@ namespace tlg::v8
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
                        std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
+                       bool force_hilbert_reorder,
                        std::string &err);
 
     bool write_raw(FILE *fp,
@@ -444,6 +445,7 @@ namespace tlg::v8
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
+                   bool force_hilbert_reorder,
                    std::string &err,
                    uint64_t *out_entropy_bits)
     {
@@ -648,6 +650,7 @@ namespace tlg::v8
                                effective_bitmap_order,
                                residual_bitmap_emphasis,
                                reorder_histogram_ptr,
+                               force_hilbert_reorder,
                                err))
             return false;
           if (!writer.align_to_u32_zero() || !writer.finish())
