@@ -69,7 +69,7 @@ def load_dataset(paths: Sequence[Path]) -> Tuple[np.ndarray, Dict[str, np.ndarra
 
     total_lines = 0
     loaded = 0
-    report_interval = 1000
+    report_interval = 100000
 
     for path in paths:
         try:
