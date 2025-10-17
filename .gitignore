@@ -3,6 +3,8 @@
 
 # ML intermediate directory
 /data/
+/models/
+
 
 # Analysis temporary
 /analysis/
