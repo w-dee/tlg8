@@ -1,6 +1,9 @@
 # non-redistributable files
 /test/images/test*
 
+# ML intermediate directory
+/data/
+
 # Analysis temporary
 /analysis/
 

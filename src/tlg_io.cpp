@@ -146,6 +146,8 @@ bool save_tlg(const std::string &path,
                                  opt.tlg8_write_residuals_bmp_path,
                                  opt.tlg8_write_residuals_order,
                                  opt.tlg8_write_residuals_emphasis,
+                                 opt.tlg8_training_dump_path,
+                                 opt.tlg8_training_dump_image_tag,
                                  opt.tlg8_force_hilbert_reorder,
                                  err,
                                  out_entropy_bits);

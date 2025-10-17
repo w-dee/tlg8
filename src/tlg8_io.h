@@ -7,6 +7,15 @@
 
 namespace tlg::v8
 {
+  struct TrainingDumpContext
+  {
+    FILE *file = nullptr;
+    std::string image_tag;
+    uint32_t image_width = 0;
+    uint32_t image_height = 0;
+    uint32_t components = 0;
+  };
+
   bool configure_golomb_table(const std::string &path, std::string &err);
   bool decode_stream(FILE *fp, PixelBuffer &out, std::string &err);
 
@@ -22,6 +31,8 @@ namespace tlg::v8
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
+                   const std::string &training_dump_path,
+                   const std::string &training_image_tag,
                    bool force_hilbert_reorder,
                    std::string &err,
                    uint64_t *out_entropy_bits = nullptr);

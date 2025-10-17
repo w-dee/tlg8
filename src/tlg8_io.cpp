@@ -432,6 +432,7 @@ namespace tlg::v8
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
                        std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
+                       TrainingDumpContext *training_ctx,
                        bool force_hilbert_reorder,
                        std::string &err);
 
@@ -445,6 +446,8 @@ namespace tlg::v8
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
+                   const std::string &training_dump_path,
+                   const std::string &training_image_tag,
                    bool force_hilbert_reorder,
                    std::string &err,
                    uint64_t *out_entropy_bits)
@@ -510,6 +513,25 @@ namespace tlg::v8
         err = "tlg8: unsupported desired colors";
         return false;
       }
+
+      std::unique_ptr<FILE, FileCloser> training_dump_file;
+      TrainingDumpContext training_context;
+      if (!training_dump_path.empty())
+      {
+        FILE *ml_fp = std::fopen(training_dump_path.c_str(), "ab");
+        if (!ml_fp)
+        {
+          err = "tlg8: 学習データを書き出すファイルを開けません: " + training_dump_path;
+          return false;
+        }
+        training_dump_file.reset(ml_fp);
+        training_context.file = ml_fp;
+        training_context.image_tag = training_image_tag;
+        training_context.image_width = src.width;
+        training_context.image_height = src.height;
+        training_context.components = static_cast<uint32_t>(desired_colors);
+      }
+      auto *training_ctx_ptr = training_dump_file ? &training_context : nullptr;
 
       std::vector<uint8_t> packed;
       if (!copy_pixels_to_buffer(src, desired_colors, packed, err))
@@ -650,6 +672,7 @@ namespace tlg::v8
                                effective_bitmap_order,
                                residual_bitmap_emphasis,
                                reorder_histogram_ptr,
+                               training_ctx_ptr,
                                force_hilbert_reorder,
                                err))
             return false;
@@ -716,6 +739,9 @@ namespace tlg::v8
           }
         }
       }
+
+      if (training_ctx_ptr && training_ctx_ptr->file)
+        std::fflush(training_ctx_ptr->file);
 
       return true;
     }

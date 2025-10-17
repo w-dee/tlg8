@@ -7,6 +7,7 @@
 #include "tlg8_reorder.h"
 #include "tlg8_predictors.h"
 #include "tlg8_varint.h"
+#include "tlg8_io.h"
 #include "tlg_io_common.h"
 #include "image_io.h"
 
@@ -21,6 +22,44 @@
 
 namespace
 {
+  void write_json_string(FILE *fp, const std::string &value)
+  {
+    std::fputc('"', fp);
+    for (unsigned char ch : value)
+    {
+      switch (ch)
+      {
+      case '\\':
+      case '"':
+        std::fputc('\\', fp);
+        std::fputc(static_cast<int>(ch), fp);
+        break;
+      case '\b':
+        std::fputs("\\b", fp);
+        break;
+      case '\f':
+        std::fputs("\\f", fp);
+        break;
+      case '\n':
+        std::fputs("\\n", fp);
+        break;
+      case '\r':
+        std::fputs("\\r", fp);
+        break;
+      case '\t':
+        std::fputs("\\t", fp);
+        break;
+      default:
+        if (ch < 0x20)
+          std::fprintf(fp, "\\u%04x", static_cast<unsigned int>(ch));
+        else
+          std::fputc(static_cast<int>(ch), fp);
+        break;
+      }
+    }
+    std::fputc('"', fp);
+  }
+
   inline constexpr double kEarlyExitGiveUpRate = 1.3;
   using tlg::v8::enc::BlockChoiceEncoding;
   using tlg::v8::enc::GolombCodingKind;
@@ -549,6 +588,7 @@ namespace tlg::v8::enc
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
                        std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
+                       TrainingDumpContext *training_ctx,
                        bool force_hilbert_reorder,
                        std::string &err)
   {
@@ -615,6 +655,12 @@ namespace tlg::v8::enc
         ReorderPattern best_reorder_pattern = ReorderPattern::Hilbert;
         uint32_t best_reorder_index = 0;
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
+        uint64_t second_bits = std::numeric_limits<uint64_t>::max();
+        uint32_t second_predictor = 0;
+        uint32_t second_filter = 0;
+        uint32_t second_entropy = 0;
+        uint32_t second_interleave = 0;
+        uint32_t second_reorder_index = 0;
 
         component_colors candidate{};
         workspace.prepare(accessor, block_x, block_y, block_w, block_h, components);
@@ -683,6 +729,15 @@ namespace tlg::v8::enc
                                                                                                 uses_interleave_candidate);
                   if (estimated_bits < best_bits)
                   {
+                    if (best_bits < std::numeric_limits<uint64_t>::max())
+                    {
+                      second_bits = best_bits;
+                      second_predictor = best_predictor;
+                      second_filter = best_filter;
+                      second_entropy = best_entropy;
+                      second_interleave = best_interleave;
+                      second_reorder_index = best_reorder_index;
+                    }
                     best_bits = estimated_bits;
                     best_predictor = predictor_index;
                     best_filter = filter_code;
@@ -695,10 +750,112 @@ namespace tlg::v8::enc
                     best_reorder_pattern = reorder_pattern;
                     best_reorder_index = actual_reorder_index;
                   }
+                  else if (estimated_bits < second_bits)
+                  {
+                    second_bits = estimated_bits;
+                    second_predictor = predictor_index;
+                    second_filter = filter_code;
+                    second_entropy = entropy_index;
+                    second_interleave = interleave_index;
+                    second_reorder_index = actual_reorder_index;
+                  }
                 }
               }
             }
           }
+        }
+
+        if (training_ctx && training_ctx->file)
+        {
+          std::vector<uint8_t> block_pixels;
+          block_pixels.reserve(static_cast<size_t>(value_count) * components);
+          for (uint32_t by = 0; by < block_h; ++by)
+          {
+            for (uint32_t bx = 0; bx < block_w; ++bx)
+            {
+              for (uint32_t comp = 0; comp < components; ++comp)
+              {
+                const auto &plane = workspace.padded[comp];
+                const size_t base_index = static_cast<size_t>(by + 1) * workspace.stride + static_cast<size_t>(bx + 1);
+                block_pixels.push_back(plane[base_index]);
+              }
+            }
+          }
+
+          FILE *ml_fp = training_ctx->file;
+          std::fputc('{', ml_fp);
+          write_json_string(ml_fp, "image");
+          std::fputc(':', ml_fp);
+          write_json_string(ml_fp, training_ctx->image_tag);
+          std::fputc(',', ml_fp);
+          write_json_string(ml_fp, "image_size");
+          std::fprintf(ml_fp, ":[%u,%u],", training_ctx->image_width, training_ctx->image_height);
+          write_json_string(ml_fp, "tile_origin");
+          std::fprintf(ml_fp, ":[%u,%u],", origin_x, origin_y);
+          write_json_string(ml_fp, "block_origin");
+          std::fprintf(ml_fp, ":[%u,%u],", origin_x + block_x, origin_y + block_y);
+          write_json_string(ml_fp, "block_size");
+          std::fprintf(ml_fp, ":[%u,%u],", block_w, block_h);
+          write_json_string(ml_fp, "components");
+          std::fprintf(ml_fp, ":%u,", components);
+          write_json_string(ml_fp, "pixels");
+          std::fputc(':', ml_fp);
+          std::fputc('[', ml_fp);
+          for (std::size_t i = 0; i < block_pixels.size(); ++i)
+          {
+            if (i > 0)
+              std::fputc(',', ml_fp);
+            std::fprintf(ml_fp, "%u", static_cast<unsigned int>(block_pixels[i]));
+          }
+          std::fputc(']', ml_fp);
+          std::fputc(',', ml_fp);
+
+          auto write_candidate = [&](const char *key,
+                                     uint32_t predictor,
+                                     uint32_t filter,
+                                     uint32_t reorder_index,
+                                     uint32_t interleave,
+                                     uint32_t entropy,
+                                     uint64_t bits)
+          {
+            write_json_string(ml_fp, key);
+            if (bits == std::numeric_limits<uint64_t>::max())
+            {
+              std::fputs(":null", ml_fp);
+              return;
+            }
+            std::fputs(":{", ml_fp);
+            write_json_string(ml_fp, "predictor");
+            std::fprintf(ml_fp, ":%u,", predictor);
+            write_json_string(ml_fp, "filter");
+            std::fprintf(ml_fp, ":%u,", filter);
+            write_json_string(ml_fp, "reorder");
+            std::fprintf(ml_fp, ":%u,", reorder_index);
+            write_json_string(ml_fp, "interleave");
+            std::fprintf(ml_fp, ":%u,", interleave);
+            write_json_string(ml_fp, "entropy");
+            std::fprintf(ml_fp, ":%u,", entropy);
+            write_json_string(ml_fp, "bits");
+            std::fprintf(ml_fp, ":%llu}", static_cast<unsigned long long>(bits));
+          };
+
+          write_candidate("best",
+                          best_predictor,
+                          best_filter,
+                          best_reorder_index,
+                          best_interleave,
+                          best_entropy,
+                          best_bits);
+          std::fputc(',', ml_fp);
+          write_candidate("second",
+                          second_predictor,
+                          second_filter,
+                          second_reorder_index,
+                          second_interleave,
+                          second_entropy,
+                          second_bits);
+          std::fputc('}', ml_fp);
+          std::fputc('\n', ml_fp);
         }
 
         // 最小の推定ビット長を与えた組み合わせを採用する。
