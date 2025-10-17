@@ -9,7 +9,9 @@ NPZ 形式での保存 / 復元機能を一括して実装する。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
+
+import sys
 
 import numpy as np
 
@@ -344,6 +346,7 @@ class MultiTaskModel:
         lr: float,
         weight_decay: float,
         rng: np.random.Generator,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> float:
         """1 エポック分の学習を実行する。"""
 
@@ -352,7 +355,8 @@ class MultiTaskModel:
         sample_count = features.shape[0]
         indices = rng.permutation(sample_count)
         total_loss = 0.0
-        for start in range(0, sample_count, batch_size):
+        total_batches = max(1, (sample_count + batch_size - 1) // batch_size)
+        for batch_no, start in enumerate(range(0, sample_count, batch_size), start=1):
             batch_idx = indices[start : start + batch_size]
             xb = features[batch_idx]
             hidden, activations, pre_acts, dropout_masks = self._forward_hidden(
@@ -370,6 +374,8 @@ class MultiTaskModel:
                 weight_decay,
             )
             total_loss += batch_loss * len(batch_idx)
+            if progress_callback is not None:
+                progress_callback(batch_no, total_batches)
         return float(total_loss / sample_count)
 
     def _update_heads(
@@ -503,6 +509,25 @@ def train_multitask_model(
     patience_counter = 0
 
     for epoch in range(config.epochs):
+        total_batches = max(1, (train_features.shape[0] + config.batch_size - 1) // config.batch_size)
+        digits = len(str(total_batches))
+        bar_width = 30
+        progress_rendered = False
+
+        def report_progress(batch_idx: int, total: int) -> None:
+            """バッチ処理の進捗を表示する。"""
+
+            nonlocal progress_rendered
+            progress_rendered = True
+            ratio = min(max(batch_idx / total, 0.0), 1.0)
+            filled = min(bar_width, max(0, int(round(ratio * bar_width))))
+            bar = "#" * filled + "-" * (bar_width - filled)
+            sys.stdout.write(
+                f"\rエポック {epoch + 1:03d} {batch_idx:>{digits}}/{total} "
+                f"[{bar}] {ratio * 100:6.2f}%"
+            )
+            sys.stdout.flush()
+
         loss = model.train_epoch(
             train_features,
             train_targets,
@@ -510,7 +535,10 @@ def train_multitask_model(
             config.learning_rate,
             config.weight_decay,
             rng,
+            progress_callback=report_progress,
         )
+        if progress_rendered:
+            sys.stdout.write("\n")
         train_logits = model.predict_logits(train_features)
         val_logits = model.predict_logits(val_features)
         train_metrics: Dict[str, Dict[str, float]] = {}
