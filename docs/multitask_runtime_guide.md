@@ -36,6 +36,13 @@ done
 - `--epsilon-soft`: best/second のソフトターゲット比重（既定 0.2）。
 - `--export-dir`: ベストモデルを書き出すディレクトリ。
 
+バッチサイズ調整の指針:
+
+- **増やすメリット**: 1 ステップあたりの勾配推定が安定し、GPU/CPU ベクトル化効率が向上する。高速化が見込め、`top3` マクロ平均のばらつきが減るケースが多い。
+- **増やすデメリット**: メモリ使用量が増大し、極端に大きくすると検証頻度が下がって早期終了が鈍る。汎化性能が悪化する場合もある。
+- **減らすメリット**: 更新頻度が上がり、限られたメモリ環境でも学習を継続できる。正則化効果で汎化が改善することがある。
+- **減らすデメリット**: 勾配がノイジーになり、収束が遅くなる。学習率の調整が必要になりやすい。
+
 実行例:
 
 ```bash
@@ -50,15 +57,16 @@ python3 train_multitask.py data/tlg8_multitask.jsonl \
     --export-dir out/multitask
 ```
 
-実行中はエポック毎に各ヘッド（predictor/filter_perm/filter_primary/filter_secondary/reorder/interleave）の `top1`・`top2`・`two_choice` が表示される。`--export-dir` を指定すると検証 `two_choice` が最良の時点で `multitask_best.npz` と `metrics.json` が保存される。
+JSONL 読み込み時は 1,000 行ごとに `読み込み中: xxxx エントリ処理済み...` が標準エラーへ表示され、巨大ファイルでも進捗が把握しやすい。実行中はエポック毎に各ヘッド（predictor/filter_perm/filter_primary/filter_secondary/reorder/interleave）の `top1`・`top2`・`top3`・`three_choice` が表示され、マクロ平均（全ヘッド平均）も併せて出力される。`--export-dir` を指定すると検証 `top3` マクロ平均が最良の時点で `multitask_best.npz` が保存される。
 
 ## 学習状態の評価指標
-- **two_choice**: best または second を当てられた割合。目標 0.95 以上。
-- **top1 vs top2 のギャップ**: `top1` が極端に低く `top2` が高い場合、2位情報に依存しすぎている。ビームサーチで救済できるが、ログを確認して極端なフェーズが無いか把握する。
+- **top3**: ゴールドの best が上位 3 位以内に入った割合。現行の早期終了はこのマクロ平均を最優先で監視する。0.97 付近を目標に改善を図る。
+- **three_choice**: モデルの argmax が best または second を的中させた割合。third ラベルを持たないデータでは `top3` が主指標になるが、`three_choice` も参考値として確認する。
+- **top1 vs top2 のギャップ**: `top1` が極端に低く `top2` が高い場合、2 位情報に依存しすぎている。ビームサーチで救済できるが、ログを確認して極端なフェーズが無いか把握する。
 - **損失推移**: `train_loss` と `val_loss` を比較し、後者が早期に下げ止まるようなら過学習兆候。
 
 ### 学習がうまくいっていない兆候と対処
-1. **全フェーズで two_choice が 0.9 未満**
+1. **全フェーズで top3 が 0.9 未満**
    - データ不足が第一候補。より多様なブロックを含む JSONL を追加し、再学習。
    - モデル容量を増やす: `--hidden-dims` に層を追加 or 各層を 1.5〜2 倍へ。
 2. **特定のヘッドのみ低精度**（例: filter_primary）
@@ -74,7 +82,7 @@ python3 train_multitask.py data/tlg8_multitask.jsonl \
 
 ## 推論・ビームサーチの使い方
 ### モデル読み込みとトップ候補抽出
-`multitask_model.py` の `MultiTaskModel.load` を利用する。特徴量は学習時と同じ前処理（8×8×C + 3 スカラー標準化）を行う。
+`multitask_model.py` の `MultiTaskModel.load` を利用する。特徴量は学習時と同じ前処理（8×8×C + 3 スカラー標準化）を行う。推論時のランキングには温度 (`--temperature`) を適用でき、`MultiTaskModel.predict_topk` はデフォルトで各ヘッド上位 3 件を返す。
 
 ```python
 import numpy as np
@@ -83,14 +91,14 @@ from multitask_model import MultiTaskModel
 model = MultiTaskModel.load("out/multitask/multitask_best.npz")
 features = np.load("sample_block_features.npy")  # shape = (259,)
 logits = model.predict_logits(features[None, :])
-topk = model.predict_topk(features[None, :], k=2)
-print(topk["head_predictor"])  # [(class_id, logprob), ...]
+topk = model.predict_topk(features[None, :], k=3, temperature=1.2)
+print(topk["predictor"])  # [(class_id, logprob), ...]
 ```
 
-フィルタ候補は `build_filter_candidates` で 4 通りまでに束ねられる。
+フィルタ候補は `build_filter_candidates` で最大 6 通りまで束ねられるが、他ヘッドの候補数に応じて自動的に 4→3→2 件へ削減される。
 
 ### ビームサーチによる構成選択
-`beam_search_runtime.py` の `select_block_config` では、各フェーズの上位候補から最大 16 通りの組合せをエンコーダで評価する。
+`beam_search_runtime.py` の `select_block_config` では、各フェーズの上位候補（predictor/filter/reorder/interleave の top-3 を基準、マージンで自動縮小）から最大 16 通りの組合せをエンコーダで評価する。
 
 ```python
 from beam_search_runtime import select_block_config
@@ -102,12 +110,14 @@ cfg, bits = select_block_config(
     try_encode_block,
     margin_reorder=0.5,
     margin_interleave=0.5,
-    margin_predictor=0.3,
+    margin_filter_perm=0.4,
+    margin_predictor=0.4,
+    max_trials=16,
 )
 print(cfg, bits)
 ```
 
-フィルタの合成順位と候補圧縮は自動で行われ、信頼度マージンにより組合せ上限が 16 を超えないよう制御される。`try_encode_block` は既存のエンコーダ API に合わせて実装する。
+フィルタの合成順位と候補圧縮は自動で行われ、信頼度マージンや候補数上限ロジックにより総組合せが 16 を超えないよう制御される。INFO ログには各ヘッドの採用候補数とマージン、削減ステップが記録される。`try_encode_block` は既存のエンコーダ API に合わせて実装する。
 
 ### テスト
 最低限のユニットテストは `python3 -m unittest discover -s test -p 'test*.py'` で実行できる。新しいモデル構成を導入する際は成功することを確認してからコミットする。
@@ -122,7 +132,7 @@ print(cfg, bits)
 
 ## 運用 Tips
 - 学習ログは標準出力だけでなく `--log-file` を追加して保存すると、収束傾向を後から確認しやすい（オプションが無い場合は `tee` を活用）。
-- 検証 two_choice が 0.97 以上で安定したら、本番エンコーダに組み込み、ログで試行回数・平均ビット数を観測すると効果が把握できる。
+- 検証 top3 マクロ平均が 0.97 以上で安定したら、本番エンコーダに組み込み、ログで試行回数・平均ビット数を観測すると効果が把握できる。
 - 追加データが手に入ったら既存 NPZ を初期値としてロードし、微調整 (fine-tuning) することも検討できる。`train_multitask.py --load` のようなオプションを将来的に追加する際の叩き台になる。
 
 以上でマルチタスク学習スクリプトとビームサーチ実行環境の基本運用を網羅する。

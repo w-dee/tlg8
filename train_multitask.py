@@ -69,6 +69,7 @@ def load_dataset(paths: Sequence[Path]) -> Tuple[np.ndarray, Dict[str, np.ndarra
 
     total_lines = 0
     loaded = 0
+    report_interval = 1000
 
     for path in paths:
         try:
@@ -144,6 +145,11 @@ def load_dataset(paths: Sequence[Path]) -> Tuple[np.ndarray, Dict[str, np.ndarra
                     second_labels["interleave"].append(second_value("interleave"))
 
                     loaded += 1
+                    if loaded % report_interval == 0:
+                        print(
+                            f"読み込み中: {loaded} エントリ処理済み...",
+                            file=sys.stderr,
+                        )
         except OSError as exc:
             print(f"警告: {path} を読み込めません: {exc}", file=sys.stderr)
 
@@ -177,10 +183,23 @@ def slice_labels(labels: Dict[str, np.ndarray], indices: np.ndarray) -> Dict[str
 def format_metrics(metrics: Dict[str, float]) -> str:
     """単一ヘッドの指標を整形して返す。"""
 
-    return (
-        f"top1={metrics['top1']*100:.2f}% top2={metrics['top2']*100:.2f}% "
-        f"two={metrics['two_choice']*100:.2f}%"
-    )
+    top1 = metrics.get("top1", 0.0) * 100.0
+    top2 = metrics.get("top2", 0.0) * 100.0
+    top3 = metrics.get("top3", 0.0) * 100.0
+    three = metrics.get("three_choice", 0.0) * 100.0
+    return f"top1={top1:.2f}% top2={top2:.2f}% top3={top3:.2f}% three={three:.2f}%"
+
+
+def macro_average(metrics: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    """ヘッドごとの指標辞書からマクロ平均を計算する。"""
+
+    result: Dict[str, float] = {}
+    if not metrics:
+        return result
+    for key in ("top1", "top2", "top3", "three_choice"):
+        values = [metrics[name].get(key, float("nan")) for name in HEAD_ORDER]
+        result[key] = float(np.nanmean(values))
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -197,6 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--test-ratio", type=float, default=0.2, help="評価データ比率")
     parser.add_argument("--patience", type=int, default=20, help="早期終了の待機エポック数")
     parser.add_argument("--export-dir", type=Path, help="学習済みモデルの保存先ディレクトリ")
+    parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     args = parser.parse_args(argv)
 
     files = discover_input_files(args.inputs)
@@ -209,10 +229,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
     mean, std = compute_feature_scaler(features, train_idx)
-    standardized = (features - mean) / std
-
-    train_features = standardized[train_idx]
-    val_features = standardized[val_idx]
+    train_features = features[train_idx]
+    val_features = features[val_idx]
     train_best = slice_labels(best_labels, train_idx)
     train_second = slice_labels(second_labels, train_idx)
     val_best = slice_labels(best_labels, val_idx)
@@ -229,7 +247,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
     )
 
-    model = MultiTaskModel(standardized.shape[1], args.hidden_dims, args.dropout, mean, std)
+    model = MultiTaskModel(features.shape[1], args.hidden_dims, args.dropout, mean, std)
+    model.inference_temperature = max(float(args.temperature), 1e-6)
     model, train_metrics, val_metrics = train_multitask_model(
         model,
         train_features,
@@ -243,11 +262,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print("\n=== 訓練データ精度 ===")
     for name in HEAD_ORDER:
-        print(f"{name:16s}: {format_metrics(train_metrics.get(name, {'top1':0.0,'top2':0.0,'two_choice':0.0}))}")
+        print(
+            f"{name:16s}: {format_metrics(train_metrics.get(name, {}))}"
+        )
+    train_macro = macro_average(train_metrics)
+    if train_macro:
+        print(
+            f"{'macro':16s}: top1={train_macro['top1']*100:.2f}% "
+            f"top2={train_macro['top2']*100:.2f}% top3={train_macro['top3']*100:.2f}% "
+            f"three={train_macro['three_choice']*100:.2f}%"
+        )
 
     print("\n=== 評価データ精度 ===")
     for name in HEAD_ORDER:
-        print(f"{name:16s}: {format_metrics(val_metrics.get(name, {'top1':0.0,'top2':0.0,'two_choice':0.0}))}")
+        print(f"{name:16s}: {format_metrics(val_metrics.get(name, {}))}")
+    val_macro = macro_average(val_metrics)
+    if val_macro:
+        print(
+            f"{'macro':16s}: top1={val_macro['top1']*100:.2f}% "
+            f"top2={val_macro['top2']*100:.2f}% top3={val_macro['top3']*100:.2f}% "
+            f"three={val_macro['three_choice']*100:.2f}%"
+        )
 
     if args.export_dir:
         args.export_dir.mkdir(parents=True, exist_ok=True)

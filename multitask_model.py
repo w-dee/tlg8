@@ -101,33 +101,64 @@ def build_soft_targets(
     return targets
 
 
-def compute_metrics(
-    logits: np.ndarray, best: np.ndarray, second: np.ndarray
-) -> Dict[str, float]:
-    """ロジットから top1/top2/two_choice 指標を算出する。"""
+def _deterministic_topk_indices(logits: np.ndarray, k: int) -> np.ndarray:
+    """(-logit, class_id) の順でソートした上位 k インデックスを返す。"""
 
     if logits.ndim != 2:
         raise ValueError("logits は (N, C) 形状である必要があります")
-    if logits.shape[0] == 0:
-        return {"top1": float("nan"), "top2": float("nan"), "two_choice": float("nan")}
+    if k <= 0:
+        raise ValueError("k は正の整数である必要があります")
+    n_samples, n_classes = logits.shape
+    k_eff = min(k, n_classes)
+    result = np.zeros((n_samples, k_eff), dtype=np.int64)
+    class_ids = np.arange(n_classes, dtype=np.int64)
+    for idx in range(n_samples):
+        row = logits[idx]
+        order = np.lexsort((class_ids, -row))
+        result[idx] = order[:k_eff]
+    return result
 
-    pred = np.argmax(logits, axis=1)
+
+def compute_metrics(
+    logits: np.ndarray, best: np.ndarray, second: np.ndarray
+) -> Dict[str, float]:
+    """ロジットから top1/top2/top3/three_choice 指標を算出する。"""
+
+    if logits.ndim != 2:
+        raise ValueError("logits は (N, C) 形状である必要があります")
+    sample_count = logits.shape[0]
+    if sample_count == 0:
+        return {
+            "top1": float("nan"),
+            "top2": float("nan"),
+            "top3": float("nan"),
+            "three_choice": float("nan"),
+        }
+
+    best = np.asarray(best, dtype=np.int64)
+    second = np.asarray(second, dtype=np.int64)
+    top1_idx = _deterministic_topk_indices(logits, 1)
+    pred = top1_idx[:, 0]
     top1 = pred == best
 
     if logits.shape[1] >= 2:
-        top2_idx = np.argpartition(logits, kth=-2, axis=1)[:, -2:]
+        top2_idx = _deterministic_topk_indices(logits, 2)
         top2 = np.any(top2_idx == best[:, None], axis=1)
     else:
         top2 = top1
 
-    two_choice = top1.copy()
+    top3_idx = _deterministic_topk_indices(logits, 3)
+    top3 = np.any(top3_idx == best[:, None], axis=1)
+
+    three_choice = top1.copy()
     valid_second = second >= 0
-    two_choice |= valid_second & (pred == second)
+    three_choice |= valid_second & (pred == second)
 
     return {
         "top1": float(np.mean(top1)),
         "top2": float(np.mean(top2)),
-        "two_choice": float(np.mean(two_choice)),
+        "top3": float(np.mean(top3)),
+        "three_choice": float(np.mean(three_choice)),
     }
 
 
@@ -157,6 +188,25 @@ class MultiTaskModel:
         self.trunk_biases: List[np.ndarray] = []
         self.head_weights: Dict[str, np.ndarray] = {}
         self.head_biases: Dict[str, np.ndarray] = {}
+        self.inference_temperature: float = 1.0
+
+    def _standardize_batch(self, features: np.ndarray) -> np.ndarray:
+        """特徴量を平均・標準偏差で正規化する。"""
+
+        arr = np.asarray(features, dtype=np.float32)
+        standardized = (arr - self.feature_mean) / self.feature_std
+        return standardized.astype(np.float64)
+
+    def _prepare_standardized(self, features: np.ndarray) -> Tuple[np.ndarray, bool]:
+        """推論向けに 1 サンプル入力を正規化し、元次元情報を返す。"""
+
+        arr = np.asarray(features, dtype=np.float32)
+        squeeze = False
+        if arr.ndim == 1:
+            arr = arr[None, :]
+            squeeze = True
+        standardized = self._standardize_batch(arr)
+        return standardized, squeeze
 
     def initialize(self, rng: np.random.Generator) -> None:
         """重みを乱数初期化する。"""
@@ -190,6 +240,7 @@ class MultiTaskModel:
             "dropout": np.asarray([self.dropout], dtype=np.float32),
             "feature_mean": self.feature_mean.astype(np.float32),
             "feature_std": self.feature_std.astype(np.float32),
+            "inference_temperature": np.asarray([self.inference_temperature], dtype=np.float32),
         }
         for idx, (W, b) in enumerate(zip(self.trunk_weights, self.trunk_biases)):
             state[f"trunk_W{idx}"] = W.astype(np.float32)
@@ -209,6 +260,8 @@ class MultiTaskModel:
         safe_std = state["feature_std"].astype(np.float32)
         safe_std[safe_std < 1e-6] = 1.0
         self.feature_std = safe_std
+        temp_arr = state.get("inference_temperature")
+        self.inference_temperature = float(temp_arr[0]) if temp_arr is not None else 1.0
         self.trunk_weights = []
         self.trunk_biases = []
         idx = 0
@@ -276,7 +329,10 @@ class MultiTaskModel:
     ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
         """隠れ層出力と中間結果を返す。"""
 
-        activations, pre_acts, dropout_masks = self._forward_trunk(x, training, rng)
+        standardized = self._standardize_batch(x)
+        activations, pre_acts, dropout_masks = self._forward_trunk(
+            standardized, training, rng
+        )
         hidden = activations[-1]
         return hidden, activations, pre_acts, dropout_masks
 
@@ -374,12 +430,7 @@ class MultiTaskModel:
     def predict_logits(self, features: np.ndarray) -> Dict[str, np.ndarray]:
         """入力特徴量から各ヘッドのロジットを返す。"""
 
-        feats = np.asarray(features, dtype=np.float32)
-        squeeze = False
-        if feats.ndim == 1:
-            feats = feats[None, :]
-            squeeze = True
-        standardized = (feats - self.feature_mean) / self.feature_std
+        standardized, squeeze = self._prepare_standardized(features)
         rng = np.random.default_rng(0)
         activations, _, _ = self._forward_trunk(standardized, training=False, rng=rng)
         hidden = activations[-1]
@@ -393,11 +444,17 @@ class MultiTaskModel:
         return logits
 
     def predict_topk(
-        self, features: np.ndarray, k: int = 2
+        self,
+        features: np.ndarray,
+        k: int = 3,
+        per_head_k: Dict[str, int] | None = None,
+        temperature: float | None = None,
     ) -> Dict[str, List[Tuple[int, float]]]:
-        """各ヘッドについて上位 k 件の (class_id, logprob) を返す。"""
+        """各ヘッドについて上位候補 (class_id, logprob) を返す。"""
 
         logits = self.predict_logits(features)
+        base_temp = self.inference_temperature if temperature is None else float(temperature)
+        temp = max(base_temp, 1e-6)
         result: Dict[str, List[Tuple[int, float]]] = {}
         for name, arr in logits.items():
             vec = np.asarray(arr)
@@ -407,9 +464,12 @@ class MultiTaskModel:
                 data = vec[0]
             else:
                 raise ValueError("predict_topk は単一サンプルの入力にのみ対応します")
-            log_probs = log_softmax(data[None, :])[0]
-            k_eff = min(k, data.shape[0])
-            order = np.argsort(data)[::-1][:k_eff]
+            head_k = per_head_k.get(name, k) if per_head_k else k
+            head_k = max(1, min(int(head_k), data.shape[0]))
+            scaled = data / temp
+            log_probs = log_softmax(scaled[None, :])[0]
+            class_ids = np.arange(data.shape[0], dtype=np.int64)
+            order = np.lexsort((class_ids, -scaled))[:head_k]
             result[name] = [(int(idx), float(log_probs[idx])) for idx in order]
         return result
 
@@ -462,14 +522,27 @@ def train_multitask_model(
             val_metrics[name] = compute_metrics(
                 val_logits[name], val_labels[name], val_second[name]
             )
-        mean_two_choice = float(
-            np.mean([val_metrics[name]["two_choice"] for name in HEAD_ORDER])
+        mean_top3 = float(
+            np.mean([val_metrics[name]["top3"] for name in HEAD_ORDER])
         )
+        mean_three_choice = float(
+            np.mean([val_metrics[name]["three_choice"] for name in HEAD_ORDER])
+        )
+        mean_top1 = float(np.mean([val_metrics[name]["top1"] for name in HEAD_ORDER]))
+        mean_top2 = float(np.mean([val_metrics[name]["top2"] for name in HEAD_ORDER]))
         print(
-            f"epoch {epoch + 1:03d}: loss={loss:.4f} val_two_choice={mean_two_choice*100:.2f}%"
+            "epoch {epoch:03d}: loss={loss:.4f} val_top3={top3:.2f}% "
+            "val_three={three:.2f}% val_top1={top1:.2f}% val_top2={top2:.2f}%".format(
+                epoch=epoch + 1,
+                loss=loss,
+                top3=mean_top3 * 100.0,
+                three=mean_three_choice * 100.0,
+                top1=mean_top1 * 100.0,
+                top2=mean_top2 * 100.0,
+            )
         )
-        if mean_two_choice > best_metric + 1e-6:
-            best_metric = mean_two_choice
+        if mean_top3 > best_metric + 1e-6:
+            best_metric = mean_top3
             best_state = model.copy_state()
             best_train_metrics = train_metrics
             best_val_metrics = val_metrics
@@ -492,21 +565,22 @@ def build_filter_candidates(
 ) -> List[Tuple[int, float]]:
     """フィルター候補を組み合わせた上位リストを構築する。"""
 
-    if not top_perm:
-        return []
-    perm_id, perm_score = top_perm[0]
-    primaries = top_primary[:2] if top_primary else []
-    secondaries = top_secondary[:2] if top_secondary else []
-    if not primaries or not secondaries:
+    if not top_perm or not top_primary or not top_secondary:
         return []
     combos: List[Tuple[int, float]] = []
-    for primary_id, primary_score in primaries:
-        for secondary_id, secondary_score in secondaries:
-            code = ((perm_id % 6) << 4) | ((primary_id % 4) << 2) | (secondary_id % 4)
-            score = perm_score + primary_score + secondary_score
-            combos.append((code, score))
-    combos.sort(key=lambda item: item[1], reverse=True)
-    return combos[:max_candidates]
+    for perm_id, perm_score in top_perm:
+        perm_mod = perm_id % 6
+        for primary_id, primary_score in top_primary:
+            primary_mod = primary_id % 4
+            for secondary_id, secondary_score in top_secondary:
+                secondary_mod = secondary_id % 4
+                code = (perm_mod << 4) | (primary_mod << 2) | secondary_mod
+                score = perm_score + primary_score + secondary_score
+                combos.append((code, score))
+    combos.sort(key=lambda item: (-item[1], item[0]))
+    if max_candidates <= 0:
+        return combos
+    return combos[: max_candidates]
 
 
 def evaluate_multitask(
