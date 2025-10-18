@@ -4,18 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import logging
 import math
+import mmap
 import os
 import random
+import struct
+import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -43,6 +47,14 @@ from multitask_model import (
 MAX_COMPONENTS = 4
 BLOCK_EDGE = 8
 MAX_BLOCK_PIXELS = BLOCK_EDGE * BLOCK_EDGE
+
+# ラベルキャッシュのレコード定義
+LABEL_MAGIC = 0x4C424C38  # 'LBL8'
+LABEL_VERSION = 1
+LABEL_STRUCT = struct.Struct("<IHH12hI92x")
+LABEL_RECORD_SIZE = LABEL_STRUCT.size
+LABEL_FIELD_COUNT = 12
+LABEL_FIELD_OFFSET = 8  # ヘッダー 8 バイト分の後にラベル本体が続く
 
 try:
     from tqdm import tqdm
@@ -149,14 +161,14 @@ def discover_input_files(inputs: Sequence[str]) -> List[Path]:
     for item in inputs:
         path = Path(item)
         if path.is_dir():
-            for child in sorted(path.iterdir()):
+            for child in sorted(path.rglob("*.jsonl")):
                 if child.is_file():
                     files.append(child)
         elif path.is_file():
             files.append(path)
         else:
             print(f"警告: 入力パス '{item}' は存在しません", file=sys.stderr)
-    return files
+    return sorted({p.resolve() for p in files})
 
 
 def split_dataset(count: int, test_ratio: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -328,6 +340,191 @@ def build_jsonl_index(
     return files, index
 
 
+def compute_label_cache_hashes(
+    files: Sequence[FileRef], *, show_progress: bool
+) -> Tuple[List[Dict[str, object]], str]:
+    """ラベルキャッシュ検証用に各入力の SHA-256 と結合ハッシュを計算する。"""
+
+    total = sum(ref.size for ref in files)
+    progress = ProgressReporter(
+        total,
+        "ラベルキャッシュ照合: ハッシュ計算",
+        unit="B",
+        enable=show_progress,
+        unit_scale=True,
+    )
+    dataset_hasher = hashlib.sha256()
+    results: List[Dict[str, object]] = []
+    for ref in files:
+        sha = hashlib.sha256()
+        resolved = ref.path.resolve()
+        try:
+            with resolved.open("rb", buffering=1024 * 1024) as fp:
+                while True:
+                    chunk = fp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    sha.update(chunk)
+                    progress.update(len(chunk))
+        except OSError as exc:
+            progress.close()
+            raise RuntimeError(f"{resolved} のハッシュ計算に失敗しました: {exc}") from exc
+        digest = sha.hexdigest()
+        results.append(
+            {
+                "path": str(resolved),
+                "size": int(ref.size),
+                "mtime": float(ref.mtime),
+                "sha256": digest,
+            }
+        )
+        dataset_hasher.update(bytes.fromhex(digest))
+        dataset_hasher.update(struct.pack("<Q", int(ref.size)))
+        dataset_hasher.update(str(resolved).encode("utf-8"))
+    progress.close()
+    return results, dataset_hasher.hexdigest()
+
+
+def try_load_label_cache(
+    meta_path: Path,
+    bin_path: Path,
+    files: Sequence[FileRef],
+    expected_records: int,
+    *,
+    show_progress: bool,
+) -> Optional[FastLabelStore]:
+    """ラベルキャッシュが利用可能なら FastLabelStore を初期化する。"""
+
+    if not meta_path.exists() or not bin_path.exists():
+        return None
+    try:
+        with meta_path.open("r", encoding="utf-8") as fp:
+            meta = json.load(fp)
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("ラベルキャッシュメタデータを読み取れません: %s", exc)
+        return None
+
+    try:
+        schema_val = int(meta.get("schema", 0))
+    except (TypeError, ValueError):
+        logging.warning("ラベルキャッシュのスキーマが解釈できません")
+        return None
+    if schema_val != 1:
+        logging.warning("ラベルキャッシュのスキーマバージョンが一致しません")
+        return None
+    try:
+        record_size = int(meta.get("record_size", 0))
+        record_count = int(meta.get("record_count", 0))
+    except (TypeError, ValueError):
+        logging.warning("ラベルキャッシュメタデータのレコード情報が不正です")
+        return None
+    if record_size != LABEL_RECORD_SIZE:
+        logging.warning("ラベルレコードサイズが想定値と異なるためキャッシュを無視します")
+        return None
+    if record_count != expected_records or record_count <= 0:
+        logging.warning("ラベルキャッシュの件数が現在のデータセットと一致しません")
+        return None
+
+    inputs_meta = meta.get("inputs")
+    if not isinstance(inputs_meta, list) or len(inputs_meta) != len(files):
+        logging.warning("ラベルキャッシュの入力ファイル一覧が不正です")
+        return None
+
+    try:
+        computed_meta, dataset_hash = compute_label_cache_hashes(files, show_progress=show_progress)
+    except RuntimeError as exc:
+        logging.warning("ラベルキャッシュ照合中にハッシュ計算へ失敗しました: %s", exc)
+        return None
+
+    for recorded, current in zip(inputs_meta, computed_meta):
+        if not isinstance(recorded, dict):
+            logging.warning("ラベルキャッシュの入力情報が壊れています")
+            return None
+        try:
+            recorded_path = Path(recorded["path"]).resolve()
+            recorded_size = int(recorded["size"])
+            recorded_mtime = float(recorded["mtime"])
+            recorded_sha = str(recorded["sha256"])
+        except (KeyError, TypeError, ValueError):
+            logging.warning("ラベルキャッシュの入力情報を解釈できません")
+            return None
+        if recorded_path != Path(current["path"]).resolve():
+            logging.warning("ラベルキャッシュの入力パスが一致しません: %s", recorded_path)
+            return None
+        if recorded_size != int(current["size"]):
+            logging.warning("ラベルキャッシュのサイズ情報が一致しません: %s", recorded_path)
+            return None
+        if not math.isclose(recorded_mtime, float(current["mtime"]), rel_tol=0.0, abs_tol=1e-6):
+            logging.warning("ラベルキャッシュの更新時刻が一致しません: %s", recorded_path)
+            return None
+        if recorded_sha != str(current["sha256"]):
+            logging.warning("ラベルキャッシュのハッシュが一致しません: %s", recorded_path)
+            return None
+
+    recorded_dataset_hash = str(meta.get("dataset_sha256", ""))
+    if recorded_dataset_hash != dataset_hash:
+        logging.warning("ラベルキャッシュの結合ハッシュが一致しません")
+        return None
+
+    try:
+        size = bin_path.stat().st_size
+    except OSError as exc:
+        logging.warning("ラベルキャッシュのバイナリを確認できません: %s", exc)
+        return None
+    if size != record_size * record_count:
+        logging.warning("ラベルキャッシュのファイルサイズが不一致です")
+        return None
+
+    try:
+        store = FastLabelStore(bin_path, record_count, record_size)
+    except Exception as exc:
+        logging.warning("ラベルキャッシュの初期化に失敗しました: %s", exc)
+        return None
+    logging.info("ラベルキャッシュを利用します (%s)", bin_path)
+    return store
+
+
+def invoke_preextractor(
+    inputs: Sequence[str],
+    *,
+    index_cache: Optional[Path],
+    meta_out: Path,
+    bin_out: Path,
+    record_size: int,
+    threads: int,
+    progress: bool,
+    skip_bad: bool,
+) -> int:
+    """preextract_labels.py をサブプロセスとして実行する。"""
+
+    script = Path(__file__).with_name("preextract_labels.py")
+    if not script.exists():
+        logging.warning("preextract_labels.py が見つかりません")
+        return 1
+    cmd: List[str] = [sys.executable, str(script)]
+    cmd.extend(str(item) for item in inputs)
+    if index_cache is not None:
+        cmd.extend(["--index-cache", str(index_cache)])
+    cmd.extend(
+        [
+            "--meta-out",
+            str(meta_out),
+            "--bin-out",
+            str(bin_out),
+            "--record-size",
+            str(int(record_size)),
+            "--threads",
+            str(max(1, int(threads))),
+        ]
+    )
+    cmd.append("--progress" if progress else "--no-progress")
+    if skip_bad:
+        cmd.append("--skip-bad-records")
+    logging.info("preextract_labels.py を起動します: %s", " ".join(cmd))
+    result = subprocess.run(cmd, check=False)
+    return int(result.returncode)
+
+
 class JsonlReader:
     """ファイル・オフセット指定で JSON レコードを読み取る補助クラス。"""
 
@@ -431,6 +628,104 @@ def _normalize_indices(idx: object, length: int) -> Tuple[np.ndarray, bool]:
             raise TypeError("1 次元の整数インデックスのみ対応しています")
         return idx.astype(np.int64, copy=False), False
     raise TypeError("対応していないインデックス指定です")
+
+
+class FastLabelStore:
+    """ラベルバイナリを mmap して高速アクセス用ビューを提供する。"""
+
+    def __init__(self, bin_path: Path, record_count: int, record_size: int) -> None:
+        self._path = Path(bin_path)
+        self._record_count = int(record_count)
+        self._record_size = int(record_size)
+        self._file = open(self._path, "rb")
+        try:
+            self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        except Exception:
+            self._file.close()
+            raise
+        try:
+            mapped_size = self._mmap.size()
+        except (AttributeError, OSError):  # pragma: no cover - プラットフォーム差異
+            mapped_size = len(self._mmap)
+        expected_size = self._record_count * self._record_size
+        if mapped_size < expected_size:
+            self.close()
+            raise ValueError("ラベルバイナリのサイズがメタデータと一致しません")
+        try:
+            magic, version, _reserved = struct.unpack_from("<IHH", self._mmap, 0)
+        except struct.error as exc:
+            self.close()
+            raise ValueError("ラベルバイナリのヘッダーを読み取れません") from exc
+        if magic != LABEL_MAGIC or version != LABEL_VERSION:
+            self.close()
+            raise ValueError("ラベルバイナリのマジックまたはバージョンが不正です")
+        self._fields: Dict[int, np.ndarray] = {}
+        stride = self._record_size
+        base = LABEL_FIELD_OFFSET
+        for idx in range(LABEL_FIELD_COUNT):
+            offset = base + idx * 2
+            arr = np.ndarray(
+                shape=(self._record_count,),
+                dtype=np.int16,
+                buffer=self._mmap,
+                offset=offset,
+                strides=(stride,),
+            )
+            self._fields[idx] = arr
+
+    def field_array(self, idx: int) -> np.ndarray:
+        return self._fields[idx]
+
+    @property
+    def record_count(self) -> int:
+        return self._record_count
+
+    def make(self, head: str, *, use_second: bool) -> "FastLabels":
+        return FastLabels(self, head, use_second=use_second)
+
+    def close(self) -> None:
+        try:
+            self._mmap.close()
+        finally:
+            self._file.close()
+
+
+class FastLabels:
+    """FastLabelStore 上の単一ヘッドビュー。"""
+
+    FIELD_INDEX = {
+        ("predictor", False): 0,
+        ("filter_perm", False): 1,
+        ("filter_primary", False): 2,
+        ("filter_secondary", False): 3,
+        ("reorder", False): 4,
+        ("interleave", False): 5,
+        ("predictor", True): 6,
+        ("filter_perm", True): 7,
+        ("filter_primary", True): 8,
+        ("filter_secondary", True): 9,
+        ("reorder", True): 10,
+        ("interleave", True): 11,
+    }
+
+    def __init__(self, store: FastLabelStore, head: str, *, use_second: bool) -> None:
+        self._store = store
+        try:
+            self._field_idx = self.FIELD_INDEX[(head, use_second)]
+        except KeyError as exc:
+            raise KeyError(f"未知のヘッド名です: {head}") from exc
+
+    def __len__(self) -> int:
+        return self._store.record_count
+
+    def __getitem__(self, idx: object) -> np.ndarray:
+        rows, scalar = _normalize_indices(idx, len(self))
+        field = self._store.field_array(self._field_idx)
+        values = field[rows]
+        out = values.astype(np.int32, copy=True)
+        if scalar:
+            return int(out[0])
+        return out
 
 
 class LazyFeatures:
@@ -638,7 +933,7 @@ def compute_feature_scaler_streaming(
     return mean32, std
 
 
-def slice_labels_lazy(labels: Dict[str, LazyLabels], indices: np.ndarray) -> Dict[str, np.ndarray]:
+def slice_labels_lazy(labels: Dict[str, object], indices: np.ndarray) -> Dict[str, np.ndarray]:
     """遅延ラベルから指定インデックスの値をまとめて抽出する。"""
 
     return {name: lazy[indices] for name, lazy in labels.items()}
@@ -946,6 +1241,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--export-dir", type=Path, help="学習済みモデルの保存先ディレクトリ")
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
+    parser.add_argument("--labels-meta", type=Path, default=Path(".cache/labels.meta.json"), help="ラベルキャッシュのメタデータパス")
+    parser.add_argument("--labels-bin", type=Path, default=Path(".cache/labels.bin"), help="ラベルキャッシュのバイナリパス")
+    parser.add_argument("--build-label-cache", action="store_true", help="キャッシュ不整合時に事前抽出を自動実行")
+    parser.add_argument("--no-label-cache", action="store_true", help="JSONL からのラベル読み出しを強制")
     parser.add_argument(
         "--progress",
         action="store_true",
@@ -1020,15 +1319,58 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ImportError:
         pass
 
-    files = discover_input_files(args.inputs)
-    if not files:
+    input_paths = discover_input_files(args.inputs)
+    if not input_paths:
         print("エラー: 入力ファイルが見つかりません", file=sys.stderr)
         return 1
 
     cache_path = Path(args.index_cache) if args.index_cache else None
-    features, best_labels, second_labels, total = open_indexed_dataset(
-        files, cache_path, bool(args.progress)
-    )
+    file_refs, index = build_jsonl_index(input_paths, cache_path, bool(args.progress))
+
+    fast_label_store: Optional[FastLabelStore] = None
+    if not args.no_label_cache:
+        fast_label_store = try_load_label_cache(
+            args.labels_meta,
+            args.labels_bin,
+            file_refs,
+            index.shape[0],
+            show_progress=bool(args.progress),
+        )
+        if fast_label_store is None and args.build_label_cache:
+            rc = invoke_preextractor(
+                args.inputs,
+                index_cache=cache_path,
+                meta_out=args.labels_meta,
+                bin_out=args.labels_bin,
+                record_size=LABEL_RECORD_SIZE,
+                threads=MAX_DECODE_THREADS,
+                progress=bool(args.progress),
+                skip_bad=bool(args.skip_bad_records),
+            )
+            if rc == 0:
+                fast_label_store = try_load_label_cache(
+                    args.labels_meta,
+                    args.labels_bin,
+                    file_refs,
+                    index.shape[0],
+                    show_progress=bool(args.progress),
+                )
+            else:
+                logging.warning("ラベルキャッシュ生成に失敗しました (exit=%d)", rc)
+
+    reader = JsonlReader(file_refs)
+    sample = reader.read_line(int(index[0, 0]), int(index[0, 1]))
+    feature_dim = record_to_feature(sample).shape[0]
+    features = LazyFeatures(reader, index, feature_dim, max_workers=MAX_DECODE_THREADS)
+
+    if fast_label_store is not None:
+        best_labels = {name: fast_label_store.make(name, use_second=False) for name in HEAD_ORDER}
+        second_labels = {name: fast_label_store.make(name, use_second=True) for name in HEAD_ORDER}
+    else:
+        best_labels = {name: LazyLabels(reader, index, name, use_second=False) for name in HEAD_ORDER}
+        second_labels = {name: LazyLabels(reader, index, name, use_second=True) for name in HEAD_ORDER}
+
+    total = int(index.shape[0])
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
     mean, std = compute_feature_scaler_streaming(features, train_idx, show_progress=ENABLE_PROGRESS)
