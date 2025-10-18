@@ -49,6 +49,94 @@ try:
 except Exception:  # pragma: no cover - tqdm が利用不可の場合のフォールバック
     tqdm = None
 
+
+class _SimpleProgressBar:
+    """tqdm 非導入環境向けの簡易プログレスバー。"""
+
+    def __init__(self, total: int, desc: str, unit: str, *, unit_scale: bool = False) -> None:
+        self._total = max(0, int(total))
+        self._desc = desc
+        self._unit = unit
+        self._unit_scale = unit_scale
+        self._current = 0
+        self._printed = False
+        self._last_message_len = 0
+        if self._total > 0:
+            self._render()
+
+    def _format_value(self, value: int) -> str:
+        if not self._unit_scale or value <= 0:
+            return f"{value} {self._unit}"
+        suffixes = ["B", "KB", "MB", "GB", "TB"]
+        scaled = float(value)
+        idx = 0
+        while scaled >= 1024.0 and idx < len(suffixes) - 1:
+            scaled /= 1024.0
+            idx += 1
+        return f"{scaled:.2f} {suffixes[idx]}"
+
+    def _render(self) -> None:
+        message = f"{self._desc}: {self._format_value(self._current)}/{self._format_value(self._total)}"
+        padding = max(0, self._last_message_len - len(message))
+        sys.stderr.write("\r" + message + (" " * padding))
+        sys.stderr.flush()
+        self._printed = True
+        self._last_message_len = len(message)
+
+    def update(self, amount: int) -> None:
+        if amount <= 0 or self._total <= 0:
+            return
+        self._current = min(self._total, self._current + amount)
+        self._render()
+
+    def close(self) -> None:
+        if self._printed:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
+class ProgressReporter:
+    """tqdm を優先しつつ、利用不可時は簡易バーで進捗を表示するヘルパー。"""
+
+    def __init__(
+        self,
+        total: int,
+        desc: str,
+        *,
+        unit: str = "件",
+        enable: bool = True,
+        unit_scale: bool = False,
+    ) -> None:
+        self._enabled = enable and total > 0
+        self._bar = None
+        self._simple: Optional[_SimpleProgressBar] = None
+        if not self._enabled:
+            return
+        if tqdm is not None:
+            self._bar = tqdm(total=total, desc=desc, unit=unit, unit_scale=unit_scale)
+        else:
+            self._simple = _SimpleProgressBar(total, desc, unit, unit_scale=unit_scale)
+
+    def update(self, amount: int) -> None:
+        if not self._enabled or amount <= 0:
+            return
+        if self._bar is not None:
+            self._bar.update(amount)
+        elif self._simple is not None:
+            self._simple.update(amount)
+
+    def close(self) -> None:
+        if not self._enabled:
+            return
+        if self._bar is not None:
+            self._bar.close()
+        elif self._simple is not None:
+            self._simple.close()
+
+
+# 進捗表示の有効 / 無効を CLI から切り替えるためのフラグ。
+ENABLE_PROGRESS = True
+
 # 遅延デコード用のスレッド上限と JSON デコード挙動を実行時に切り替えるためのグローバル。
 MAX_DECODE_THREADS = 1
 SKIP_BAD_RECORDS = False
@@ -197,11 +285,13 @@ def build_jsonl_index(
             with path.open("rb", buffering=1024 * 1024) as fp:
                 offset = fp.tell()
                 last_pos = offset
-                bar = None
-                if show_progress and tqdm is not None:
-                    bar = tqdm(total=size, unit="B", unit_scale=True, desc=path.name)
-                elif show_progress and tqdm is None:
-                    print(f"{path.name}: インデックス構築中...", file=sys.stderr)
+                bar = ProgressReporter(
+                    size,
+                    f"{path.name}: インデックス構築中",
+                    unit="B",
+                    enable=show_progress,
+                    unit_scale=True,
+                )
                 while True:
                     line = fp.readline()
                     if not line:
@@ -209,13 +299,11 @@ def build_jsonl_index(
                     if line.strip():
                         index_list.append((file_id, offset))
                     offset = fp.tell()
-                    if bar is not None:
-                        bar.update(offset - last_pos)
-                        last_pos = offset
-                if bar is not None:
-                    if last_pos < size:
-                        bar.update(size - last_pos)
-                    bar.close()
+                    bar.update(offset - last_pos)
+                    last_pos = offset
+                if last_pos < size:
+                    bar.update(size - last_pos)
+                bar.close()
         except OSError as exc:
             print(f"警告: {path} を読み込めません: {exc}", file=sys.stderr)
     if not index_list:
@@ -439,10 +527,25 @@ class LazyLabels:
     def __getitem__(self, idx: object) -> np.ndarray:
         rows, scalar = _normalize_indices(idx, len(self))
         out = np.empty((rows.shape[0],), dtype=np.int32)
+        desc = "best" if not self._use_second else "second"
+        progress = ProgressReporter(
+            rows.shape[0],
+            f"{self._head}({desc}) ラベル読み出し",
+            unit="サンプル",
+            enable=ENABLE_PROGRESS and rows.shape[0] >= 1024,
+        )
+        pending = 0
         for out_idx, rec_idx in enumerate(rows):
             file_id, offset = self._index[int(rec_idx)]
             record = self._reader.read_line(int(file_id), int(offset))
             out[out_idx] = self._resolve_value(record)
+            pending += 1
+            if pending >= 256:
+                progress.update(pending)
+                pending = 0
+        if pending:
+            progress.update(pending)
+        progress.close()
         if scalar:
             return out[0]
         return out
@@ -494,7 +597,11 @@ def open_indexed_dataset(
 
 
 def compute_feature_scaler_streaming(
-    features: LazyFeatures, train_idx: np.ndarray, batch_size: int = 4096
+    features: LazyFeatures,
+    train_idx: np.ndarray,
+    batch_size: int = 4096,
+    *,
+    show_progress: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """訓練データの遅延読み出しで平均・標準偏差を算出する。"""
 
@@ -502,6 +609,9 @@ def compute_feature_scaler_streaming(
     mean = np.zeros((feat_dim,), dtype=np.float64)
     m2 = np.zeros((feat_dim,), dtype=np.float64)
     count = 0
+    progress = ProgressReporter(
+        int(train_idx.shape[0]), "特徴量スケーラー算出中", unit="サンプル", enable=show_progress
+    )
     for start in range(0, train_idx.shape[0], batch_size):
         batch_indices = train_idx[start : start + batch_size]
         batch = features[batch_indices].astype(np.float64)
@@ -510,6 +620,8 @@ def compute_feature_scaler_streaming(
             delta = row - mean
             mean += delta / count
             m2 += delta * (row - mean)
+        progress.update(batch.shape[0])
+    progress.close()
     if count <= 1:
         variance = np.ones_like(mean)
     else:
@@ -530,6 +642,78 @@ def slice_labels_lazy(labels: Dict[str, LazyLabels], indices: np.ndarray) -> Dic
     """遅延ラベルから指定インデックスの値をまとめて抽出する。"""
 
     return {name: lazy[indices] for name, lazy in labels.items()}
+
+
+def predict_logits_with_progress(
+    model: "torch.nn.Module",
+    features: object,
+    device: "torch.device",
+    *,
+    batch_size: int,
+    amp: str,
+    desc: str,
+) -> Dict[str, np.ndarray]:
+    """predict_logits_batched にプログレスバーを付与したラッパー。"""
+
+    if not ENABLE_PROGRESS:
+        return predict_logits_batched(model, features, device, batch_size=batch_size, amp=amp)
+
+    if isinstance(features, np.ndarray):
+        total = int(features.shape[0]) if features.ndim > 1 else 1
+    else:
+        total = int(getattr(features, "shape")[0])  # type: ignore[index]
+
+    progress = ProgressReporter(total, desc, unit="サンプル", enable=ENABLE_PROGRESS)
+    if total <= 0:
+        progress.close()
+        return predict_logits_batched(model, features, device, batch_size=batch_size, amp=amp)
+
+    if isinstance(features, np.ndarray):
+        try:
+            return predict_logits_batched(model, features, device, batch_size=batch_size, amp=amp)
+        finally:
+            progress.update(total)
+            progress.close()
+
+    total_local = total
+
+    class _ProgressiveFeatures:
+        """特徴量読み出し時に進捗を更新する薄いラッパー。"""
+
+        def __init__(self, base: object, reporter: ProgressReporter) -> None:
+            self._base = base
+            self._reporter = reporter
+            self.shape = getattr(base, "shape")
+
+        def __len__(self) -> int:
+            if hasattr(self._base, "__len__"):
+                return int(len(self._base))  # type: ignore[arg-type]
+            return total_local
+
+        def __getitem__(self, item: object) -> np.ndarray:
+            result = self._base[item]
+            amount = 0
+            if isinstance(item, slice):
+                start = 0 if item.start is None else int(item.start)
+                stop = start if item.stop is None else int(item.stop)
+                amount = max(0, stop - start)
+            elif isinstance(item, np.ndarray):
+                amount = int(item.shape[0])
+            elif isinstance(item, Sequence):
+                amount = len(item)
+            elif isinstance(result, np.ndarray):
+                amount = int(result.shape[0]) if result.ndim > 0 else 1
+            else:
+                amount = 1
+            if amount > 0:
+                self._reporter.update(amount)
+            return result
+
+    wrapped = _ProgressiveFeatures(features, progress)
+    try:
+        return predict_logits_batched(model, wrapped, device, batch_size=batch_size, amp=amp)
+    finally:
+        progress.close()
 
 
 def format_metrics(metrics: Dict[str, float]) -> str:
@@ -639,6 +823,8 @@ def train_with_torch_backend(
 
         def report_progress(batch_idx: int, total: int) -> None:
             nonlocal progress_rendered
+            if not ENABLE_PROGRESS:
+                return
             progress_rendered = True
             ratio = min(max(batch_idx / total, 0.0), 1.0)
             filled = min(bar_width, max(0, int(round(ratio * bar_width))))
@@ -685,8 +871,22 @@ def train_with_torch_backend(
         model_forward.eval()
         model.eval()
         eval_batch = min(args.max_batch, 8192)
-        train_logits = predict_logits_batched(model_forward, train_features, device, batch_size=eval_batch, amp=amp_mode)
-        val_logits = predict_logits_batched(model_forward, val_features, device, batch_size=eval_batch, amp=amp_mode)
+        train_logits = predict_logits_with_progress(
+            model_forward,
+            train_features,
+            device,
+            batch_size=eval_batch,
+            amp=amp_mode,
+            desc="訓練ロジット算出中",
+        )
+        val_logits = predict_logits_with_progress(
+            model_forward,
+            val_features,
+            device,
+            batch_size=eval_batch,
+            amp=amp_mode,
+            desc="評価ロジット算出中",
+        )
 
         train_metrics: Dict[str, Dict[str, float]] = {}
         val_metrics: Dict[str, Dict[str, float]] = {}
@@ -746,7 +946,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--export-dir", type=Path, help="学習済みモデルの保存先ディレクトリ")
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
-    parser.add_argument("--progress", action="store_true", help="JSONL インデックス構築時に進捗を表示")
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        default=True,
+        help="重い処理でプログレスバーを表示 (デフォルト ON)",
+    )
+    parser.add_argument("--no-progress", dest="progress", action="store_false", help="プログレスバーを無効化")
     parser.add_argument("--skip-bad-records", action="store_true", help="JSON デコードに失敗した行をスキップ")
     parser.add_argument(
         "--max-batch",
@@ -780,7 +986,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("エラー: --max-batch には 1 以上を指定してください", file=sys.stderr)
         return 1
 
-    global MAX_DECODE_THREADS, SKIP_BAD_RECORDS
+    global MAX_DECODE_THREADS, SKIP_BAD_RECORDS, ENABLE_PROGRESS
+    ENABLE_PROGRESS = bool(args.progress)
     SKIP_BAD_RECORDS = bool(args.skip_bad_records)
     threads = int(args.max_threads)
     if threads <= 0:
@@ -824,7 +1031,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
-    mean, std = compute_feature_scaler_streaming(features, train_idx)
+    mean, std = compute_feature_scaler_streaming(features, train_idx, show_progress=ENABLE_PROGRESS)
     train_features = LazyFeatureSubset(features, train_idx)
     val_features = LazyFeatureSubset(features, val_idx)
     train_best = slice_labels_lazy(best_labels, train_idx)
