@@ -8,12 +8,25 @@ NPZ 形式での保存 / 復元機能を一括して実装する。
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple, TYPE_CHECKING
 
 import sys
 
 import numpy as np
+
+try:  # PyTorch が未導入環境でも numpy バックエンドを維持するための遅延インポート
+    import torch
+    from torch import nn
+    from torch.nn import functional as F
+except Exception:  # pragma: no cover - PyTorch 非導入環境でのフォールバック
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # 型チェック時のみ使用
+    import torch  # noqa: F401
 
 # 各ヘッドのクラス数定義
 HEAD_SPECS: Dict[str, int] = {
@@ -33,6 +46,209 @@ HEAD_ORDER: Tuple[str, ...] = (
     "reorder",
     "interleave",
 )
+
+
+def _ensure_torch() -> "torch":
+    """PyTorch 利用前に導入状態を検証する。"""
+
+    if torch is None:
+        raise ImportError("PyTorch がインストールされていません。'pip install torch' を実行してください")
+    return torch
+
+
+def pick_device(prefer: str = "xpu") -> "torch.device":
+    """利用可能なデバイスから優先候補を選択するヘルパー。"""
+
+    torch_mod = _ensure_torch()
+    prefer_norm = (prefer or "").lower()
+    if prefer_norm == "xpu" and hasattr(torch_mod, "xpu") and torch_mod.xpu.is_available():
+        return torch_mod.device("xpu")
+    return torch_mod.device("cpu")
+
+
+def _autocast_cm(device: "torch.device", amp: str) -> object:
+    """AMP 設定に応じた自動混合精度コンテキストを返す。"""
+
+    if torch is None or amp.lower() != "bf16":
+        return nullcontext()
+    if device.type == "xpu" and hasattr(torch, "xpu"):
+        return torch.xpu.amp.autocast(dtype=torch.bfloat16)  # type: ignore[attr-defined]
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+
+class TorchMultiTask(nn.Module if nn is not None else object):
+    """PyTorch 実装のマルチタスク MLP。"""
+
+    def __init__(
+        self,
+        feature_mean: np.ndarray,
+        feature_std: np.ndarray,
+        *,
+        dropout: float = 0.1,
+    ) -> None:
+        torch_mod = _ensure_torch()
+        super().__init__()
+        if feature_mean.ndim != 1:
+            raise ValueError("feature_mean は 1 次元ベクトルである必要があります")
+        if feature_std.ndim != 1 or feature_std.shape != feature_mean.shape:
+            raise ValueError("feature_std は feature_mean と同じ形状である必要があります")
+        input_dim = int(feature_mean.shape[0])
+        if input_dim != 1536:
+            raise ValueError("入力特徴量次元が 1536 以外です")
+        self.input_dim = input_dim
+        self.hidden_dim = 384
+        self.dropout_rate = float(np.clip(dropout, 0.0, 0.9))
+        safe_std = feature_std.astype(np.float32).copy()
+        safe_std[safe_std < 1e-6] = 1.0
+        mean32 = feature_mean.astype(np.float32)
+        self.register_buffer("feature_mean", torch_mod.from_numpy(mean32))
+        self.register_buffer("feature_std", torch_mod.from_numpy(safe_std))
+        self.fc1 = nn.Linear(self.input_dim, 2048)
+        self.fc2 = nn.Linear(2048, 1536)
+        self.fc3 = nn.Linear(1536, self.hidden_dim)
+        self.dropout1 = nn.Dropout(self.dropout_rate)
+        self.dropout2 = nn.Dropout(self.dropout_rate)
+        heads: Dict[str, nn.Linear] = {}
+        for name, classes in HEAD_SPECS.items():
+            heads[name] = nn.Linear(self.hidden_dim, classes)
+        self.heads = nn.ModuleDict(heads)
+        self.inference_temperature: float = 1.0
+
+    def forward(self, x: "torch.Tensor") -> Dict[str, "torch.Tensor"]:
+        """標準化後にトランクとヘッドを順伝播する。"""
+
+        torch_mod = _ensure_torch()
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        if x.dtype not in (torch_mod.float16, torch_mod.float32, torch_mod.bfloat16):
+            x = x.to(dtype=torch_mod.float32)
+        standardized = (x - self.feature_mean) / self.feature_std
+        h = F.gelu(self.fc1(standardized))
+        h = self.dropout1(h)
+        h = F.gelu(self.fc2(h))
+        h = self.dropout2(h)
+        h = F.gelu(self.fc3(h))
+        outputs: Dict[str, torch.Tensor] = {}
+        for name in HEAD_ORDER:
+            outputs[name] = self.heads[name](h)
+        return outputs
+
+    def load_from_npz(self, npz_path: str) -> None:
+        """既存 NPZ 形式の重みを PyTorch モデルへ読み込む。"""
+
+        torch_mod = _ensure_torch()
+        with torch_mod.no_grad():
+            with np.load(npz_path) as data:
+                state = {key: data[key] for key in data.files}
+            mean = state.get("feature_mean")
+            std = state.get("feature_std")
+            if mean is None or std is None:
+                raise KeyError("NPZ に feature_mean/std が含まれていません")
+            safe_std = np.asarray(std, dtype=np.float32).copy()
+            safe_std[safe_std < 1e-6] = 1.0
+            self.feature_mean.copy_(torch_mod.from_numpy(np.asarray(mean, dtype=np.float32)))
+            self.feature_std.copy_(torch_mod.from_numpy(safe_std))
+            dropout_arr = state.get("dropout")
+            if dropout_arr is not None:
+                self.dropout_rate = float(np.asarray(dropout_arr, dtype=np.float32)[0])
+                self.dropout1.p = self.dropout_rate
+                self.dropout2.p = self.dropout_rate
+            temp_arr = state.get("inference_temperature")
+            if temp_arr is not None:
+                self.inference_temperature = float(np.asarray(temp_arr, dtype=np.float32)[0])
+            for idx, layer in enumerate((self.fc1, self.fc2, self.fc3)):
+                weight_key = f"trunk_W{idx}"
+                bias_key = f"trunk_b{idx}"
+                if weight_key not in state or bias_key not in state:
+                    raise KeyError(f"NPZ に {weight_key}/{bias_key} が見つかりません")
+                weight = np.asarray(state[weight_key], dtype=np.float32)
+                bias = np.asarray(state[bias_key], dtype=np.float32)
+                layer.weight.data.copy_(torch_mod.from_numpy(weight.T))
+                layer.bias.data.copy_(torch_mod.from_numpy(bias))
+            for name in HEAD_ORDER:
+                weight = np.asarray(state[f"head_{name}_W"], dtype=np.float32)
+                bias = np.asarray(state[f"head_{name}_b"], dtype=np.float32)
+                head = self.heads[name]
+                head.weight.data.copy_(torch_mod.from_numpy(weight.T))
+                head.bias.data.copy_(torch_mod.from_numpy(bias))
+
+    def save_torch(self, path: str) -> None:
+        """state_dict とスケーラ情報を保存する。"""
+
+        _ensure_torch()
+        payload = {
+            "state_dict": {k: v.detach().cpu() for k, v in self.state_dict().items()},
+            "mean": self.feature_mean.detach().cpu().numpy(),
+            "std": self.feature_std.detach().cpu().numpy(),
+            "dropout": self.dropout_rate,
+            "inference_temperature": self.inference_temperature,
+        }
+        torch.save(payload, path)  # type: ignore[union-attr]
+
+    @staticmethod
+    def load_torch(path: str, *, map_location: str | "torch.device" | None = None) -> "TorchMultiTask":
+        """保存済み PyTorch モデルを復元する。"""
+
+        torch_mod = _ensure_torch()
+        payload = torch_mod.load(path, map_location=map_location)
+        mean = np.asarray(payload["mean"], dtype=np.float32)
+        std = np.asarray(payload["std"], dtype=np.float32)
+        dropout = float(payload.get("dropout", 0.1))
+        model = TorchMultiTask(mean, std, dropout=dropout)
+        model.load_state_dict(payload["state_dict"])  # type: ignore[arg-type]
+        model.inference_temperature = float(payload.get("inference_temperature", 1.0))
+        return model
+
+
+def predict_logits_batched(
+    model: TorchMultiTask,
+    features: np.ndarray,
+    device: "torch.device",
+    *,
+    batch_size: int = 8192,
+    amp: str = "bf16",
+) -> Dict[str, np.ndarray]:
+    """PyTorch モデルでバッチ推論を行い NumPy 配列を返す。"""
+
+    torch_mod = _ensure_torch()
+    if batch_size <= 0:
+        raise ValueError("batch_size は正の整数である必要があります")
+    if isinstance(features, np.ndarray):
+        arr = np.asarray(features, dtype=np.float32)
+        squeeze = arr.ndim == 1
+        if squeeze:
+            arr = arr[None, :]
+        total = arr.shape[0]
+        fetch = lambda start, end: arr[start:end]
+    else:
+        squeeze = False
+        total = int(getattr(features, "shape")[0])  # type: ignore[index]
+        fetch = lambda start, end: np.asarray(features[start:end], dtype=np.float32)  # type: ignore[index]
+    if total == 0:
+        return {
+            name: np.empty((0, HEAD_SPECS[name]), dtype=np.float32) if not squeeze else np.empty((HEAD_SPECS[name],), dtype=np.float32)
+            for name in HEAD_ORDER
+        }
+    outputs: Dict[str, np.ndarray] = {
+        name: np.empty((total, HEAD_SPECS[name]), dtype=np.float32)
+        for name in HEAD_ORDER
+    }
+    was_training = model.training  # type: ignore[attr-defined]
+    model.eval()
+    with torch_mod.no_grad():
+        for start in range(0, total, batch_size):
+            end = min(total, start + batch_size)
+            batch_np = fetch(start, end)
+            xb = torch_mod.from_numpy(batch_np).to(device=device, dtype=torch_mod.float32)
+            with _autocast_cm(device, amp):
+                logits = model(xb)
+            for name in HEAD_ORDER:
+                outputs[name][start:end] = logits[name].detach().cpu().numpy()
+    if was_training:
+        model.train()
+    if squeeze:
+        return {name: outputs[name][0] for name in HEAD_ORDER}
+    return outputs
 
 
 @dataclass

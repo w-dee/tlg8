@@ -7,7 +7,13 @@ from typing import Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from multitask_model import build_filter_candidates, log_softmax, MultiTaskModel
+from multitask_model import (
+    MultiTaskModel,
+    TorchMultiTask,
+    build_filter_candidates,
+    log_softmax,
+    predict_logits_batched,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -292,3 +298,61 @@ def select_block_config(
         raise RuntimeError("最大試行回数を超過しました")
     LOGGER.info("実際に評価した組合せ=%d", eval_count)
     return best_config, best_bits
+
+
+def select_block_config_batched(
+    features_batch: np.ndarray,
+    model: TorchMultiTask,
+    *,
+    device,
+    batch_size: int = 8192,
+    amp: str = "bf16",
+    margin_reorder: float = 0.5,
+    margin_interleave: float = 0.5,
+    margin_filter_perm: float = 0.4,
+    margin_predictor: float = 0.4,
+    max_trials: int = 16,
+    temperature: float | None = None,
+    try_encode_block: Callable[[Dict[str, int]], int] | None = None,
+):
+    """複数ブロックの特徴量をまとめてビームサーチ推論する。"""
+
+    if features_batch.ndim == 1:
+        features_batch = features_batch[None, :]
+    logits_batch = predict_logits_batched(
+        model,
+        features_batch,
+        device,
+        batch_size=batch_size,
+        amp=amp,
+    )
+    sample_count = next(iter(logits_batch.values())).shape[0]
+    results: List[object] = []
+    for idx in range(sample_count):
+        single_logits = {name: arr[idx : idx + 1] for name, arr in logits_batch.items()}
+        candidates = _enumerate_candidates(
+            single_logits,
+            max_trials,
+            margin_reorder,
+            margin_interleave,
+            margin_filter_perm,
+            margin_predictor,
+            temperature if temperature is not None else model.inference_temperature,
+        )
+        if try_encode_block is None:
+            results.append(candidates)
+            continue
+        best_config = None
+        best_bits = None
+        eval_count = 0
+        for config, _score in candidates:
+            bits = int(try_encode_block(config))
+            eval_count += 1
+            if best_bits is None or bits < best_bits:
+                best_bits = bits
+                best_config = config
+        if eval_count > max_trials:
+            raise RuntimeError("最大試行回数を超過しました")
+        LOGGER.info("実際に評価した組合せ=%d", eval_count)
+        results.append((best_config, best_bits))
+    return results

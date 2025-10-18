@@ -6,6 +6,9 @@
 ## 前提条件
 - Python 3.9 以上
 - `numpy`・`tqdm` など既存スクリプトが依存するライブラリ（`requirements.txt` が無い場合は `pip install numpy tqdm` 程度で十分）
+- PyTorch + Intel GPU (XPU) 対応: `pip install torch torchvision torchaudio`（環境に合うホイールを選択）、`pip install intel-extension-for-pytorch`
+- オプション: CPU フォールバックを高速化する `pip install oneccl_bind_pt`
+- デバイス確認: `python -c "import torch; print(torch.xpu.is_available())"`
 - `tlgconv` バイナリ（`mkdir -p build && cmake --build build` で生成）
 - 学習データ JSONL: 既存の学習ダンプ機構で得られる `pixels`・`best*`・`second*` を含む形式
 
@@ -32,9 +35,13 @@ done
 - `--lr`: 学習率。既定 `1e-3`。
 - `--batch-size`: 既定 512。メモリに余裕があれば増やす。
 - `--dropout`: トランク層のドロップアウト率。
-- `--hidden-dims`: 共有トランクの層構成。
+- `--backend`: 既定は `torch`。旧 NumPy 実装に切り替える場合は `--backend numpy`。
+- `--device`: PyTorch バックエンドでの優先デバイス。`xpu` が利用可能なら bfloat16 AMP を既定で有効化。
+- `--amp`: `bf16` と `none` を選択可能。CPU で bfloat16 非対応なら `--amp none`。
+- `--compile`: `torch.compile` を試すトグル。失敗時は警告ログのみ。
+- `--hidden-dims`: NumPy バックエンド用の共有トランク層構成。PyTorch 側は 1536→2048→1536→384 に固定。
 - `--epsilon-soft`: best/second のソフトターゲット比重（既定 0.2）。
-- `--export-dir`: ベストモデルを書き出すディレクトリ。
+- `--export-dir`: PyTorch バックエンドは `multitask_best.pt`（`state_dict` と標準化統計）を、NumPy は従来通り `multitask_model.npz` を保存。
 
 バッチサイズ調整の指針:
 
@@ -47,17 +54,28 @@ done
 
 ```bash
 python3 train_multitask.py data/tlg8_multitask.jsonl \
+    --backend torch \
+    --device xpu \
     --epochs 240 \
     --lr 5e-4 \
     --batch-size 1024 \
     --dropout 0.1 \
-    --hidden-dims 1536 768 384 \
     --weight-decay 3e-4 \
     --test-ratio 0.2 \
     --export-dir out/multitask
 ```
 
-JSONL 読み込み時は 1,000 行ごとに `読み込み中: xxxx エントリ処理済み...` が標準エラーへ表示され、巨大ファイルでも進捗が把握しやすい。実行中はエポック毎に各ヘッド（predictor/filter_perm/filter_primary/filter_secondary/reorder/interleave）の `top1`・`top2`・`top3`・`three_choice` が表示され、マクロ平均（全ヘッド平均）も併せて出力される。`--export-dir` を指定すると検証 `top3` マクロ平均が最良の時点で `multitask_best.npz` が保存される。
+CPU のみで従来の NumPy 実装を使う場合:
+
+```bash
+python3 train_multitask.py data/tlg8_multitask.jsonl \
+    --backend numpy \
+    --hidden-dims 1536 768 384 \
+    --epochs 200 \
+    --export-dir out/multitask_npz
+```
+
+JSONL 読み込み時は 1,000 行ごとに `読み込み中: xxxx エントリ処理済み...` が標準エラーへ表示され、巨大ファイルでも進捗が把握しやすい。実行中はエポック毎に各ヘッド（predictor/filter_perm/filter_primary/filter_secondary/reorder/interleave）の `top1`・`top2`・`top3`・`three_choice` が表示され、マクロ平均（全ヘッド平均）も併せて出力される。`--export-dir` を指定すると検証 `top3` マクロ平均が最良の時点で PyTorch バックエンドは `multitask_best.pt`、NumPy バックエンドは `multitask_model.npz` を保存する。
 
 ## 学習状態の評価指標
 - **top3**: ゴールドの best が上位 3 位以内に入った割合。現行の早期終了はこのマクロ平均を最優先で監視する。0.97 付近を目標に改善を図る。

@@ -9,16 +9,36 @@ import json
 import logging
 import math
 import os
+import random
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from multitask_model import HEAD_ORDER, MultiTaskModel, TrainConfig, train_multitask_model
+try:  # PyTorch を利用する場合にのみ必要
+    import torch
+    from torch.nn import functional as torch_F
+except Exception:  # pragma: no cover - PyTorch 非導入環境
+    torch = None  # type: ignore[assignment]
+    torch_F = None  # type: ignore[assignment]
+
+from multitask_model import (
+    HEAD_ORDER,
+    HEAD_SPECS,
+    MultiTaskModel,
+    TorchMultiTask,
+    TrainConfig,
+    build_soft_targets,
+    compute_metrics,
+    pick_device,
+    predict_logits_batched,
+    train_multitask_model,
+)
 
 MAX_COMPONENTS = 4
 BLOCK_EDGE = 8
@@ -534,16 +554,192 @@ def macro_average(metrics: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     return result
 
 
+def _amp_context(device: "torch.device", amp_mode: str):
+    """AMP 設定に応じて適切なコンテキストを返す。"""
+
+    if torch is None or amp_mode.lower() != "bf16":
+        return nullcontext()
+    if device.type == "xpu" and hasattr(torch, "xpu"):
+        return torch.xpu.amp.autocast(dtype=torch.bfloat16)  # type: ignore[attr-defined]
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+
+def train_with_torch_backend(
+    args: argparse.Namespace,
+    train_features: "LazyFeatureSubset",
+    train_best: Dict[str, np.ndarray],
+    train_second: Dict[str, np.ndarray],
+    val_features: "LazyFeatureSubset",
+    val_best: Dict[str, np.ndarray],
+    val_second: Dict[str, np.ndarray],
+    mean: np.ndarray,
+    std: np.ndarray,
+) -> Tuple[TorchMultiTask, Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    """PyTorch バックエンドでマルチタスクモデルを学習する。"""
+
+    if torch is None or torch_F is None:
+        raise ImportError("PyTorch が利用できません。'pip install torch torchvision torchaudio intel-extension-for-pytorch' を確認してください")
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    if hasattr(torch, "xpu"):
+        try:
+            torch.xpu.manual_seed(args.seed)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    device = pick_device(args.device)
+    amp_mode = args.amp.lower()
+    if amp_mode == "bf16" and device.type == "cpu":
+        if not hasattr(torch, "cpu") or not getattr(torch.cpu, "is_bf16_supported", lambda: False)():  # type: ignore[attr-defined]
+            logging.warning("CPU が bfloat16 をサポートしていないため AMP を無効化します")
+            amp_mode = "none"
+
+    model = TorchMultiTask(mean, std, dropout=args.dropout)
+    model.inference_temperature = max(float(args.temperature), 1e-6)
+    model.to(device)
+
+    model_forward = model
+    if args.compile:
+        if hasattr(torch, "compile"):
+            try:
+                model_forward = torch.compile(model)  # type: ignore[assignment]
+            except Exception as exc:
+                logging.warning("torch.compile に失敗したため未コンパイルで継続します: %s", exc)
+                model_forward = model
+        else:
+            logging.warning("この PyTorch では torch.compile が利用できないため通常モードで実行します")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    train_targets: Dict[str, np.ndarray] = {}
+    for name in HEAD_ORDER:
+        train_targets[name] = build_soft_targets(
+            train_best[name],
+            train_second[name],
+            HEAD_SPECS[name],
+            args.epsilon_soft,
+        ).astype(np.float32)
+
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    best_train_metrics: Dict[str, Dict[str, float]] = {}
+    best_val_metrics: Dict[str, Dict[str, float]] = {}
+    best_metric = -np.inf
+    patience_counter = 0
+    train_count = len(train_features)
+    rng = np.random.default_rng(args.seed)
+    total_batches = max(1, (train_count + args.batch_size - 1) // args.batch_size)
+    digits = len(str(total_batches))
+    bar_width = 30
+
+    for epoch in range(args.epochs):
+        indices = rng.permutation(train_count)
+        progress_rendered = False
+
+        def report_progress(batch_idx: int, total: int) -> None:
+            nonlocal progress_rendered
+            progress_rendered = True
+            ratio = min(max(batch_idx / total, 0.0), 1.0)
+            filled = min(bar_width, max(0, int(round(ratio * bar_width))))
+            bar = "#" * filled + "-" * (bar_width - filled)
+            sys.stdout.write(
+                f"\rエポック {epoch + 1:03d} {batch_idx:>{digits}}/{total} [{bar}] {ratio * 100:6.2f}%"
+            )
+            sys.stdout.flush()
+
+        model.train()
+        model_forward.train()
+        epoch_loss = 0.0
+        sample_seen = 0
+        for batch_no, start in enumerate(range(0, train_count, args.batch_size), start=1):
+            end = min(train_count, start + args.batch_size)
+            batch_idx = indices[start:end]
+            features_np = np.asarray(train_features[batch_idx], dtype=np.float32)
+            xb = torch.from_numpy(features_np).to(device=device, dtype=torch.float32)
+            target_tensors: Dict[str, torch.Tensor] = {}
+            for name in HEAD_ORDER:
+                probs = train_targets[name][batch_idx]
+                target_tensors[name] = torch.from_numpy(probs).to(device=device, dtype=torch.float32)
+            optimizer.zero_grad(set_to_none=True)
+            with _amp_context(device, amp_mode):
+                logits = model_forward(xb)
+                loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
+                for name in HEAD_ORDER:
+                    log_probs = torch_F.log_softmax(logits[name], dim=1)
+                    loss_tensor = loss_tensor + torch_F.kl_div(
+                        log_probs, target_tensors[name], reduction="batchmean"
+                    )
+            loss_tensor.backward()
+            optimizer.step()
+            batch_size_actual = batch_idx.shape[0]
+            epoch_loss += float(loss_tensor.detach().cpu()) * batch_size_actual
+            sample_seen += batch_size_actual
+            report_progress(batch_no, total_batches)
+
+        if progress_rendered:
+            sys.stdout.write("\n")
+
+        mean_loss = epoch_loss / max(1, sample_seen)
+
+        model_forward.eval()
+        model.eval()
+        eval_batch = min(args.max_batch, 8192)
+        train_logits = predict_logits_batched(model_forward, train_features, device, batch_size=eval_batch, amp=amp_mode)
+        val_logits = predict_logits_batched(model_forward, val_features, device, batch_size=eval_batch, amp=amp_mode)
+
+        train_metrics: Dict[str, Dict[str, float]] = {}
+        val_metrics: Dict[str, Dict[str, float]] = {}
+        for name in HEAD_ORDER:
+            train_metrics[name] = compute_metrics(train_logits[name], train_best[name], train_second[name])
+            val_metrics[name] = compute_metrics(val_logits[name], val_best[name], val_second[name])
+
+        mean_top3 = float(np.mean([val_metrics[name]["top3"] for name in HEAD_ORDER]))
+        mean_three_choice = float(np.mean([val_metrics[name]["three_choice"] for name in HEAD_ORDER]))
+        mean_top1 = float(np.mean([val_metrics[name]["top1"] for name in HEAD_ORDER]))
+        mean_top2 = float(np.mean([val_metrics[name]["top2"] for name in HEAD_ORDER]))
+        print(
+            "epoch {epoch:03d}: loss={loss:.4f} val_top3={top3:.2f}% val_three={three:.2f}% val_top1={top1:.2f}% val_top2={top2:.2f}%".format(
+                epoch=epoch + 1,
+                loss=mean_loss,
+                top3=mean_top3 * 100.0,
+                three=mean_three_choice * 100.0,
+                top1=mean_top1 * 100.0,
+                top2=mean_top2 * 100.0,
+            )
+        )
+
+        if mean_top3 > best_metric + 1e-6:
+            best_metric = mean_top3
+            best_state = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
+            best_train_metrics = train_metrics
+            best_val_metrics = val_metrics
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print("早期終了: 改善が見られませんでした")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        if model_forward is not model:
+            model_forward.load_state_dict(best_state)
+
+    return model, best_train_metrics, best_val_metrics
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TLG8 マルチタスク分類モデル学習ツール")
     parser.add_argument("inputs", nargs="+", help="JSONL 形式の学習データまたはディレクトリ")
+    parser.add_argument("--backend", choices=["numpy", "torch"], default="torch", help="学習バックエンド")
     parser.add_argument("--epochs", type=int, default=200, help="学習エポック数")
     parser.add_argument("--lr", type=float, default=1e-3, help="学習率")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="L2 正則化係数")
     parser.add_argument("--batch-size", type=int, default=512, help="ミニバッチサイズ")
     parser.add_argument("--seed", type=int, default=42, help="乱数シード")
     parser.add_argument("--dropout", type=float, default=0.1, help="ドロップアウト率")
-    parser.add_argument("--hidden-dims", type=int, nargs="*", default=[1024, 512, 256], help="隠れ層ユニット数")
+    parser.add_argument("--hidden-dims", type=int, nargs="*", default=[1024, 512, 256], help="(NumPy バックエンド用) 隠れ層ユニット数")
     parser.add_argument("--epsilon-soft", type=float, default=0.2, help="第 2 候補に割り当てる確率質量")
     parser.add_argument("--test-ratio", type=float, default=0.2, help="評価データ比率")
     parser.add_argument("--patience", type=int, default=20, help="早期終了の待機エポック数")
@@ -564,9 +760,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=0,
         help="遅延デコードに利用する最大スレッド数 (0 で自動設定)",
     )
+    parser.add_argument("--device", choices=["xpu", "cpu"], default="xpu", help="PyTorch バックエンド用デバイス優先度")
+    parser.add_argument(
+        "--amp",
+        choices=["bf16", "none"],
+        default=None,
+        help="PyTorch バックエンドで利用する自動混合精度",
+    )
+    parser.add_argument("--compile", action="store_true", help="torch.compile を試行する")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    backend = args.backend.lower()
+    if args.amp is None:
+        args.amp = "bf16" if backend == "torch" and args.device == "xpu" else "none"
 
     if args.max_batch <= 0:
         print("エラー: --max-batch には 1 以上を指定してください", file=sys.stderr)
@@ -624,61 +832,104 @@ def main(argv: Sequence[str] | None = None) -> int:
     val_best = slice_labels_lazy(best_labels, val_idx)
     val_second = slice_labels_lazy(second_labels, val_idx)
 
-    effective_batch = min(int(args.batch_size), int(args.max_batch))
+    args.batch_size = min(int(args.batch_size), int(args.max_batch))
 
-    config = TrainConfig(
-        epochs=args.epochs,
-        batch_size=effective_batch,
-        learning_rate=args.lr,
-        weight_decay=args.weight_decay,
-        dropout=args.dropout,
-        epsilon_soft=args.epsilon_soft,
-        patience=args.patience,
-        seed=args.seed,
-    )
-
-    model = MultiTaskModel(features.shape[1], args.hidden_dims, args.dropout, mean, std)
-    model.inference_temperature = max(float(args.temperature), 1e-6)
-    model, train_metrics, val_metrics = train_multitask_model(
-        model,
-        train_features,
-        train_best,
-        train_second,
-        val_features,
-        val_best,
-        val_second,
-        config,
-    )
-
-    print("\n=== 訓練データ精度 ===")
-    for name in HEAD_ORDER:
-        print(
-            f"{name:16s}: {format_metrics(train_metrics.get(name, {}))}"
-        )
-    train_macro = macro_average(train_metrics)
-    if train_macro:
-        print(
-            f"{'macro':16s}: top1={train_macro['top1']*100:.2f}% "
-            f"top2={train_macro['top2']*100:.2f}% top3={train_macro['top3']*100:.2f}% "
-            f"three={train_macro['three_choice']*100:.2f}%"
+    if backend == "numpy":
+        config = TrainConfig(
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            weight_decay=args.weight_decay,
+            dropout=args.dropout,
+            epsilon_soft=args.epsilon_soft,
+            patience=args.patience,
+            seed=args.seed,
         )
 
-    print("\n=== 評価データ精度 ===")
-    for name in HEAD_ORDER:
-        print(f"{name:16s}: {format_metrics(val_metrics.get(name, {}))}")
-    val_macro = macro_average(val_metrics)
-    if val_macro:
-        print(
-            f"{'macro':16s}: top1={val_macro['top1']*100:.2f}% "
-            f"top2={val_macro['top2']*100:.2f}% top3={val_macro['top3']*100:.2f}% "
-            f"three={val_macro['three_choice']*100:.2f}%"
+        model = MultiTaskModel(features.shape[1], args.hidden_dims, args.dropout, mean, std)
+        model.inference_temperature = max(float(args.temperature), 1e-6)
+        model, train_metrics, val_metrics = train_multitask_model(
+            model,
+            train_features,
+            train_best,
+            train_second,
+            val_features,
+            val_best,
+            val_second,
+            config,
         )
 
-    if args.export_dir:
-        args.export_dir.mkdir(parents=True, exist_ok=True)
-        out_path = args.export_dir / "multitask_model.npz"
-        model.save(str(out_path))
-        print(f"\nモデルを {out_path} に保存しました。")
+        print("\n=== 訓練データ精度 ===")
+        for name in HEAD_ORDER:
+            print(f"{name:16s}: {format_metrics(train_metrics.get(name, {}))}")
+        train_macro = macro_average(train_metrics)
+        if train_macro:
+            print(
+                f"{'macro':16s}: top1={train_macro['top1']*100:.2f}% "
+                f"top2={train_macro['top2']*100:.2f}% top3={train_macro['top3']*100:.2f}% "
+                f"three={train_macro['three_choice']*100:.2f}%"
+            )
+
+        print("\n=== 評価データ精度 ===")
+        for name in HEAD_ORDER:
+            print(f"{name:16s}: {format_metrics(val_metrics.get(name, {}))}")
+        val_macro = macro_average(val_metrics)
+        if val_macro:
+            print(
+                f"{'macro':16s}: top1={val_macro['top1']*100:.2f}% "
+                f"top2={val_macro['top2']*100:.2f}% top3={val_macro['top3']*100:.2f}% "
+                f"three={val_macro['three_choice']*100:.2f}%"
+            )
+
+        if args.export_dir:
+            args.export_dir.mkdir(parents=True, exist_ok=True)
+            out_path = args.export_dir / "multitask_model.npz"
+            model.save(str(out_path))
+            print(f"\nモデルを {out_path} に保存しました。")
+    else:
+        try:
+            torch_model, train_metrics, val_metrics = train_with_torch_backend(
+                args,
+                train_features,
+                train_best,
+                train_second,
+                val_features,
+                val_best,
+                val_second,
+                mean,
+                std,
+            )
+        except ImportError as exc:
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 1
+
+        print("\n=== 訓練データ精度 ===")
+        for name in HEAD_ORDER:
+            print(f"{name:16s}: {format_metrics(train_metrics.get(name, {}))}")
+        train_macro = macro_average(train_metrics)
+        if train_macro:
+            print(
+                f"{'macro':16s}: top1={train_macro['top1']*100:.2f}% "
+                f"top2={train_macro['top2']*100:.2f}% top3={train_macro['top3']*100:.2f}% "
+                f"three={train_macro['three_choice']*100:.2f}%"
+            )
+
+        print("\n=== 評価データ精度 ===")
+        for name in HEAD_ORDER:
+            print(f"{name:16s}: {format_metrics(val_metrics.get(name, {}))}")
+        val_macro = macro_average(val_metrics)
+        if val_macro:
+            print(
+                f"{'macro':16s}: top1={val_macro['top1']*100:.2f}% "
+                f"top2={val_macro['top2']*100:.2f}% top3={val_macro['top3']*100:.2f}% "
+                f"three={val_macro['three_choice']*100:.2f}%"
+            )
+
+        if args.export_dir:
+            args.export_dir.mkdir(parents=True, exist_ok=True)
+            out_path = args.export_dir / "multitask_best.pt"
+            torch_model.save_torch(str(out_path))
+            print(f"\nPyTorch モデルを {out_path} に保存しました。")
 
     return 0
 
