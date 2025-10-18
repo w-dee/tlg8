@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -61,124 +63,268 @@ def _split_filter_code(code: int) -> Tuple[int, int, int]:
     return perm, primary, secondary
 
 
-def load_dataset(paths: Sequence[Path]) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-    """JSONL 形式の学習データを読み込み、特徴量と各ラベルを返す。"""
+@dataclass
+class FileRef:
+    """JSONL ファイルへの参照情報。"""
 
-    features: List[np.ndarray] = []
-    best_labels: Dict[str, List[int]] = {name: [] for name in HEAD_ORDER}
-    second_labels: Dict[str, List[int]] = {name: [] for name in HEAD_ORDER}
+    path: Path
+    size: int
 
-    total_lines = 0
-    loaded = 0
-    report_interval = 100000
 
+@dataclass
+class LinePtr:
+    """各レコードのファイル ID とバイトオフセット。"""
+
+    file_id: int
+    offset: int
+
+
+def build_jsonl_index(paths: Sequence[Path]) -> Tuple[List[FileRef], np.ndarray]:
+    """JSONL 群からレコード位置のインデックスを構築する。"""
+
+    files: List[FileRef] = []
+    pointers: List[LinePtr] = []
     for path in paths:
         try:
-            with path.open("r", encoding="utf-8") as fp:
-                for line_no, line in enumerate(fp, 1):
-                    total_lines += 1
-                    record = line.strip()
-                    if not record:
-                        continue
-                    try:
-                        data = json.loads(record)
-                    except json.JSONDecodeError as exc:
-                        print(f"警告: {path}:{line_no} の JSON 解釈に失敗しました: {exc}", file=sys.stderr)
-                        continue
-                    try:
-                        pixels = data["pixels"]
-                        block_w, block_h = data["block_size"]
-                        components = data["components"]
-                        best = data["best"]
-                        second = data.get("second", {})
-                    except (KeyError, TypeError, ValueError) as exc:
-                        print(f"警告: {path}:{line_no} のレコード形式が不正です: {exc}", file=sys.stderr)
-                        continue
-
-                    if not isinstance(pixels, list):
-                        print(f"警告: {path}:{line_no} の pixels が配列ではありません", file=sys.stderr)
-                        continue
-
-                    expected_len = block_w * block_h * components
-                    if len(pixels) != expected_len:
-                        print(
-                            f"警告: {path}:{line_no} の画素数が想定({expected_len})と異なります",
-                            file=sys.stderr,
-                        )
-                        continue
-
-                    padded = np.zeros((MAX_COMPONENTS, MAX_BLOCK_PIXELS), dtype=np.float32)
-                    offset = 0
-                    for by in range(block_h):
-                        for bx in range(block_w):
-                            dest = by * BLOCK_EDGE + bx
-                            for comp in range(components):
-                                padded[comp, dest] = pixels[offset] / 255.0
-                                offset += 1
-                    extra = np.array([block_w / 8.0, block_h / 8.0, components / 4.0], dtype=np.float32)
-                    feature = np.concatenate([padded.reshape(-1), extra])
-                    features.append(feature)
-
-                    best_labels["predictor"].append(int(best.get("predictor", 0)))
-                    best_filter = int(best.get("filter", 0))
-                    perm, primary, secondary = _split_filter_code(best_filter)
-                    best_labels["filter_perm"].append(perm)
-                    best_labels["filter_primary"].append(primary)
-                    best_labels["filter_secondary"].append(secondary)
-                    best_labels["reorder"].append(int(best.get("reorder", 0)))
-                    best_labels["interleave"].append(int(best.get("interleave", 0)))
-
-                    def second_value(key: str) -> int:
-                        value = second.get(key, -1)
-                        try:
-                            return int(value)
-                        except (TypeError, ValueError):
-                            return -1
-
-                    sec_pred = second_value("predictor")
-                    sec_filter = second_value("filter")
-                    s_perm, s_primary, s_secondary = _split_filter_code(sec_filter)
-                    second_labels["predictor"].append(sec_pred)
-                    second_labels["filter_perm"].append(s_perm)
-                    second_labels["filter_primary"].append(s_primary)
-                    second_labels["filter_secondary"].append(s_secondary)
-                    second_labels["reorder"].append(second_value("reorder"))
-                    second_labels["interleave"].append(second_value("interleave"))
-
-                    loaded += 1
-                    if loaded % report_interval == 0:
-                        print(
-                            f"読み込み中: {loaded} エントリ処理済み...",
-                            file=sys.stderr,
-                        )
+            with path.open("rb") as fp:
+                files.append(FileRef(path=path, size=path.stat().st_size))
+                file_id = len(files) - 1
+                offset = fp.tell()
+                while True:
+                    line = fp.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        pointers.append(LinePtr(file_id=file_id, offset=offset))
+                    offset = fp.tell()
         except OSError as exc:
             print(f"警告: {path} を読み込めません: {exc}", file=sys.stderr)
-
-    if not features:
+    if not pointers:
         raise RuntimeError("学習データが読み込めませんでした")
-
-    feature_array = np.stack(features, axis=0)
-    best_array = {name: np.asarray(values, dtype=np.int32) for name, values in best_labels.items()}
-    second_array = {name: np.asarray(values, dtype=np.int32) for name, values in second_labels.items()}
-
-    print(f"読み込み完了: {loaded} エントリ / {total_lines} 行", file=sys.stderr)
-    return feature_array, best_array, second_array
+    index = np.asarray([(ptr.file_id, ptr.offset) for ptr in pointers], dtype=np.int64)
+    return files, index
 
 
-def compute_feature_scaler(features: np.ndarray, train_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """訓練データから平均・標準偏差を算出する。"""
+class JsonlReader:
+    """ファイル・オフセット指定で JSON レコードを読み取る補助クラス。"""
 
-    subset = features[train_idx]
-    mean = subset.mean(axis=0)
-    std = subset.std(axis=0)
+    def __init__(self, files: List[FileRef]) -> None:
+        self._files = files
+        self._handles: Dict[int, io.BufferedReader] = {}
+
+    def _handle(self, file_id: int) -> io.BufferedReader:
+        handle = self._handles.get(file_id)
+        if handle is None or handle.closed:
+            path = self._files[file_id].path
+            handle = open(path, "rb", buffering=1024 * 1024)
+            self._handles[file_id] = handle
+        return handle
+
+    def read(self, file_id: int, offset: int) -> Dict[str, object]:
+        """指定位置の JSON レコードを辞書として返す。"""
+
+        handle = self._handle(file_id)
+        handle.seek(offset)
+        line = handle.readline()
+        return json.loads(line.decode("utf-8").strip())
+
+
+def record_to_feature(record: Dict[str, object]) -> np.ndarray:
+    """単一レコードから特徴量ベクトルを構築する。"""
+
+    try:
+        pixels = record["pixels"]  # type: ignore[index]
+        block_w, block_h = record["block_size"]  # type: ignore[index]
+        components = record["components"]  # type: ignore[index]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"レコードの必須フィールドが不足しています: {exc}") from exc
+
+    if not isinstance(pixels, list):
+        raise ValueError("pixels フィールドが配列ではありません")
+    block_w = int(block_w)
+    block_h = int(block_h)
+    components = int(components)
+    expected_len = block_w * block_h * components
+    if len(pixels) != expected_len:
+        raise ValueError("pixels の長さがブロック構成と一致しません")
+
+    padded = np.zeros((MAX_COMPONENTS, MAX_BLOCK_PIXELS), dtype=np.float32)
+    offset = 0
+    for by in range(block_h):
+        for bx in range(block_w):
+            dest = by * BLOCK_EDGE + bx
+            for comp in range(components):
+                padded[comp, dest] = float(pixels[offset]) / 255.0
+                offset += 1
+    extra = np.array([block_w / 8.0, block_h / 8.0, components / 4.0], dtype=np.float32)
+    feature = np.concatenate([padded.reshape(-1), extra])
+    return feature
+
+
+def _normalize_indices(idx: object, length: int) -> Tuple[np.ndarray, bool]:
+    """インデックス指定を正規化し、スカラー指定かどうかを返す。"""
+
+    if isinstance(idx, (int, np.integer)):
+        return np.asarray([int(idx)], dtype=np.int64), True
+    if isinstance(idx, slice):
+        rng = range(*idx.indices(length))
+        return np.fromiter(rng, dtype=np.int64), False
+    if isinstance(idx, (list, tuple)):
+        arr = np.asarray(idx, dtype=np.int64)
+        return arr, False
+    if isinstance(idx, np.ndarray):
+        if idx.ndim != 1:
+            raise TypeError("1 次元の整数インデックスのみ対応しています")
+        return idx.astype(np.int64, copy=False), False
+    raise TypeError("対応していないインデックス指定です")
+
+
+class LazyFeatures:
+    """JSONL からオンデマンドで特徴量を読み出す遅延配列。"""
+
+    def __init__(self, reader: JsonlReader, index: np.ndarray, feature_dim: int) -> None:
+        self._reader = reader
+        self._index = index
+        self._shape = (index.shape[0], feature_dim)
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self._shape
+
+    def __len__(self) -> int:
+        return self._shape[0]
+
+    def __getitem__(self, idx: object) -> np.ndarray:
+        rows, scalar = _normalize_indices(idx, len(self))
+        batch = np.empty((rows.shape[0], self._shape[1]), dtype=np.float32)
+        for out_idx, rec_idx in enumerate(rows):
+            file_id, offset = self._index[int(rec_idx)]
+            record = self._reader.read(int(file_id), int(offset))
+            batch[out_idx] = record_to_feature(record)
+        if scalar:
+            return batch[0]
+        return batch
+
+
+class LazyLabels:
+    """JSONL からオンデマンドでラベルを読み出す遅延ベクトル。"""
+
+    def __init__(self, reader: JsonlReader, index: np.ndarray, head: str, *, use_second: bool = False) -> None:
+        self._reader = reader
+        self._index = index
+        self._head = head
+        self._use_second = use_second
+
+    def __len__(self) -> int:
+        return self._index.shape[0]
+
+    def _resolve_value(self, record: Dict[str, object]) -> int:
+        key = "second" if self._use_second else "best"
+        entry = record.get(key, {})  # type: ignore[assignment]
+        if not isinstance(entry, dict):
+            entry = {}
+        default_scalar = -1 if self._use_second else 0
+        default_filter = -1 if self._use_second else 0
+        if self._head == "predictor":
+            return int(entry.get("predictor", default_scalar))
+        if self._head == "reorder":
+            return int(entry.get("reorder", default_scalar))
+        if self._head == "interleave":
+            return int(entry.get("interleave", default_scalar))
+        if self._head in ("filter_perm", "filter_primary", "filter_secondary"):
+            code = int(entry.get("filter", default_filter))
+            perm, primary, secondary = _split_filter_code(code)
+            mapping = {
+                "filter_perm": perm,
+                "filter_primary": primary,
+                "filter_secondary": secondary,
+            }
+            return mapping[self._head]
+        raise KeyError(f"未知のヘッド名です: {self._head}")
+
+    def __getitem__(self, idx: object) -> np.ndarray:
+        rows, scalar = _normalize_indices(idx, len(self))
+        out = np.empty((rows.shape[0],), dtype=np.int32)
+        for out_idx, rec_idx in enumerate(rows):
+            file_id, offset = self._index[int(rec_idx)]
+            record = self._reader.read(int(file_id), int(offset))
+            out[out_idx] = self._resolve_value(record)
+        if scalar:
+            return out[0]
+        return out
+
+
+class LazyFeatureSubset:
+    """LazyFeatures の部分集合ビュー。"""
+
+    def __init__(self, base: LazyFeatures, indices: np.ndarray) -> None:
+        self._base = base
+        self._indices = np.asarray(indices, dtype=np.int64)
+        self._shape = (self._indices.shape[0], base.shape[1])
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self._shape
+
+    def __len__(self) -> int:
+        return self._indices.shape[0]
+
+    def __getitem__(self, idx: object) -> np.ndarray:
+        if isinstance(idx, (int, np.integer)):
+            base_idx = self._indices[int(idx)]
+            return self._base[int(base_idx)]
+        rows, scalar = _normalize_indices(idx, len(self))
+        base_rows = self._indices[rows]
+        batch = self._base[base_rows]
+        if scalar:
+            if isinstance(batch, np.ndarray) and batch.ndim == 2 and batch.shape[0] == 1:
+                return batch[0]
+        return batch
+
+
+def open_indexed_dataset(paths: Sequence[Path]) -> Tuple[LazyFeatures, Dict[str, LazyLabels], Dict[str, LazyLabels], int]:
+    """JSONL データセットをインデックス化し、遅延ビューを返す。"""
+
+    files, index = build_jsonl_index(paths)
+    reader = JsonlReader(files)
+    sample = reader.read(int(index[0, 0]), int(index[0, 1]))
+    feature_dim = record_to_feature(sample).shape[0]
+    features = LazyFeatures(reader, index, feature_dim)
+    best_labels = {name: LazyLabels(reader, index, name, use_second=False) for name in HEAD_ORDER}
+    second_labels = {name: LazyLabels(reader, index, name, use_second=True) for name in HEAD_ORDER}
+    return features, best_labels, second_labels, index.shape[0]
+
+
+def compute_feature_scaler_streaming(
+    features: LazyFeatures, train_idx: np.ndarray, batch_size: int = 4096
+) -> Tuple[np.ndarray, np.ndarray]:
+    """訓練データの遅延読み出しで平均・標準偏差を算出する。"""
+
+    feat_dim = features.shape[1]
+    mean = np.zeros((feat_dim,), dtype=np.float64)
+    m2 = np.zeros((feat_dim,), dtype=np.float64)
+    count = 0
+    for start in range(0, train_idx.shape[0], batch_size):
+        batch_indices = train_idx[start : start + batch_size]
+        batch = features[batch_indices].astype(np.float64)
+        for row in batch:
+            count += 1
+            delta = row - mean
+            mean += delta / count
+            m2 += delta * (row - mean)
+    if count <= 1:
+        variance = np.ones_like(mean)
+    else:
+        variance = m2 / (count - 1)
+    std = np.sqrt(np.maximum(variance, 1e-12)).astype(np.float32)
     std[std < 1e-6] = 1.0
-    return mean.astype(np.float32), std.astype(np.float32)
+    return mean.astype(np.float32), std
 
 
-def slice_labels(labels: Dict[str, np.ndarray], indices: np.ndarray) -> Dict[str, np.ndarray]:
-    """辞書形式のラベル配列をインデックス指定で抽出する。"""
+def slice_labels_lazy(labels: Dict[str, LazyLabels], indices: np.ndarray) -> Dict[str, np.ndarray]:
+    """遅延ラベルから指定インデックスの値をまとめて抽出する。"""
 
-    return {name: values[indices] for name, values in labels.items()}
+    return {name: lazy[indices] for name, lazy in labels.items()}
 
 
 def format_metrics(metrics: Dict[str, float]) -> str:
@@ -257,17 +403,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("エラー: 入力ファイルが見つかりません", file=sys.stderr)
         return 1
 
-    features, best_labels, second_labels = load_dataset(files)
-    total = features.shape[0]
+    features, best_labels, second_labels, total = open_indexed_dataset(files)
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
-    mean, std = compute_feature_scaler(features, train_idx)
-    train_features = features[train_idx]
-    val_features = features[val_idx]
-    train_best = slice_labels(best_labels, train_idx)
-    train_second = slice_labels(second_labels, train_idx)
-    val_best = slice_labels(best_labels, val_idx)
-    val_second = slice_labels(second_labels, val_idx)
+    mean, std = compute_feature_scaler_streaming(features, train_idx)
+    train_features = LazyFeatureSubset(features, train_idx)
+    val_features = LazyFeatureSubset(features, val_idx)
+    train_best = slice_labels_lazy(best_labels, train_idx)
+    train_second = slice_labels_lazy(second_labels, train_idx)
+    val_best = slice_labels_lazy(best_labels, val_idx)
+    val_second = slice_labels_lazy(second_labels, val_idx)
 
     config = TrainConfig(
         epochs=args.epochs,

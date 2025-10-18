@@ -436,18 +436,40 @@ class MultiTaskModel:
     def predict_logits(self, features: np.ndarray) -> Dict[str, np.ndarray]:
         """入力特徴量から各ヘッドのロジットを返す。"""
 
-        standardized, squeeze = self._prepare_standardized(features)
+        if isinstance(features, np.ndarray):
+            standardized, squeeze = self._prepare_standardized(features)
+            rng = np.random.default_rng(0)
+            activations, _, _ = self._forward_trunk(standardized, training=False, rng=rng)
+            hidden = activations[-1]
+            logits: Dict[str, np.ndarray] = {}
+            for name in HEAD_ORDER:
+                out = hidden @ self.head_weights[name] + self.head_biases[name]
+                if squeeze:
+                    logits[name] = out[0]
+                else:
+                    logits[name] = out
+            return logits
+
+        sample_count = int(getattr(features, "shape")[0])  # type: ignore[index]
+        if sample_count == 0:
+            return {name: np.empty((0, HEAD_SPECS[name]), dtype=np.float64) for name in HEAD_ORDER}
+
         rng = np.random.default_rng(0)
-        activations, _, _ = self._forward_trunk(standardized, training=False, rng=rng)
-        hidden = activations[-1]
-        logits: Dict[str, np.ndarray] = {}
-        for name in HEAD_ORDER:
-            out = hidden @ self.head_weights[name] + self.head_biases[name]
-            if squeeze:
-                logits[name] = out[0]
-            else:
-                logits[name] = out
-        return logits
+        batch_size = min(8192, sample_count)
+        outputs: Dict[str, np.ndarray] = {
+            name: np.empty((sample_count, HEAD_SPECS[name]), dtype=np.float64)
+            for name in HEAD_ORDER
+        }
+        position = 0
+        while position < sample_count:
+            end = min(sample_count, position + batch_size)
+            batch_idx = np.arange(position, end, dtype=np.int64)
+            batch = features[batch_idx]
+            hidden, _, _, _ = self._forward_hidden(batch, rng, training=False)
+            for name in HEAD_ORDER:
+                outputs[name][position:end] = hidden @ self.head_weights[name] + self.head_biases[name]
+            position = end
+        return outputs
 
     def predict_topk(
         self,
