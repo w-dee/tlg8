@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
@@ -224,14 +225,19 @@ class JsonlReader:
 
     def __init__(self, files: List[FileRef]) -> None:
         self._files = files
-        self._handles: Dict[int, io.BufferedReader] = {}
+        # スレッドごとにファイルハンドルを分離してシーク競合を防ぐ。
+        self._local = threading.local()
 
     def _handle(self, file_id: int) -> io.BufferedReader:
-        handle = self._handles.get(file_id)
+        handles = getattr(self._local, "handles", None)
+        if handles is None:
+            handles = {}
+            self._local.handles = handles
+        handle = handles.get(file_id)
         if handle is None or handle.closed:
             path = self._files[file_id].path
             handle = open(path, "rb", buffering=1024 * 1024)
-            self._handles[file_id] = handle
+            handles[file_id] = handle
         return handle
 
     def read_line(self, file_id: int, offset: int) -> Dict[str, object]:
