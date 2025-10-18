@@ -121,6 +121,16 @@ def _deterministic_topk_indices(logits: np.ndarray, k: int) -> np.ndarray:
     return result
 
 
+def _deterministic_topk_row(logits_row: np.ndarray, k: int) -> np.ndarray:
+    """1 次元ロジット配列に対して決定的な top-k インデックスを返す。"""
+
+    if logits_row.ndim != 1:
+        raise ValueError("logits_row は 1 次元である必要があります")
+    class_ids = np.arange(logits_row.shape[0], dtype=np.int64)
+    order = np.lexsort((class_ids, -logits_row))
+    return order[: min(k, logits_row.shape[0])]
+
+
 def compute_metrics(
     logits: np.ndarray, best: np.ndarray, second: np.ndarray
 ) -> Dict[str, float]:
@@ -496,8 +506,7 @@ class MultiTaskModel:
             head_k = max(1, min(int(head_k), data.shape[0]))
             scaled = data / temp
             log_probs = log_softmax(scaled[None, :])[0]
-            class_ids = np.arange(data.shape[0], dtype=np.int64)
-            order = np.lexsort((class_ids, -scaled))[:head_k]
+            order = _deterministic_topk_row(scaled, head_k)
             result[name] = [(int(idx), float(log_probs[idx])) for idx in order]
         return result
 

@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
+import math
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -19,6 +22,15 @@ from multitask_model import HEAD_ORDER, MultiTaskModel, TrainConfig, train_multi
 MAX_COMPONENTS = 4
 BLOCK_EDGE = 8
 MAX_BLOCK_PIXELS = BLOCK_EDGE * BLOCK_EDGE
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm が利用不可の場合のフォールバック
+    tqdm = None
+
+# 遅延デコード用のスレッド上限と JSON デコード挙動を実行時に切り替えるためのグローバル。
+MAX_DECODE_THREADS = 1
+SKIP_BAD_RECORDS = False
 
 
 def discover_input_files(inputs: Sequence[str]) -> List[Path]:
@@ -69,39 +81,141 @@ class FileRef:
 
     path: Path
     size: int
+    mtime: float
 
 
-@dataclass
-class LinePtr:
-    """各レコードのファイル ID とバイトオフセット。"""
+def _inputs_match_meta(paths: Sequence[Path], meta: Dict[str, object]) -> bool:
+    """キャッシュメタデータと入力ファイル群が一致するか検証する。"""
 
-    file_id: int
-    offset: int
+    files_meta = meta.get("files") if isinstance(meta, dict) else None
+    if not isinstance(files_meta, list) or len(files_meta) != len(paths):
+        return False
+    for path, entry in zip(paths, files_meta):
+        if not isinstance(entry, dict):
+            return False
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        recorded_path = entry.get("path")
+        recorded_size = entry.get("size")
+        recorded_mtime = entry.get("mtime")
+        if str(path) != str(recorded_path):
+            return False
+        if int(stat.st_size) != int(recorded_size):
+            return False
+        try:
+            meta_mtime = float(recorded_mtime)
+        except (TypeError, ValueError):
+            return False
+        if not math.isclose(stat.st_mtime, meta_mtime, rel_tol=0.0, abs_tol=1e-6):
+            return False
+    return True
 
 
-def build_jsonl_index(paths: Sequence[Path]) -> Tuple[List[FileRef], np.ndarray]:
+def _ensure_index_matrix(arr: np.ndarray) -> np.ndarray:
+    """(N, 2) 形状の int64 配列に正規化する。"""
+
+    index = np.asarray(arr, dtype=np.int64)
+    if index.ndim == 1:
+        if index.size % 2 != 0:
+            raise ValueError("インデックス配列の長さが不正です")
+        index = index.reshape(-1, 2)
+    elif index.ndim != 2 or index.shape[1] != 2:
+        index = index.reshape(-1, 2)
+    return index
+
+
+def build_jsonl_index(
+    paths: Sequence[Path],
+    cache_path: Optional[Path],
+    show_progress: bool,
+) -> Tuple[List[FileRef], np.ndarray]:
     """JSONL 群からレコード位置のインデックスを構築する。"""
 
+    if cache_path is not None and cache_path.exists():
+        meta_path = cache_path.with_suffix(cache_path.suffix + ".meta.json")
+        try:
+            with meta_path.open("r", encoding="utf-8") as meta_fp:
+                meta = json.load(meta_fp)
+        except OSError:
+            meta = None
+        except json.JSONDecodeError:
+            meta = None
+        if meta and _inputs_match_meta(paths, meta):
+            try:
+                cached = np.load(cache_path, allow_pickle=False)
+            except (OSError, ValueError):
+                cached = None
+            if cached is not None:
+                files: List[FileRef] = []
+                valid = True
+                for item in meta.get("files", []):
+                    if not isinstance(item, dict):
+                        valid = False
+                        break
+                    try:
+                        path_str = str(item["path"])
+                        size_val = int(item["size"])
+                        mtime_val = float(item["mtime"])
+                    except (KeyError, TypeError, ValueError):
+                        valid = False
+                        break
+                    files.append(FileRef(path=Path(path_str), size=size_val, mtime=mtime_val))
+                if valid and len(files) == len(paths):
+                    return files, _ensure_index_matrix(cached)
+
     files: List[FileRef] = []
-    pointers: List[LinePtr] = []
+    index_list: List[Tuple[int, int]] = []
     for path in paths:
         try:
-            with path.open("rb") as fp:
-                files.append(FileRef(path=path, size=path.stat().st_size))
-                file_id = len(files) - 1
+            stat = path.stat()
+            size = stat.st_size
+            files.append(FileRef(path=path, size=size, mtime=stat.st_mtime))
+            file_id = len(files) - 1
+            with path.open("rb", buffering=1024 * 1024) as fp:
                 offset = fp.tell()
+                last_pos = offset
+                bar = None
+                if show_progress and tqdm is not None:
+                    bar = tqdm(total=size, unit="B", unit_scale=True, desc=path.name)
+                elif show_progress and tqdm is None:
+                    print(f"{path.name}: インデックス構築中...", file=sys.stderr)
                 while True:
                     line = fp.readline()
                     if not line:
                         break
                     if line.strip():
-                        pointers.append(LinePtr(file_id=file_id, offset=offset))
+                        index_list.append((file_id, offset))
                     offset = fp.tell()
+                    if bar is not None:
+                        bar.update(offset - last_pos)
+                        last_pos = offset
+                if bar is not None:
+                    if last_pos < size:
+                        bar.update(size - last_pos)
+                    bar.close()
         except OSError as exc:
             print(f"警告: {path} を読み込めません: {exc}", file=sys.stderr)
-    if not pointers:
+    if not index_list:
         raise RuntimeError("学習データが読み込めませんでした")
-    index = np.asarray([(ptr.file_id, ptr.offset) for ptr in pointers], dtype=np.int64)
+    index = _ensure_index_matrix(index_list)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, index)
+        meta = {
+            "files": [
+                {
+                    "path": str(ref.path),
+                    "size": int(ref.size),
+                    "mtime": float(ref.mtime),
+                }
+                for ref in files
+            ]
+        }
+        meta_path = cache_path.with_suffix(cache_path.suffix + ".meta.json")
+        with meta_path.open("w", encoding="utf-8") as meta_fp:
+            json.dump(meta, meta_fp)
     return files, index
 
 
@@ -120,13 +234,39 @@ class JsonlReader:
             self._handles[file_id] = handle
         return handle
 
-    def read(self, file_id: int, offset: int) -> Dict[str, object]:
+    def read_line(self, file_id: int, offset: int) -> Dict[str, object]:
         """指定位置の JSON レコードを辞書として返す。"""
 
         handle = self._handle(file_id)
         handle.seek(offset)
-        line = handle.readline()
-        return json.loads(line.decode("utf-8").strip())
+        raw = handle.readline()
+        try:
+            return json.loads(raw.decode("utf-8").strip())
+        except json.JSONDecodeError:
+            handle.seek(offset)
+            raw_retry = handle.readline()
+            try:
+                return json.loads(raw_retry.decode("utf-8").strip())
+            except json.JSONDecodeError as exc:
+                if SKIP_BAD_RECORDS:
+                    logging.warning(
+                        "Skipping corrupt JSON at file_id=%d offset=%d",
+                        file_id,
+                        offset,
+                    )
+                    return {
+                        "pixels": [],
+                        "block_size": [0, 0],
+                        "components": 0,
+                        "best": {},
+                        "second": {},
+                    }
+                raise exc
+
+    def read(self, file_id: int, offset: int) -> Dict[str, object]:
+        """後方互換用エイリアス。"""
+
+        return self.read_line(file_id, offset)
 
 
 def record_to_feature(record: Dict[str, object]) -> np.ndarray:
@@ -182,10 +322,18 @@ def _normalize_indices(idx: object, length: int) -> Tuple[np.ndarray, bool]:
 class LazyFeatures:
     """JSONL からオンデマンドで特徴量を読み出す遅延配列。"""
 
-    def __init__(self, reader: JsonlReader, index: np.ndarray, feature_dim: int) -> None:
+    def __init__(
+        self,
+        reader: JsonlReader,
+        index: np.ndarray,
+        feature_dim: int,
+        *,
+        max_workers: int = 1,
+    ) -> None:
         self._reader = reader
         self._index = index
         self._shape = (index.shape[0], feature_dim)
+        self._max_workers = max(1, int(max_workers))
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -197,13 +345,33 @@ class LazyFeatures:
     def __getitem__(self, idx: object) -> np.ndarray:
         rows, scalar = _normalize_indices(idx, len(self))
         batch = np.empty((rows.shape[0], self._shape[1]), dtype=np.float32)
-        for out_idx, rec_idx in enumerate(rows):
-            file_id, offset = self._index[int(rec_idx)]
-            record = self._reader.read(int(file_id), int(offset))
-            batch[out_idx] = record_to_feature(record)
+        if self._max_workers <= 1 or rows.shape[0] <= 1:
+            for out_idx, rec_idx in enumerate(rows):
+                batch[out_idx] = self._read_and_pack(int(rec_idx))
+        else:
+            with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+                futures = [
+                    executor.submit(self._read_and_pack_with_index, out_idx, int(rec_idx))
+                    for out_idx, rec_idx in enumerate(rows)
+                ]
+                for future in futures:
+                    out_idx, feature = future.result()
+                    batch[out_idx] = feature
         if scalar:
             return batch[0]
         return batch
+
+    def _read_and_pack(self, rec_idx: int) -> np.ndarray:
+        file_id, offset = self._index[int(rec_idx)]
+        record = self._reader.read_line(int(file_id), int(offset))
+        feature = record_to_feature(record)
+        if feature.dtype != np.float32:
+            feature = feature.astype(np.float32, copy=False)
+        return feature
+
+    def _read_and_pack_with_index(self, out_idx: int, rec_idx: int) -> Tuple[int, np.ndarray]:
+        feature = self._read_and_pack(rec_idx)
+        return out_idx, feature
 
 
 class LazyLabels:
@@ -247,7 +415,7 @@ class LazyLabels:
         out = np.empty((rows.shape[0],), dtype=np.int32)
         for out_idx, rec_idx in enumerate(rows):
             file_id, offset = self._index[int(rec_idx)]
-            record = self._reader.read(int(file_id), int(offset))
+            record = self._reader.read_line(int(file_id), int(offset))
             out[out_idx] = self._resolve_value(record)
         if scalar:
             return out[0]
@@ -282,14 +450,18 @@ class LazyFeatureSubset:
         return batch
 
 
-def open_indexed_dataset(paths: Sequence[Path]) -> Tuple[LazyFeatures, Dict[str, LazyLabels], Dict[str, LazyLabels], int]:
+def open_indexed_dataset(
+    paths: Sequence[Path],
+    cache_path: Optional[Path],
+    show_progress: bool,
+) -> Tuple[LazyFeatures, Dict[str, LazyLabels], Dict[str, LazyLabels], int]:
     """JSONL データセットをインデックス化し、遅延ビューを返す。"""
 
-    files, index = build_jsonl_index(paths)
+    files, index = build_jsonl_index(paths, cache_path, show_progress)
     reader = JsonlReader(files)
-    sample = reader.read(int(index[0, 0]), int(index[0, 1]))
+    sample = reader.read_line(int(index[0, 0]), int(index[0, 1]))
     feature_dim = record_to_feature(sample).shape[0]
-    features = LazyFeatures(reader, index, feature_dim)
+    features = LazyFeatures(reader, index, feature_dim, max_workers=MAX_DECODE_THREADS)
     best_labels = {name: LazyLabels(reader, index, name, use_second=False) for name in HEAD_ORDER}
     second_labels = {name: LazyLabels(reader, index, name, use_second=True) for name in HEAD_ORDER}
     return features, best_labels, second_labels, index.shape[0]
@@ -318,7 +490,14 @@ def compute_feature_scaler_streaming(
         variance = m2 / (count - 1)
     std = np.sqrt(np.maximum(variance, 1e-12)).astype(np.float32)
     std[std < 1e-6] = 1.0
-    return mean.astype(np.float32), std
+    mean32 = mean.astype(np.float32)
+    logging.info(
+        "Scaler: L2(mean)=%.6f, min(std)=%.6f, max(std)=%.6f",
+        float(np.linalg.norm(mean)),
+        float(std.min()),
+        float(std.max()),
+    )
+    return mean32, std
 
 
 def slice_labels_lazy(labels: Dict[str, LazyLabels], indices: np.ndarray) -> Dict[str, np.ndarray]:
@@ -364,46 +543,71 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--patience", type=int, default=20, help="早期終了の待機エポック数")
     parser.add_argument("--export-dir", type=Path, help="学習済みモデルの保存先ディレクトリ")
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
-    parser.add_argument("--max-threads", type=int, help="CPU の最大スレッド数")
+    parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
+    parser.add_argument("--progress", action="store_true", help="JSONL インデックス構築時に進捗を表示")
+    parser.add_argument("--skip-bad-records", action="store_true", help="JSON デコードに失敗した行をスキップ")
+    parser.add_argument(
+        "--max-batch",
+        type=int,
+        default=8192,
+        help="遅延読み出し時の実効ミニバッチ上限",
+    )
+    parser.add_argument(
+        "--max-threads",
+        type=int,
+        default=0,
+        help="遅延デコードに利用する最大スレッド数 (0 で自動設定)",
+    )
     args = parser.parse_args(argv)
 
-    if args.max_threads is not None:
-        if args.max_threads <= 0:
-            print("エラー: --max-threads には 1 以上を指定してください", file=sys.stderr)
-            return 1
-        threads = args.max_threads
-        # 代表的な数値演算ライブラリ向けにスレッド数を環境変数で制御する。
-        for var in (
-            "OMP_NUM_THREADS",
-            "OPENBLAS_NUM_THREADS",
-            "MKL_NUM_THREADS",
-            "VECLIB_MAXIMUM_THREADS",
-            "NUMEXPR_NUM_THREADS",
-            "BLIS_NUM_THREADS",
-        ):
-            os.environ[var] = str(threads)
-        # NumPy 自身がスレッド制御 API を提供していれば併用する。
-        if hasattr(np, "set_num_threads"):
-            try:
-                np.set_num_threads(threads)
-            except Exception:
-                pass
-        try:
-            import mkl  # type: ignore
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-            try:
-                mkl.set_num_threads(threads)
-            except Exception:
-                pass
-        except ImportError:
+    if args.max_batch <= 0:
+        print("エラー: --max-batch には 1 以上を指定してください", file=sys.stderr)
+        return 1
+
+    global MAX_DECODE_THREADS, SKIP_BAD_RECORDS
+    SKIP_BAD_RECORDS = bool(args.skip_bad_records)
+    threads = int(args.max_threads)
+    if threads <= 0:
+        threads = max(1, min(8, os.cpu_count() or 1))
+    MAX_DECODE_THREADS = max(1, threads)
+
+    # 代表的な数値演算ライブラリ向けにスレッド数を環境変数で制御する。
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ):
+        os.environ[var] = str(MAX_DECODE_THREADS)
+    # NumPy 自身がスレッド制御 API を提供していれば併用する。
+    if hasattr(np, "set_num_threads"):
+        try:
+            np.set_num_threads(MAX_DECODE_THREADS)
+        except Exception:
             pass
+    try:
+        import mkl  # type: ignore
+
+        try:
+            mkl.set_num_threads(MAX_DECODE_THREADS)
+        except Exception:
+            pass
+    except ImportError:
+        pass
 
     files = discover_input_files(args.inputs)
     if not files:
         print("エラー: 入力ファイルが見つかりません", file=sys.stderr)
         return 1
 
-    features, best_labels, second_labels, total = open_indexed_dataset(files)
+    cache_path = Path(args.index_cache) if args.index_cache else None
+    features, best_labels, second_labels, total = open_indexed_dataset(
+        files, cache_path, bool(args.progress)
+    )
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
     mean, std = compute_feature_scaler_streaming(features, train_idx)
@@ -414,9 +618,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     val_best = slice_labels_lazy(best_labels, val_idx)
     val_second = slice_labels_lazy(second_labels, val_idx)
 
+    effective_batch = min(int(args.batch_size), int(args.max_batch))
+
     config = TrainConfig(
         epochs=args.epochs,
-        batch_size=args.batch_size,
+        batch_size=effective_batch,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         dropout=args.dropout,
