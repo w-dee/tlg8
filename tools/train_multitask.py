@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -217,7 +218,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--patience", type=int, default=20, help="早期終了の待機エポック数")
     parser.add_argument("--export-dir", type=Path, help="学習済みモデルの保存先ディレクトリ")
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
+    parser.add_argument("--max-threads", type=int, help="CPU の最大スレッド数")
     args = parser.parse_args(argv)
+
+    if args.max_threads is not None:
+        if args.max_threads <= 0:
+            print("エラー: --max-threads には 1 以上を指定してください", file=sys.stderr)
+            return 1
+        threads = args.max_threads
+        # 代表的な数値演算ライブラリ向けにスレッド数を環境変数で制御する。
+        for var in (
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "BLIS_NUM_THREADS",
+        ):
+            os.environ[var] = str(threads)
+        # NumPy 自身がスレッド制御 API を提供していれば併用する。
+        if hasattr(np, "set_num_threads"):
+            try:
+                np.set_num_threads(threads)
+            except Exception:
+                pass
+        try:
+            import mkl  # type: ignore
+
+            try:
+                mkl.set_num_threads(threads)
+            except Exception:
+                pass
+        except ImportError:
+            pass
 
     files = discover_input_files(args.inputs)
     if not files:
