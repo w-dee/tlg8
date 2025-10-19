@@ -1,3 +1,4 @@
+#include "label_record.h"
 #include "tlg8_bit_io.h"
 #include "tlg8_block.h"
 #include "tlg8_block_side_info.h"
@@ -76,31 +77,7 @@ namespace
   using tlg::v8::detail::bitio::varuint_bits;
   using tlg::v8::TrainingDumpContext;
 
-  struct LabelRecord
-  {
-    uint32_t magic = 0x384C424Cu;
-    uint16_t version = 1u;
-    uint16_t reserved = 0u;
-    int16_t labels[12]{};
-    uint32_t crc32 = 0u;
-    uint8_t padding[92]{};
-  };
-
   static_assert(sizeof(LabelRecord) == tlg::v8::kLabelRecordSize, "LabelRecord のサイズが想定値と一致しません");
-
-  void split_filter_code(int code, int16_t &perm, int16_t &primary, int16_t &secondary)
-  {
-    if (code < 0)
-    {
-      perm = -1;
-      primary = -1;
-      secondary = -1;
-      return;
-    }
-    perm = static_cast<int16_t>(((code >> 4) & 0x7) % 6);
-    primary = static_cast<int16_t>(((code >> 2) & 0x3) % 4);
-    secondary = static_cast<int16_t>((code & 0x3) % 4);
-  }
 
   bool write_label_cache_record(TrainingDumpContext &ctx,
                                 uint32_t best_predictor,
@@ -121,14 +98,14 @@ namespace
     std::fill(std::begin(record.labels), std::end(record.labels), static_cast<int16_t>(-1));
 
     record.labels[0] = static_cast<int16_t>(best_predictor);
-    split_filter_code(static_cast<int>(best_filter), record.labels[1], record.labels[2], record.labels[3]);
+    split_filter(static_cast<int>(best_filter), record.labels[1], record.labels[2], record.labels[3]);
     record.labels[4] = static_cast<int16_t>(best_reorder);
     record.labels[5] = static_cast<int16_t>(best_interleave);
 
     if (has_second)
     {
       record.labels[6] = static_cast<int16_t>(second_predictor);
-      split_filter_code(static_cast<int>(second_filter), record.labels[7], record.labels[8], record.labels[9]);
+      split_filter(static_cast<int>(second_filter), record.labels[7], record.labels[8], record.labels[9]);
       record.labels[10] = static_cast<int16_t>(second_reorder);
       record.labels[11] = static_cast<int16_t>(second_interleave);
     }

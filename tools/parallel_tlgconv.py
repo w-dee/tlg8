@@ -4,15 +4,34 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import queue
-import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+try:
+    from .io_utils import (
+        RECORD_SIZE,
+        append_file,
+        append_jsonl_and_count,
+        count_lines,
+        dataset_hash,
+        sha256_file,
+        validate_label_part,
+    )
+except ImportError:  # 実行方法によっては相対インポートが利用できない
+    from io_utils import (  # type: ignore[no-redef]
+        RECORD_SIZE,
+        append_file,
+        append_jsonl_and_count,
+        count_lines,
+        dataset_hash,
+        sha256_file,
+        validate_label_part,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +85,23 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="ラベルキャッシュのメタデータを書き出すパス (省略可)",
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="一時ファイルを検証するだけで最終出力を書き出さない",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="最終的なファイル連結のみ省略して挙動を確認する",
+    )
+    parser.add_argument(
+        "--hexdump-head",
+        type=int,
+        default=0,
+        metavar="N",
+        help="最終 labels.bin の先頭 N バイトを 16 進で表示",
     )
     return parser.parse_args()
 
@@ -127,24 +163,6 @@ def worker(
         job_queue.task_done()
 
 
-def append_jsonl(destination: Path, sources: Iterable[Path]) -> None:
-    """JSONL ファイルを順番にマージする。"""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("ab") as dest:
-        for src in sources:
-            with src.open("rb") as data:
-                shutil.copyfileobj(data, dest)
-
-
-def append_label_cache(destination: Path, sources: Iterable[Path]) -> None:
-    """ラベルキャッシュのバイナリを順に連結する。"""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("ab") as dest:
-        for src in sources:
-            with src.open("rb") as data:
-                shutil.copyfileobj(data, dest)
-
-
 def read_label_cache_meta(meta_path: Path) -> int:
     """部分的なラベルキャッシュメタデータからレコード数を得る。"""
     try:
@@ -158,41 +176,16 @@ def read_label_cache_meta(meta_path: Path) -> int:
         raise RuntimeError(f"メタデータ {meta_path} の schema が想定と異なります: {schema}")
 
     record_size = data.get("record_size")
-    if record_size != 128:
-        raise RuntimeError(f"メタデータ {meta_path} の record_size が 128 ではありません: {record_size}")
+    if record_size != RECORD_SIZE:
+        raise RuntimeError(
+            f"メタデータ {meta_path} の record_size が {RECORD_SIZE} ではありません: {record_size}"
+        )
 
     record_count = data.get("record_count")
     if not isinstance(record_count, int):
         raise RuntimeError(f"メタデータ {meta_path} の record_count が不正です: {record_count}")
 
     return record_count
-
-
-def compute_file_sha256(path: Path) -> str:
-    """ファイルの SHA-256 を計算する。"""
-    hasher = hashlib.sha256()
-    with path.open("rb") as fp:
-        while True:
-            chunk = fp.read(1 << 20)
-            if not chunk:
-                break
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def compute_dataset_sha256(inputs: List[Dict[str, object]]) -> str:
-    """Python 実装と同じ手順でデータセットのハッシュを求める。"""
-    hasher = hashlib.sha256()
-    for item in inputs:
-        sha_hex = item.get("sha256")
-        size = item.get("size")
-        path = item.get("path")
-        if not isinstance(sha_hex, str) or not isinstance(size, int) or not isinstance(path, str):
-            raise RuntimeError("データセットハッシュ計算用の入力情報が不正です")
-        hasher.update(bytes.fromhex(sha_hex))
-        hasher.update(size.to_bytes(8, "little"))
-        hasher.update(path.encode("utf-8"))
-    return hasher.hexdigest()
 
 
 def write_label_cache_meta(
@@ -203,7 +196,7 @@ def write_label_cache_meta(
 ) -> None:
     """最終的なラベルキャッシュのメタデータを書き出す。"""
     bin_size = bin_path.stat().st_size
-    expected_size = record_count * 128
+    expected_size = record_count * RECORD_SIZE
     if bin_size != expected_size:
         raise RuntimeError(
             f"ラベルキャッシュバイナリのサイズ {bin_size} がレコード数 {record_count} と一致しません"
@@ -211,7 +204,7 @@ def write_label_cache_meta(
 
     training_path = training_jsonl.resolve()
     stats = training_path.stat()
-    sha256_hex = compute_file_sha256(training_path)
+    sha256_hex = sha256_file(training_path)
     inputs: List[Dict[str, object]] = [
         {
             "path": str(training_path),
@@ -220,11 +213,11 @@ def write_label_cache_meta(
             "sha256": sha256_hex,
         }
     ]
-    dataset_sha = compute_dataset_sha256(inputs)
+    dataset_sha = dataset_hash(inputs)
 
     meta = {
         "schema": 1,
-        "record_size": 128,
+        "record_size": RECORD_SIZE,
         "record_count": record_count,
         "inputs": inputs,
         "dataset_sha256": dataset_sha,
@@ -248,18 +241,26 @@ def main() -> int:
     if args.threads < 1:
         print("--threads は 1 以上を指定してください", file=sys.stderr)
         return 1
+    if args.hexdump_head < 0:
+        print("--hexdump-head には 0 以上を指定してください", file=sys.stderr)
+        return 1
+
+    if args.verify_only:
+        args.dry_run = True
 
     label_cache_requested = args.label_cache_bin is not None or args.label_cache_meta is not None
     if label_cache_requested and (args.label_cache_bin is None or args.label_cache_meta is None):
         print("ラベルキャッシュを出力する場合は bin と meta の両方を指定してください", file=sys.stderr)
         return 1
 
-    if label_cache_requested:
-        args.label_cache_bin.parent.mkdir(parents=True, exist_ok=True)
-        args.label_cache_bin.write_bytes(b"")
+    write_outputs = not args.verify_only and not args.dry_run
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_bytes(b"")
+    if write_outputs:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_bytes(b"")
+        if label_cache_requested:
+            args.label_cache_bin.parent.mkdir(parents=True, exist_ok=True)
+            args.label_cache_bin.write_bytes(b"")
 
     job_queue: "queue.Queue[Tuple[int, Path] | None]" = queue.Queue()
     result_queue: "queue.Queue[Tuple[int, Path, Optional[Path], Optional[Path]]]" = queue.Queue()
@@ -285,13 +286,22 @@ def main() -> int:
     completed = 0
     total = len(images)
     total_label_records = 0
+    total_jsonl_lines = 0
 
     while completed < total:
         index, jsonl_path, label_bin_path, label_meta_path = result_queue.get()
         pending[index] = (jsonl_path, label_bin_path, label_meta_path)
         while next_index in pending:
             path, bin_path, meta_path = pending.pop(next_index)
-            append_jsonl(args.output, [path])
+            try:
+                if write_outputs:
+                    part_lines = append_jsonl_and_count(args.output, path)
+                else:
+                    part_lines = count_lines(path)
+            except Exception as exc:  # noqa: BLE001
+                print(f"JSONL の追記に失敗しました ({path}): {exc}", file=sys.stderr)
+                return 1
+            total_jsonl_lines += part_lines
             path.unlink(missing_ok=True)
             if label_cache_requested:
                 if bin_path is None or meta_path is None:
@@ -302,7 +312,23 @@ def main() -> int:
                 except RuntimeError as exc:
                     print(str(exc), file=sys.stderr)
                     return 1
-                append_label_cache(args.label_cache_bin, [bin_path])
+                try:
+                    validate_label_part(bin_path, record_count)
+                except RuntimeError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 1
+                if part_lines != record_count:
+                    print(
+                        f"JSONL の行数 {part_lines} とラベル数 {record_count} が一致しません ({path.name})",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if write_outputs:
+                    try:
+                        append_file(args.label_cache_bin, bin_path)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"ラベルキャッシュの結合に失敗しました ({bin_path}): {exc}", file=sys.stderr)
+                        return 1
                 total_label_records += record_count
                 bin_path.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
@@ -316,16 +342,40 @@ def main() -> int:
         thread.join()
 
     if label_cache_requested:
-        try:
-            write_label_cache_meta(
-                args.label_cache_meta,
-                args.label_cache_bin,
-                total_label_records,
-                args.output,
+        if total_jsonl_lines != total_label_records:
+            print(
+                f"マージ後の JSONL 行数 {total_jsonl_lines} とラベル数 {total_label_records} が一致しません",
+                file=sys.stderr,
             )
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
             return 1
+        if write_outputs:
+            try:
+                validate_label_part(args.label_cache_bin, total_label_records)
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            try:
+                write_label_cache_meta(
+                    args.label_cache_meta,
+                    args.label_cache_bin,
+                    total_label_records,
+                    args.output,
+                )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+
+    if args.hexdump_head > 0 and label_cache_requested and args.label_cache_bin is not None:
+        try:
+            with args.label_cache_bin.open("rb") as fp:
+                head = fp.read(args.hexdump_head)
+        except FileNotFoundError:
+            print("hexdump を要求されましたが labels.bin が存在しません", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"hexdump の取得に失敗しました: {exc}", file=sys.stderr)
+            return 1
+        print("labels.bin head:", head.hex())
 
     return 0
 
