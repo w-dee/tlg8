@@ -74,6 +74,84 @@ namespace
     return write_little_endian(fp, value);
   }
 
+  bool write_f64le(FILE *fp, double value)
+  {
+    static_assert(sizeof(double) == sizeof(uint64_t), "double のサイズが 64bit ではありません");
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return write_u64le(fp, bits);
+  }
+
+  bool write_feature_stats_file(const tlg::v8::TrainingDumpContext::FeatureStatsState &state, std::string &err)
+  {
+    if (!state.enabled())
+      return true;
+    if (state.sum.size() != state.sumsq.size())
+    {
+      err = "tlg8: 特徴量統計の内部状態が不正です";
+      return false;
+    }
+
+    std::filesystem::path out_path = std::filesystem::u8path(state.path);
+    if (!out_path.parent_path().empty())
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(out_path.parent_path(), ec);
+      if (ec)
+      {
+        err = "tlg8: 特徴量統計の出力ディレクトリを作成できません: " + out_path.parent_path().u8string();
+        return false;
+      }
+    }
+
+    std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(state.path.c_str(), "wb"), &std::fclose);
+    if (!file)
+    {
+      err = "tlg8: 特徴量統計を書き出すファイルを開けません: " + state.path;
+      return false;
+    }
+
+    constexpr char magic[4] = {'F', 'S', 'C', '8'};
+    if (!write_bytes(file.get(), magic, sizeof(magic)))
+    {
+      err = "tlg8: 特徴量統計のマジック書き込みに失敗しました";
+      return false;
+    }
+    if (!write_u32le(file.get(), 1u))
+    {
+      err = "tlg8: 特徴量統計のバージョン書き込みに失敗しました";
+      return false;
+    }
+    const uint32_t dimension = static_cast<uint32_t>(state.sum.size());
+    if (!write_u32le(file.get(), dimension))
+    {
+      err = "tlg8: 特徴量統計の次元数書き込みに失敗しました";
+      return false;
+    }
+    if (!write_u64le(file.get(), state.count))
+    {
+      err = "tlg8: 特徴量統計のサンプル数書き込みに失敗しました";
+      return false;
+    }
+    for (double value : state.sum)
+    {
+      if (!write_f64le(file.get(), value))
+      {
+        err = "tlg8: 特徴量統計の総和書き込みに失敗しました";
+        return false;
+      }
+    }
+    for (double value : state.sumsq)
+    {
+      if (!write_f64le(file.get(), value))
+      {
+        err = "tlg8: 特徴量統計の二乗和書き込みに失敗しました";
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool read_u32le(FILE *fp, uint32_t &value)
   {
     return read_little_endian(fp, value);
@@ -734,6 +812,7 @@ namespace tlg::v8
                    double residual_bmp_emphasis,
                    const std::string &training_dump_path,
                    const std::string &training_image_tag,
+                   const std::string &training_stats_path,
                    const std::string &label_cache_bin_path,
                    const std::string &label_cache_meta_path,
                    bool force_hilbert_reorder,
@@ -811,6 +890,22 @@ namespace tlg::v8
       std::unique_ptr<FILE, FileCloser> training_dump_file;
       std::unique_ptr<FILE, FileCloser> label_cache_file;
       TrainingDumpContext training_context;
+      const bool need_training_ctx = !training_dump_path.empty() || !training_stats_path.empty() ||
+                                     !label_cache_bin_path.empty() || !label_cache_meta_path.empty();
+      if (need_training_ctx)
+      {
+        training_context.image_tag = training_image_tag;
+        training_context.image_width = src.width;
+        training_context.image_height = src.height;
+        training_context.components = static_cast<uint32_t>(desired_colors);
+        if (!training_stats_path.empty())
+        {
+          training_context.feature_stats.path = training_stats_path;
+          training_context.feature_stats.sum.assign(tlg::v8::kFeatureVectorSize, 0.0);
+          training_context.feature_stats.sumsq.assign(tlg::v8::kFeatureVectorSize, 0.0);
+          training_context.feature_stats.count = 0;
+        }
+      }
       if (!training_dump_path.empty())
       {
         FILE *ml_fp = std::fopen(training_dump_path.c_str(), "ab");
@@ -857,7 +952,7 @@ namespace tlg::v8
           training_context.label_cache.record_count = 0;
         }
       }
-      auto *training_ctx_ptr = training_dump_file ? &training_context : nullptr;
+      auto *training_ctx_ptr = need_training_ctx ? &training_context : nullptr;
 
       std::vector<uint8_t> packed;
       if (!copy_pixels_to_buffer(src, desired_colors, packed, err))
@@ -1075,6 +1170,12 @@ namespace tlg::v8
         training_ctx_ptr->label_cache.file = nullptr;
         label_cache_file.reset();
         if (!write_label_cache_meta(training_context.label_cache, err))
+          return false;
+      }
+
+      if (training_ctx_ptr && training_ctx_ptr->feature_stats.enabled())
+      {
+        if (!write_feature_stats_file(training_context.feature_stats, err))
           return false;
       }
 

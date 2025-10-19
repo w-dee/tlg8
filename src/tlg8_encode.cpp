@@ -76,8 +76,59 @@ namespace
   using tlg::v8::detail::bitio::put_varuint;
   using tlg::v8::detail::bitio::varuint_bits;
   using tlg::v8::TrainingDumpContext;
+  constexpr std::size_t kFeatureVectorSize = tlg::v8::kFeatureVectorSize;
 
   static_assert(sizeof(LabelRecord) == tlg::v8::kLabelRecordSize, "LabelRecord のサイズが想定値と一致しません");
+
+  void accumulate_feature_stats(TrainingDumpContext &ctx,
+                                const std::vector<uint8_t> &block_pixels,
+                                uint32_t block_w,
+                                uint32_t block_h,
+                                uint32_t components)
+  {
+    auto &state = ctx.feature_stats;
+    if (!state.enabled())
+      return;
+    if (state.sum.size() != kFeatureVectorSize || state.sumsq.size() != kFeatureVectorSize)
+      return;
+
+    std::array<double, kFeatureVectorSize> feature{};
+    std::size_t index = 0;
+    const double inv255 = 1.0 / 255.0;
+    for (uint32_t comp = 0; comp < 4; ++comp)
+    {
+      for (uint32_t by = 0; by < 8; ++by)
+      {
+        for (uint32_t bx = 0; bx < 8; ++bx)
+        {
+          double value = 0.0;
+          if (comp < components && by < block_h && bx < block_w)
+          {
+            const size_t pixel_index =
+                (static_cast<size_t>(by) * block_w + bx) * components + comp;
+            if (pixel_index < block_pixels.size())
+              value = static_cast<double>(block_pixels[pixel_index]) * inv255;
+          }
+          if (index < feature.size())
+            feature[index++] = value;
+        }
+      }
+    }
+    if (index + 3 == feature.size())
+    {
+      feature[index++] = static_cast<double>(block_w) / 8.0;
+      feature[index++] = static_cast<double>(block_h) / 8.0;
+      feature[index++] = static_cast<double>(components) / 4.0;
+    }
+
+    ++state.count;
+    for (std::size_t i = 0; i < kFeatureVectorSize; ++i)
+    {
+      const double v = feature[i];
+      state.sum[i] += v;
+      state.sumsq[i] += v * v;
+    }
+  }
 
   bool write_label_cache_record(TrainingDumpContext &ctx,
                                 uint32_t best_predictor,
@@ -809,9 +860,11 @@ namespace tlg::v8::enc
           }
         }
 
-        if (training_ctx && training_ctx->file)
+        std::vector<uint8_t> block_pixels;
+        const bool need_pixels = training_ctx &&
+                                 (training_ctx->file != nullptr || training_ctx->feature_stats.enabled());
+        if (need_pixels)
         {
-          std::vector<uint8_t> block_pixels;
           block_pixels.reserve(static_cast<size_t>(value_count) * components);
           for (uint32_t by = 0; by < block_h; ++by)
           {
@@ -820,12 +873,16 @@ namespace tlg::v8::enc
               for (uint32_t comp = 0; comp < components; ++comp)
               {
                 const auto &plane = workspace.padded[comp];
-                const size_t base_index = static_cast<size_t>(by + 1) * workspace.stride + static_cast<size_t>(bx + 1);
+                const size_t base_index =
+                    static_cast<size_t>(by + 1) * workspace.stride + static_cast<size_t>(bx + 1);
                 block_pixels.push_back(plane[base_index]);
               }
             }
           }
+        }
 
+        if (training_ctx && training_ctx->file)
+        {
           FILE *ml_fp = training_ctx->file;
           std::fputc('{', ml_fp);
           write_json_string(ml_fp, "image");
@@ -901,6 +958,9 @@ namespace tlg::v8::enc
           std::fputc('}', ml_fp);
           std::fputc('\n', ml_fp);
         }
+
+        if (training_ctx && training_ctx->feature_stats.enabled())
+          accumulate_feature_stats(*training_ctx, block_pixels, block_w, block_h, components);
 
         if (training_ctx)
         {

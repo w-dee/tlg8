@@ -40,6 +40,7 @@ static void print_usage()
             << " [--dump-reorder-histogram=<path>]"
             << " [--tlg8-dump-training=<path>]"
             << " [--tlg8-training-tag=<text>]"
+            << " [--tlg8-training-stats=<path>]"
             << " [--label-cache-bin=<path>]"
             << " [--label-cache-meta=<path>]"
             << " [--tlg8-reorder=hilbert-only]"
@@ -284,6 +285,16 @@ int main(int argc, char **argv)
       }
       tlgopt.tlg8_training_dump_image_tag = arg.substr(eq + 1);
     }
+    else if (arg.rfind("--tlg8-training-stats=", 0) == 0)
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg8-training-stats option\n";
+        return 2;
+      }
+      tlgopt.tlg8_training_stats_path = arg.substr(eq + 1);
+    }
     else if (arg.rfind("--label-cache-bin=", 0) == 0)
     {
       const auto eq = arg.find('=');
@@ -340,6 +351,11 @@ int main(int argc, char **argv)
   if (!tlgopt.tlg8_training_dump_path.empty() && tlgopt.version != 8)
   {
     std::cerr << "--tlg8-dump-training は TLG8 エンコード時のみ使用できます\n";
+    return 2;
+  }
+  if (!tlgopt.tlg8_training_stats_path.empty() && tlgopt.version != 8)
+  {
+    std::cerr << "--tlg8-training-stats は TLG8 エンコード時のみ使用できます\n";
     return 2;
   }
   if ((!tlgopt.tlg8_label_cache_bin_path.empty() || !tlgopt.tlg8_label_cache_meta_path.empty()) && tlgopt.version != 8)

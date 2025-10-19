@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import queue
 import subprocess
 import sys
@@ -87,6 +88,12 @@ def parse_args() -> argparse.Namespace:
         help="ラベルキャッシュのメタデータを書き出すパス (省略可)",
     )
     parser.add_argument(
+        "--feature-stats-bin",
+        type=Path,
+        default=None,
+        help="特徴量統計のバイナリを書き出すパス (省略可)",
+    )
+    parser.add_argument(
         "--verify-only",
         action="store_true",
         help="一時ファイルを検証するだけで最終出力を書き出さない",
@@ -112,6 +119,48 @@ def discover_images(images_dir: Path, pattern: str) -> List[Path]:
     return [img for img in images if img.is_file()]
 
 
+FEATURE_STATS_MAGIC = b"FSC8"
+FEATURE_STATS_VERSION = 1
+FEATURE_STATS_HEADER = struct.Struct("<4sIIQ")
+
+
+def read_feature_stats(path: Path) -> tuple[int, List[float], List[float]]:
+    """部分的な特徴量統計ファイルを読み取る。"""
+
+    with path.open("rb") as fp:
+        header = fp.read(FEATURE_STATS_HEADER.size)
+        if len(header) != FEATURE_STATS_HEADER.size:
+            raise RuntimeError(f"{path}: 特徴量統計ヘッダーを読み取れませんでした")
+        magic, version, dimension, count = FEATURE_STATS_HEADER.unpack(header)
+        if magic != FEATURE_STATS_MAGIC or version != FEATURE_STATS_VERSION:
+            raise RuntimeError(f"{path}: 特徴量統計ヘッダーが不正です")
+        sum_bytes = fp.read(8 * dimension)
+        if len(sum_bytes) != 8 * dimension:
+            raise RuntimeError(f"{path}: 特徴量統計 sum のサイズが不正です")
+        sums = list(struct.unpack("<" + "d" * dimension, sum_bytes)) if dimension else []
+        sumsq_bytes = fp.read(8 * dimension)
+        if len(sumsq_bytes) != 8 * dimension:
+            raise RuntimeError(f"{path}: 特徴量統計 sumsq のサイズが不正です")
+        sumsq = list(struct.unpack("<" + "d" * dimension, sumsq_bytes)) if dimension else []
+    return count, sums, sumsq
+
+
+def write_feature_stats(path: Path, count: int, sums: List[float], sumsq: List[float]) -> None:
+    """結合した特徴量統計ファイルを書き出す。"""
+
+    if len(sums) != len(sumsq):
+        raise RuntimeError("特徴量統計ベクトルの長さが一致しません")
+    dimension = len(sums)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f"{path.name}.tmp"
+    with tmp_path.open("wb") as fp:
+        fp.write(FEATURE_STATS_HEADER.pack(FEATURE_STATS_MAGIC, FEATURE_STATS_VERSION, dimension, count))
+        if dimension:
+            fp.write(struct.pack("<" + "d" * dimension, *sums))
+            fp.write(struct.pack("<" + "d" * dimension, *sumsq))
+    tmp_path.replace(path)
+
+
 def run_tlgconv(
     tlgconv: Path,
     image: Path,
@@ -119,6 +168,7 @@ def run_tlgconv(
     jsonl_output: Path,
     label_cache_bin: Optional[Path],
     label_cache_meta: Optional[Path],
+    feature_stats_path: Optional[Path],
 ) -> None:
     """build/tlgconv を 1 回実行する。"""
     cmd = [
@@ -132,15 +182,18 @@ def run_tlgconv(
     if label_cache_bin is not None and label_cache_meta is not None:
         cmd.append(f"--label-cache-bin={label_cache_bin}")
         cmd.append(f"--label-cache-meta={label_cache_meta}")
+    if feature_stats_path is not None:
+        cmd.append(f"--tlg8-training-stats={feature_stats_path}")
     subprocess.run(cmd, check=True)
 
 
 def worker(
     job_queue: "queue.Queue[Tuple[int, Path]]",
-    result_queue: "queue.Queue[Tuple[int, Path, Optional[Path], Optional[Path]]]",
+    result_queue: "queue.Queue[Tuple[int, Path, Optional[Path], Optional[Path], Optional[Path]]]",
     tlgconv: Path,
     temp_dir: Path,
     enable_label_cache: bool,
+    enable_feature_stats: bool,
 ) -> None:
     """ジョブを取り出して tlgconv を実行し、結果 JSONL を報告する。"""
     while True:
@@ -158,8 +211,19 @@ def worker(
         if enable_label_cache:
             label_bin_path = temp_dir / f"{tag}.labels.bin"
             label_meta_path = temp_dir / f"{tag}.labels.meta.json"
-        run_tlgconv(tlgconv, image, tlg_path, jsonl_path, label_bin_path, label_meta_path)
-        result_queue.put((index, jsonl_path, label_bin_path, label_meta_path))
+        stats_path: Optional[Path] = None
+        if enable_feature_stats:
+            stats_path = temp_dir / f"{tag}.stats.bin"
+        run_tlgconv(
+            tlgconv,
+            image,
+            tlg_path,
+            jsonl_path,
+            label_bin_path,
+            label_meta_path,
+            stats_path,
+        )
+        result_queue.put((index, jsonl_path, label_bin_path, label_meta_path, stats_path))
         job_queue.task_done()
 
 
@@ -249,6 +313,7 @@ def main() -> int:
         args.dry_run = True
 
     label_cache_requested = args.label_cache_bin is not None or args.label_cache_meta is not None
+    feature_stats_requested = args.feature_stats_bin is not None
     if label_cache_requested and (args.label_cache_bin is None or args.label_cache_meta is None):
         print("ラベルキャッシュを出力する場合は bin と meta の両方を指定してください", file=sys.stderr)
         return 1
@@ -263,13 +328,20 @@ def main() -> int:
             args.label_cache_bin.write_bytes(b"")
 
     job_queue: "queue.Queue[Tuple[int, Path] | None]" = queue.Queue()
-    result_queue: "queue.Queue[Tuple[int, Path, Optional[Path], Optional[Path]]]" = queue.Queue()
+    result_queue: "queue.Queue[Tuple[int, Path, Optional[Path], Optional[Path], Optional[Path]]]" = queue.Queue()
 
     workers = []
     for _ in range(args.threads):
         thread = threading.Thread(
             target=worker,
-            args=(job_queue, result_queue, args.tlgconv, args.temp_dir, label_cache_requested),
+            args=(
+                job_queue,
+                result_queue,
+                args.tlgconv,
+                args.temp_dir,
+                label_cache_requested,
+                feature_stats_requested,
+            ),
             daemon=True,
         )
         thread.start()
@@ -281,18 +353,22 @@ def main() -> int:
     for _ in workers:
         job_queue.put(None)
 
-    pending: dict[int, Tuple[Path, Optional[Path], Optional[Path]]] = {}
+    pending: dict[int, Tuple[Path, Optional[Path], Optional[Path], Optional[Path]]] = {}
     next_index = 0
     completed = 0
     total = len(images)
     total_label_records = 0
     total_jsonl_lines = 0
+    stats_dim: Optional[int] = None
+    stats_sum: Optional[List[float]] = None
+    stats_sumsq: Optional[List[float]] = None
+    stats_total_count = 0
 
     while completed < total:
-        index, jsonl_path, label_bin_path, label_meta_path = result_queue.get()
-        pending[index] = (jsonl_path, label_bin_path, label_meta_path)
+        index, jsonl_path, label_bin_path, label_meta_path, stats_path = result_queue.get()
+        pending[index] = (jsonl_path, label_bin_path, label_meta_path, stats_path)
         while next_index in pending:
-            path, bin_path, meta_path = pending.pop(next_index)
+            path, bin_path, meta_path, part_stats_path = pending.pop(next_index)
             try:
                 if write_outputs:
                     part_lines = append_jsonl_and_count(args.output, path)
@@ -332,6 +408,34 @@ def main() -> int:
                 total_label_records += record_count
                 bin_path.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
+            if feature_stats_requested:
+                if part_stats_path is None:
+                    print("特徴量統計の一時ファイル情報が欠落しています", file=sys.stderr)
+                    return 1
+                try:
+                    part_count, part_sum, part_sumsq = read_feature_stats(part_stats_path)
+                except RuntimeError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 1
+                if part_lines != part_count:
+                    print(
+                        f"JSONL の行数 {part_lines} と特徴量統計のサンプル数 {part_count} が一致しません ({path.name})",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if stats_dim is None:
+                    stats_dim = len(part_sum)
+                    stats_sum = [0.0] * stats_dim
+                    stats_sumsq = [0.0] * stats_dim
+                elif stats_dim != len(part_sum):
+                    print("特徴量統計の次元数が一致しません", file=sys.stderr)
+                    return 1
+                if stats_sum is not None and stats_sumsq is not None:
+                    for i in range(stats_dim or 0):
+                        stats_sum[i] += part_sum[i]
+                        stats_sumsq[i] += part_sumsq[i]
+                stats_total_count += part_count
+                part_stats_path.unlink(missing_ok=True)
             next_index += 1
             completed += 1
             print(f"[{completed}/{total}] {path.name} をマージしました")
@@ -361,6 +465,26 @@ def main() -> int:
                     total_label_records,
                     args.output,
                 )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+
+    if feature_stats_requested:
+        if stats_dim is None:
+            stats_dim = 0
+        if stats_sum is None:
+            stats_sum = []
+        if stats_sumsq is None:
+            stats_sumsq = []
+        if stats_total_count != total_jsonl_lines:
+            print(
+                f"マージ後の JSONL 行数 {total_jsonl_lines} と特徴量統計のサンプル数 {stats_total_count} が一致しません",
+                file=sys.stderr,
+            )
+            return 1
+        if write_outputs:
+            try:
+                write_feature_stats(args.feature_stats_bin, stats_total_count, stats_sum, stats_sumsq)
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1

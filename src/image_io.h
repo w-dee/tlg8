@@ -79,6 +79,7 @@ struct TlgOptions
   bool tlg8_force_hilbert_reorder = false;   // TLG8 並び替えをヒルベルト走査に固定するか
   std::string tlg8_training_dump_path;       // TLG8 ANN 学習用データを書き出すファイルパス
   std::string tlg8_training_dump_image_tag;  // 学習用データに付与する画像識別子
+  std::string tlg8_training_stats_path;      // 学習用特徴量統計を書き出すファイルパス
   std::string tlg8_label_cache_bin_path;     // ラベルキャッシュのバイナリ出力先
   std::string tlg8_label_cache_meta_path;    // ラベルキャッシュのメタデータ出力先
   bool print_entropy_bits = false;     // エントロピー符号化で使用した正味ビット数を表示するか

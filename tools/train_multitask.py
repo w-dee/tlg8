@@ -77,6 +77,10 @@ LABEL_RECORD_SIZE = LABEL_STRUCT.size
 LABEL_FIELD_COUNT = 12
 LABEL_FIELD_OFFSET = 8  # ヘッダー 8 バイト分の後にラベル本体が続く
 
+FEATURE_STATS_MAGIC = b"FSC8"
+FEATURE_STATS_VERSION = 1
+FEATURE_STATS_HEADER = struct.Struct("<4sIIQ")
+
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover - tqdm が利用不可の場合のフォールバック
@@ -950,6 +954,40 @@ def compute_feature_scaler_streaming(
     return mean, std
 
 
+def load_feature_scaler_from_binary(path: Path, expected_dim: int) -> Tuple[np.ndarray, np.ndarray, int]:
+    """C++ で事前計算した特徴量統計から平均・標準偏差を復元する。"""
+
+    with Path(path).open("rb") as fp:
+        header = fp.read(FEATURE_STATS_HEADER.size)
+        if len(header) != FEATURE_STATS_HEADER.size:
+            raise ValueError(f"特徴量統計ファイルのヘッダーが不完全です: {path}")
+        magic, version, dimension, count = FEATURE_STATS_HEADER.unpack(header)
+        if magic != FEATURE_STATS_MAGIC or version != FEATURE_STATS_VERSION:
+            raise ValueError(f"特徴量統計ファイルのマジック/バージョンが不正です: {path}")
+        if dimension != expected_dim:
+            raise ValueError(
+                f"特徴量統計の次元数が入力データと一致しません (expected={expected_dim}, actual={dimension})"
+            )
+        sum_bytes = fp.read(8 * dimension)
+        if len(sum_bytes) != 8 * dimension:
+            raise ValueError("特徴量統計ファイルの sum 部が不足しています")
+        sums = np.frombuffer(sum_bytes, dtype="<f8").astype(np.float64, copy=True)
+        sumsq_bytes = fp.read(8 * dimension)
+        if len(sumsq_bytes) != 8 * dimension:
+            raise ValueError("特徴量統計ファイルの sumsq 部が不足しています")
+        sumsq = np.frombuffer(sumsq_bytes, dtype="<f8").astype(np.float64, copy=True)
+
+    if count <= 1:
+        variance = np.ones_like(sums)
+    else:
+        variance = (sumsq - (sums ** 2) / count) / (count - 1)
+    variance = np.maximum(variance, 1e-12)
+    std = np.sqrt(variance).astype(np.float32)
+    std[std < 1e-6] = 1.0
+    mean = (sums / max(count, 1)).astype(np.float32)
+    return mean, std, int(count)
+
+
 def slice_labels_lazy(labels: Dict[str, object], indices: np.ndarray) -> Dict[str, np.ndarray]:
     """遅延ラベルから指定インデックスの値をまとめて抽出する。"""
 
@@ -1263,6 +1301,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--build-label-cache", action="store_true", help="キャッシュ不整合時に事前抽出を自動実行")
     parser.add_argument("--no-label-cache", action="store_true", help="JSONL からのラベル読み出しを強制")
     parser.add_argument(
+        "--feature-stats-bin",
+        type=Path,
+        default=None,
+        help="事前計算した特徴量統計バイナリのパス",
+    )
+    parser.add_argument(
         "--progress",
         action="store_true",
         default=True,
@@ -1399,13 +1443,40 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     total = int(index.shape[0])
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
+    mean_std_loaded = False
+    stats_count: Optional[int] = None
+    if args.feature_stats_bin is not None:
+        try:
+            loaded_mean, loaded_std, stats_count = load_feature_scaler_from_binary(
+                args.feature_stats_bin, feature_dim
+            )
+        except FileNotFoundError:
+            logging.warning("特徴量統計 %s が見つかりません", args.feature_stats_bin)
+        except ValueError as exc:
+            logging.warning("特徴量統計の読み込みに失敗しました: %s", exc)
+        else:
+            mean = loaded_mean
+            std = loaded_std
+            mean_std_loaded = True
+            logging.info(
+                "特徴量スケーラーを %s から読み込みました (サンプル数=%d)",
+                args.feature_stats_bin,
+                stats_count,
+            )
+            if stats_count is not None and stats_count != total:
+                logging.warning(
+                    "特徴量統計のサンプル数 %d がデータセット行数 %d と一致しません",
+                    stats_count,
+                    total,
+                )
 
-    mean, std = compute_feature_scaler_streaming(
-        features,
-        train_idx,
-        batch_size=int(args.scaler_batch),
-        show_progress=ENABLE_PROGRESS,
-    )
+    if not mean_std_loaded:
+        mean, std = compute_feature_scaler_streaming(
+            features,
+            train_idx,
+            batch_size=int(args.scaler_batch),
+            show_progress=ENABLE_PROGRESS,
+        )
     train_features = LazyFeatureSubset(features, train_idx)
     val_features = LazyFeatureSubset(features, val_idx)
     train_best = slice_labels_lazy(best_labels, train_idx)
