@@ -74,6 +74,7 @@ add_executable(tlgconv
     src/tlg8_predictors.cpp
     src/tlg8_entropy.cpp
     src/tlg8_reorder.cpp
+    src/sha256.cpp
     src/tlg8_encode.cpp
 )
 

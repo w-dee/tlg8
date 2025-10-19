@@ -40,6 +40,8 @@ static void print_usage()
             << " [--dump-reorder-histogram=<path>]"
             << " [--tlg8-dump-training=<path>]"
             << " [--tlg8-training-tag=<text>]"
+            << " [--label-cache-bin=<path>]"
+            << " [--label-cache-meta=<path>]"
             << " [--tlg8-reorder=hilbert-only]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
@@ -282,6 +284,26 @@ int main(int argc, char **argv)
       }
       tlgopt.tlg8_training_dump_image_tag = arg.substr(eq + 1);
     }
+    else if (arg.rfind("--label-cache-bin=", 0) == 0)
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --label-cache-bin option\n";
+        return 2;
+      }
+      tlgopt.tlg8_label_cache_bin_path = arg.substr(eq + 1);
+    }
+    else if (arg.rfind("--label-cache-meta=", 0) == 0)
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --label-cache-meta option\n";
+        return 2;
+      }
+      tlgopt.tlg8_label_cache_meta_path = arg.substr(eq + 1);
+    }
     else if (arg.rfind("--dump-reorder-histogram=", 0) == 0)
     {
       const auto eq = arg.find('=');
@@ -318,6 +340,21 @@ int main(int argc, char **argv)
   if (!tlgopt.tlg8_training_dump_path.empty() && tlgopt.version != 8)
   {
     std::cerr << "--tlg8-dump-training は TLG8 エンコード時のみ使用できます\n";
+    return 2;
+  }
+  if ((!tlgopt.tlg8_label_cache_bin_path.empty() || !tlgopt.tlg8_label_cache_meta_path.empty()) && tlgopt.version != 8)
+  {
+    std::cerr << "--label-cache-* は TLG8 エンコード時のみ使用できます\n";
+    return 2;
+  }
+  if ((tlgopt.tlg8_label_cache_bin_path.empty() ^ tlgopt.tlg8_label_cache_meta_path.empty()))
+  {
+    std::cerr << "--label-cache-bin と --label-cache-meta は同時に指定してください\n";
+    return 2;
+  }
+  if (!tlgopt.tlg8_label_cache_bin_path.empty() && tlgopt.tlg8_training_dump_path.empty())
+  {
+    std::cerr << "--label-cache-* を使用する場合は --tlg8-dump-training も指定してください\n";
     return 2;
   }
 

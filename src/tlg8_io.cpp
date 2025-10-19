@@ -2,10 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <type_traits>
 #include <vector>
 
@@ -13,6 +18,7 @@
 #include "tlg8_bit_io.h"
 #include "tlg8_entropy.h"
 #include "tlg8_reorder.h"
+#include "sha256.h"
 
 namespace
 {
@@ -76,6 +82,286 @@ namespace
   bool read_u64le(FILE *fp, uint64_t &value)
   {
     return read_little_endian(fp, value);
+  }
+
+  std::string escape_json_string(const std::string &value)
+  {
+    std::string result;
+    result.reserve(value.size() + 2);
+    result.push_back('"');
+    for (unsigned char ch : value)
+    {
+      switch (ch)
+      {
+      case '\\':
+      case '"':
+        result.push_back('\\');
+        result.push_back(static_cast<char>(ch));
+        break;
+      case '\b':
+        result.append("\\b");
+        break;
+      case '\f':
+        result.append("\\f");
+        break;
+      case '\n':
+        result.append("\\n");
+        break;
+      case '\r':
+        result.append("\\r");
+        break;
+      case '\t':
+        result.append("\\t");
+        break;
+      default:
+        if (ch < 0x20)
+        {
+          char buf[7];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(ch));
+          result.append(buf);
+        }
+        else
+        {
+          result.push_back(static_cast<char>(ch));
+        }
+        break;
+      }
+    }
+    result.push_back('"');
+    return result;
+  }
+
+  double file_time_to_seconds(const std::filesystem::file_time_type &tp)
+  {
+    using clock = std::filesystem::file_time_type::clock;
+    const auto system_now = std::chrono::system_clock::now();
+    const auto file_now = clock::now();
+    const auto adjusted = tp - file_now + system_now;
+    return std::chrono::duration<double>(adjusted.time_since_epoch()).count();
+  }
+
+  struct LabelCacheInputMeta
+  {
+    std::filesystem::path resolved_path;
+    std::uintmax_t size = 0;
+    double mtime_seconds = 0.0;
+    std::string sha256_hex;
+  };
+
+  bool compute_file_sha256(const std::filesystem::path &path,
+                           std::string &out_hex,
+                           std::string &err)
+  {
+    std::ifstream fp(path, std::ios::binary);
+    if (!fp)
+    {
+      err = "tlg8: ファイルのハッシュ計算に失敗しました: " + path.u8string();
+      return false;
+    }
+    std::array<char, 1024 * 1024> buffer{};
+    Sha256 hasher;
+    while (fp)
+    {
+      fp.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+      const std::streamsize got = fp.gcount();
+      if (got > 0)
+        hasher.update(buffer.data(), static_cast<std::size_t>(got));
+    }
+    if (fp.bad())
+    {
+      err = "tlg8: ファイルの読み取り中にエラーが発生しました: " + path.u8string();
+      return false;
+    }
+    out_hex = hasher.hexdigest();
+    return true;
+  }
+
+  bool gather_label_cache_inputs(const std::vector<std::string> &input_paths,
+                                 std::vector<LabelCacheInputMeta> &out,
+                                 std::string &err)
+  {
+    out.clear();
+    out.reserve(input_paths.size());
+    for (const auto &raw : input_paths)
+    {
+      std::filesystem::path source = std::filesystem::u8path(raw);
+      std::error_code ec;
+      if (!std::filesystem::exists(source, ec) || ec)
+      {
+        err = "tlg8: ラベルキャッシュ入力ファイルが見つかりません: " + source.u8string();
+        return false;
+      }
+      auto resolved = std::filesystem::canonical(source, ec);
+      if (ec)
+      {
+        resolved = std::filesystem::absolute(source, ec);
+        if (ec)
+        {
+          err = "tlg8: ラベルキャッシュ入力の絶対パス取得に失敗しました: " + source.u8string();
+          return false;
+        }
+      }
+      const auto size = std::filesystem::file_size(resolved, ec);
+      if (ec)
+      {
+        err = "tlg8: ラベルキャッシュ入力のファイルサイズ取得に失敗しました: " + resolved.u8string();
+        return false;
+      }
+      const auto mtime = std::filesystem::last_write_time(resolved, ec);
+      if (ec)
+      {
+        err = "tlg8: ラベルキャッシュ入力の更新時刻取得に失敗しました: " + resolved.u8string();
+        return false;
+      }
+      std::string sha;
+      if (!compute_file_sha256(resolved, sha, err))
+        return false;
+
+      LabelCacheInputMeta meta;
+      meta.resolved_path = resolved;
+      meta.size = size;
+      meta.mtime_seconds = file_time_to_seconds(mtime);
+      meta.sha256_hex = std::move(sha);
+      out.push_back(std::move(meta));
+    }
+    return true;
+  }
+
+  bool hex_to_bytes(const std::string &hex, std::array<uint8_t, 32> &out)
+  {
+    if (hex.size() != 64)
+      return false;
+    auto hex_value = [](char ch) -> int {
+      if (ch >= '0' && ch <= '9')
+        return ch - '0';
+      if (ch >= 'a' && ch <= 'f')
+        return ch - 'a' + 10;
+      if (ch >= 'A' && ch <= 'F')
+        return ch - 'A' + 10;
+      return -1;
+    };
+    for (std::size_t i = 0; i < out.size(); ++i)
+    {
+      const int hi = hex_value(hex[i * 2]);
+      const int lo = hex_value(hex[i * 2 + 1]);
+      if (hi < 0 || lo < 0)
+        return false;
+      out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+  }
+
+  bool write_label_cache_meta(const tlg::v8::TrainingDumpContext::LabelCacheState &state,
+                              std::string &err)
+  {
+    if (state.meta_path.empty())
+      return true;
+
+    std::vector<LabelCacheInputMeta> inputs;
+    if (!gather_label_cache_inputs(state.input_paths, inputs, err))
+      return false;
+
+    std::filesystem::path bin_path = std::filesystem::u8path(state.bin_path);
+    std::error_code ec;
+    const auto bin_size = std::filesystem::file_size(bin_path, ec);
+    if (ec)
+    {
+      err = "tlg8: ラベルキャッシュバイナリのサイズ取得に失敗しました: " + bin_path.u8string();
+      return false;
+    }
+    const uint64_t expected_size = state.record_count * tlg::v8::kLabelRecordSize;
+    if (bin_size != static_cast<std::uintmax_t>(expected_size))
+    {
+      err = "tlg8: ラベルキャッシュのレコード数とファイルサイズが一致しません";
+      return false;
+    }
+
+    Sha256 dataset_hasher;
+    for (const auto &meta : inputs)
+    {
+      std::array<uint8_t, 32> bytes{};
+      if (!hex_to_bytes(meta.sha256_hex, bytes))
+      {
+        err = "tlg8: ラベルキャッシュ入力の SHA-256 が不正です";
+        return false;
+      }
+      dataset_hasher.update(bytes.data(), bytes.size());
+      std::array<uint8_t, 8> size_bytes{};
+      std::uint64_t size_le = static_cast<std::uint64_t>(meta.size);
+      for (std::size_t i = 0; i < size_bytes.size(); ++i)
+        size_bytes[i] = static_cast<uint8_t>((size_le >> (i * 8)) & 0xffu);
+      dataset_hasher.update(size_bytes.data(), size_bytes.size());
+      const auto path_utf8 = meta.resolved_path.u8string();
+      dataset_hasher.update(path_utf8.data(), path_utf8.size());
+    }
+    const std::string dataset_sha = dataset_hasher.hexdigest();
+
+    std::filesystem::path meta_path = std::filesystem::u8path(state.meta_path);
+    if (!meta_path.parent_path().empty())
+    {
+      std::filesystem::create_directories(meta_path.parent_path(), ec);
+      if (ec)
+      {
+        err = "tlg8: ラベルキャッシュメタデータのディレクトリ作成に失敗しました: " + meta_path.parent_path().u8string();
+        return false;
+      }
+    }
+
+    std::filesystem::path tmp_path = meta_path;
+    tmp_path += ".tmp";
+    std::ofstream out_fp(tmp_path, std::ios::binary);
+    if (!out_fp)
+    {
+      err = "tlg8: ラベルキャッシュメタデータを書き出すファイルを開けません: " + tmp_path.u8string();
+      return false;
+    }
+    out_fp << "{\n";
+    out_fp << "  \"schema\": 1,\n";
+    out_fp << "  \"record_size\": " << tlg::v8::kLabelRecordSize << ",\n";
+    out_fp << "  \"record_count\": " << static_cast<unsigned long long>(state.record_count) << ",\n";
+    out_fp << "  \"inputs\": [\n";
+    for (std::size_t index = 0; index < inputs.size(); ++index)
+    {
+      const auto &meta = inputs[index];
+      out_fp << "    {\n";
+      out_fp << "      \"path\": " << escape_json_string(meta.resolved_path.u8string()) << ",\n";
+      out_fp << "      \"size\": " << static_cast<unsigned long long>(meta.size) << ",\n";
+      out_fp << std::setprecision(17);
+      out_fp << "      \"mtime\": " << meta.mtime_seconds << ",\n";
+      out_fp << "      \"sha256\": " << escape_json_string(meta.sha256_hex) << "\n";
+      out_fp << "    }";
+      if (index + 1 < inputs.size())
+        out_fp << ",";
+      out_fp << "\n";
+    }
+    out_fp << "  ],\n";
+    out_fp << "  \"dataset_sha256\": " << escape_json_string(dataset_sha) << "\n";
+    out_fp << "}\n";
+    if (!out_fp)
+    {
+      err = "tlg8: ラベルキャッシュメタデータの書き込みに失敗しました";
+      return false;
+    }
+    out_fp.close();
+    if (!out_fp)
+    {
+      err = "tlg8: ラベルキャッシュメタデータのクローズに失敗しました";
+      return false;
+    }
+
+    std::filesystem::rename(tmp_path, meta_path, ec);
+    if (ec)
+    {
+      std::filesystem::remove(meta_path, ec);
+      ec.clear();
+      std::filesystem::rename(tmp_path, meta_path, ec);
+      if (ec)
+      {
+        err = "tlg8: ラベルキャッシュメタデータの配置に失敗しました: " + meta_path.u8string();
+        return false;
+      }
+    }
+    return true;
   }
 }
 
@@ -448,6 +734,8 @@ namespace tlg::v8
                    double residual_bmp_emphasis,
                    const std::string &training_dump_path,
                    const std::string &training_image_tag,
+                   const std::string &label_cache_bin_path,
+                   const std::string &label_cache_meta_path,
                    bool force_hilbert_reorder,
                    std::string &err,
                    uint64_t *out_entropy_bits)
@@ -460,6 +748,12 @@ namespace tlg::v8
 
       if (out_entropy_bits)
         *out_entropy_bits = 0;
+
+      if ((!label_cache_bin_path.empty() || !label_cache_meta_path.empty()) && training_dump_path.empty())
+      {
+        err = "tlg8: ラベルキャッシュを出力する場合は学習データのダンプ先を指定してください";
+        return false;
+      }
 
       struct FileCloser
       {
@@ -515,6 +809,7 @@ namespace tlg::v8
       }
 
       std::unique_ptr<FILE, FileCloser> training_dump_file;
+      std::unique_ptr<FILE, FileCloser> label_cache_file;
       TrainingDumpContext training_context;
       if (!training_dump_path.empty())
       {
@@ -530,6 +825,37 @@ namespace tlg::v8
         training_context.image_width = src.width;
         training_context.image_height = src.height;
         training_context.components = static_cast<uint32_t>(desired_colors);
+        if (!label_cache_bin_path.empty() || !label_cache_meta_path.empty())
+        {
+          if (label_cache_bin_path.empty() || label_cache_meta_path.empty())
+          {
+            err = "tlg8: ラベルキャッシュの出力指定は bin と meta を同時に与えてください";
+            return false;
+          }
+          std::filesystem::path bin_path = std::filesystem::u8path(label_cache_bin_path);
+          if (!bin_path.parent_path().empty())
+          {
+            std::error_code ec;
+            std::filesystem::create_directories(bin_path.parent_path(), ec);
+            if (ec)
+            {
+              err = "tlg8: ラベルキャッシュの出力ディレクトリを作成できません: " + bin_path.parent_path().u8string();
+              return false;
+            }
+          }
+          FILE *bin_fp = std::fopen(label_cache_bin_path.c_str(), "wb");
+          if (!bin_fp)
+          {
+            err = "tlg8: ラベルキャッシュを書き出すファイルを開けません: " + label_cache_bin_path;
+            return false;
+          }
+          label_cache_file.reset(bin_fp);
+          training_context.label_cache.file = bin_fp;
+          training_context.label_cache.bin_path = label_cache_bin_path;
+          training_context.label_cache.meta_path = label_cache_meta_path;
+          training_context.label_cache.input_paths.push_back(training_dump_path);
+          training_context.label_cache.record_count = 0;
+        }
       }
       auto *training_ctx_ptr = training_dump_file ? &training_context : nullptr;
 
@@ -742,6 +1068,15 @@ namespace tlg::v8
 
       if (training_ctx_ptr && training_ctx_ptr->file)
         std::fflush(training_ctx_ptr->file);
+
+      if (training_ctx_ptr && training_ctx_ptr->label_cache.file)
+      {
+        std::fflush(training_ctx_ptr->label_cache.file);
+        training_ctx_ptr->label_cache.file = nullptr;
+        label_cache_file.reset();
+        if (!write_label_cache_meta(training_context.label_cache, err))
+          return false;
+      }
 
       return true;
     }

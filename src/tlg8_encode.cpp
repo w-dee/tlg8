@@ -74,6 +74,73 @@ namespace
   using tlg::v8::detail::bitio::BitWriter;
   using tlg::v8::detail::bitio::put_varuint;
   using tlg::v8::detail::bitio::varuint_bits;
+  using tlg::v8::TrainingDumpContext;
+
+  struct LabelRecord
+  {
+    uint32_t magic = 0x384C424Cu;
+    uint16_t version = 1u;
+    uint16_t reserved = 0u;
+    int16_t labels[12]{};
+    uint32_t crc32 = 0u;
+    uint8_t padding[92]{};
+  };
+
+  static_assert(sizeof(LabelRecord) == tlg::v8::kLabelRecordSize, "LabelRecord のサイズが想定値と一致しません");
+
+  void split_filter_code(int code, int16_t &perm, int16_t &primary, int16_t &secondary)
+  {
+    if (code < 0)
+    {
+      perm = -1;
+      primary = -1;
+      secondary = -1;
+      return;
+    }
+    perm = static_cast<int16_t>(((code >> 4) & 0x7) % 6);
+    primary = static_cast<int16_t>(((code >> 2) & 0x3) % 4);
+    secondary = static_cast<int16_t>((code & 0x3) % 4);
+  }
+
+  bool write_label_cache_record(TrainingDumpContext &ctx,
+                                uint32_t best_predictor,
+                                uint32_t best_filter,
+                                uint32_t best_reorder,
+                                uint32_t best_interleave,
+                                bool has_second,
+                                uint32_t second_predictor,
+                                uint32_t second_filter,
+                                uint32_t second_reorder,
+                                uint32_t second_interleave,
+                                std::string &err)
+  {
+    if (!ctx.label_cache.file)
+      return true;
+
+    LabelRecord record;
+    std::fill(std::begin(record.labels), std::end(record.labels), static_cast<int16_t>(-1));
+
+    record.labels[0] = static_cast<int16_t>(best_predictor);
+    split_filter_code(static_cast<int>(best_filter), record.labels[1], record.labels[2], record.labels[3]);
+    record.labels[4] = static_cast<int16_t>(best_reorder);
+    record.labels[5] = static_cast<int16_t>(best_interleave);
+
+    if (has_second)
+    {
+      record.labels[6] = static_cast<int16_t>(second_predictor);
+      split_filter_code(static_cast<int>(second_filter), record.labels[7], record.labels[8], record.labels[9]);
+      record.labels[10] = static_cast<int16_t>(second_reorder);
+      record.labels[11] = static_cast<int16_t>(second_interleave);
+    }
+
+    if (std::fwrite(&record, sizeof(record), 1, ctx.label_cache.file) != 1)
+    {
+      err = "tlg8: ラベルキャッシュの書き込みに失敗しました";
+      return false;
+    }
+    ++ctx.label_cache.record_count;
+    return true;
+  }
 
   // ヒストグラムで得た頻度の高い順に predictor を試行するためのインデックス列。
   constexpr std::array<uint32_t, kNumPredictors> kPredictorTrialOrder = {
@@ -856,6 +923,23 @@ namespace tlg::v8::enc
                           second_bits);
           std::fputc('}', ml_fp);
           std::fputc('\n', ml_fp);
+        }
+
+        if (training_ctx)
+        {
+          const bool has_second = (second_bits < std::numeric_limits<uint64_t>::max());
+          if (!write_label_cache_record(*training_ctx,
+                                        best_predictor,
+                                        best_filter,
+                                        best_reorder_index,
+                                        best_interleave,
+                                        has_second,
+                                        second_predictor,
+                                        second_filter,
+                                        second_reorder_index,
+                                        second_interleave,
+                                        err))
+            return false;
         }
 
         // 最小の推定ビット長を与えた組み合わせを採用する。
