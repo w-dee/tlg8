@@ -24,6 +24,27 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:  # 高速 JSON デコードが利用可能ならば切り替える
+    import orjson as _fastjson  # type: ignore[import]
+except Exception:  # pragma: no cover - orjson 未導入環境
+    _fastjson = None  # type: ignore[assignment]
+
+
+if _fastjson is not None:
+
+    def _json_loads(raw: bytes) -> Dict[str, object]:
+        """orjson を利用した高速 JSON デコード。"""
+
+        return _fastjson.loads(raw)
+
+
+else:
+
+    def _json_loads(raw: bytes) -> Dict[str, object]:
+        """標準 json によるフォールバック実装。"""
+
+        return json.loads(raw.decode("utf-8"))
+
 try:  # PyTorch を利用する場合にのみ必要
     import torch
     from torch.nn import functional as torch_F
@@ -552,13 +573,13 @@ class JsonlReader:
         handle.seek(offset)
         raw = handle.readline()
         try:
-            return json.loads(raw.decode("utf-8").strip())
-        except json.JSONDecodeError:
+            return _json_loads(raw.strip())
+        except Exception:
             handle.seek(offset)
             raw_retry = handle.readline()
             try:
-                return json.loads(raw_retry.decode("utf-8").strip())
-            except json.JSONDecodeError as exc:
+                return _json_loads(raw_retry.strip())
+            except Exception as exc:
                 if SKIP_BAD_RECORDS:
                     logging.warning(
                         "Skipping corrupt JSON at file_id=%d offset=%d",
@@ -599,14 +620,10 @@ def record_to_feature(record: Dict[str, object]) -> np.ndarray:
     if len(pixels) != expected_len:
         raise ValueError("pixels の長さがブロック構成と一致しません")
 
-    padded = np.zeros((MAX_COMPONENTS, MAX_BLOCK_PIXELS), dtype=np.float32)
-    offset = 0
-    for by in range(block_h):
-        for bx in range(block_w):
-            dest = by * BLOCK_EDGE + bx
-            for comp in range(components):
-                padded[comp, dest] = float(pixels[offset]) / 255.0
-                offset += 1
+    padded = np.zeros((MAX_COMPONENTS, BLOCK_EDGE, BLOCK_EDGE), dtype=np.float32)
+    arr = np.asarray(pixels, dtype=np.uint8, order="C")
+    arr = arr.reshape(block_h, block_w, components).transpose(2, 0, 1)
+    padded[:components, :block_h, :block_w] = arr / 255.0
     extra = np.array([block_w / 8.0, block_h / 8.0, components / 4.0], dtype=np.float32)
     feature = np.concatenate([padded.reshape(-1), extra])
     return feature
@@ -894,43 +911,43 @@ def open_indexed_dataset(
 def compute_feature_scaler_streaming(
     features: LazyFeatures,
     train_idx: np.ndarray,
-    batch_size: int = 4096,
+    batch_size: int = 32768,
     *,
     show_progress: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """訓練データの遅延読み出しで平均・標準偏差を算出する。"""
 
     feat_dim = features.shape[1]
-    mean = np.zeros((feat_dim,), dtype=np.float64)
-    m2 = np.zeros((feat_dim,), dtype=np.float64)
-    count = 0
+    total_sum = np.zeros((feat_dim,), dtype=np.float64)
+    total_sumsq = np.zeros((feat_dim,), dtype=np.float64)
+    total_count = 0
     progress = ProgressReporter(
         int(train_idx.shape[0]), "特徴量スケーラー算出中", unit="サンプル", enable=show_progress
     )
     for start in range(0, train_idx.shape[0], batch_size):
         batch_indices = train_idx[start : start + batch_size]
-        batch = features[batch_indices].astype(np.float64)
-        for row in batch:
-            count += 1
-            delta = row - mean
-            mean += delta / count
-            m2 += delta * (row - mean)
+        batch = np.asarray(features[batch_indices], dtype=np.float64, order="C")
+        total_sum += batch.sum(axis=0)
+        total_sumsq += np.square(batch).sum(axis=0)
+        total_count += batch.shape[0]
         progress.update(batch.shape[0])
     progress.close()
-    if count <= 1:
-        variance = np.ones_like(mean)
+    if total_count <= 1:
+        variance = np.ones_like(total_sum)
     else:
-        variance = m2 / (count - 1)
-    std = np.sqrt(np.maximum(variance, 1e-12)).astype(np.float32)
+        variance = (total_sumsq - (total_sum ** 2) / total_count) / (total_count - 1)
+    mean_fp64 = total_sum / max(total_count, 1)
+    variance = np.maximum(variance, 1e-12)
+    std = np.sqrt(variance).astype(np.float32)
     std[std < 1e-6] = 1.0
-    mean32 = mean.astype(np.float32)
+    mean = mean_fp64.astype(np.float32)
     logging.info(
         "Scaler: L2(mean)=%.6f, min(std)=%.6f, max(std)=%.6f",
-        float(np.linalg.norm(mean)),
+        float(np.linalg.norm(mean_fp64)),
         float(std.min()),
         float(std.max()),
     )
-    return mean32, std
+    return mean, std
 
 
 def slice_labels_lazy(labels: Dict[str, object], indices: np.ndarray) -> Dict[str, np.ndarray]:
@@ -1260,6 +1277,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="遅延読み出し時の実効ミニバッチ上限",
     )
     parser.add_argument(
+        "--scaler-batch",
+        type=int,
+        default=32768,
+        help="特徴量スケーラー算出時のバッチサイズ",
+    )
+    parser.add_argument(
         "--max-threads",
         type=int,
         default=0,
@@ -1283,6 +1306,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.max_batch <= 0:
         print("エラー: --max-batch には 1 以上を指定してください", file=sys.stderr)
+        return 1
+
+    if args.scaler_batch <= 0:
+        print("エラー: --scaler-batch には 1 以上を指定してください", file=sys.stderr)
         return 1
 
     global MAX_DECODE_THREADS, SKIP_BAD_RECORDS, ENABLE_PROGRESS
@@ -1373,7 +1400,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     total = int(index.shape[0])
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
-    mean, std = compute_feature_scaler_streaming(features, train_idx, show_progress=ENABLE_PROGRESS)
+    mean, std = compute_feature_scaler_streaming(
+        features,
+        train_idx,
+        batch_size=int(args.scaler_batch),
+        show_progress=ENABLE_PROGRESS,
+    )
     train_features = LazyFeatureSubset(features, train_idx)
     val_features = LazyFeatureSubset(features, val_idx)
     train_best = slice_labels_lazy(best_labels, train_idx)
