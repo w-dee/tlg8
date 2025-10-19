@@ -93,8 +93,8 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         if feature_std.ndim != 1 or feature_std.shape != feature_mean.shape:
             raise ValueError("feature_std は feature_mean と同じ形状である必要があります")
         input_dim = int(feature_mean.shape[0])
-        if input_dim != 1536:
-            raise ValueError("入力特徴量次元が 1536 以外です")
+        if input_dim <= 0:
+            raise ValueError("入力特徴量次元が正の値ではありません")
         self.input_dim = input_dim
         self.hidden_dim = 384
         self.dropout_rate = float(np.clip(dropout, 0.0, 0.9))
