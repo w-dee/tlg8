@@ -85,6 +85,7 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         feature_std: np.ndarray,
         *,
         dropout: float = 0.1,
+        disabled_heads: Sequence[str] = (),
     ) -> None:
         torch_mod = _ensure_torch()
         super().__init__()
@@ -108,9 +109,17 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self.fc3 = nn.Linear(1536, self.hidden_dim)
         self.dropout1 = nn.Dropout(self.dropout_rate)
         self.dropout2 = nn.Dropout(self.dropout_rate)
+        disabled_set = {name for name in disabled_heads}
+        unknown = disabled_set - set(HEAD_ORDER)
+        if unknown:
+            raise ValueError(f"無効化対象のヘッド名が不正です: {sorted(unknown)}")
+        self.active_heads: Tuple[str, ...] = tuple(
+            name for name in HEAD_ORDER if name not in disabled_set
+        )
         heads: Dict[str, nn.Linear] = {}
         for name, classes in HEAD_SPECS.items():
-            heads[name] = nn.Linear(self.hidden_dim, classes)
+            if name in self.active_heads:
+                heads[name] = nn.Linear(self.hidden_dim, classes)
         self.heads = nn.ModuleDict(heads)
         self.inference_temperature: float = 1.0
 
@@ -129,7 +138,7 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         h = self.dropout2(h)
         h = F.gelu(self.fc3(h))
         outputs: Dict[str, torch.Tensor] = {}
-        for name in HEAD_ORDER:
+        for name in self.active_heads:
             outputs[name] = self.heads[name](h)
         return outputs
 
@@ -165,12 +174,26 @@ class TorchMultiTask(nn.Module if nn is not None else object):
                 bias = np.asarray(state[bias_key], dtype=np.float32)
                 layer.weight.data.copy_(torch_mod.from_numpy(weight.T))
                 layer.bias.data.copy_(torch_mod.from_numpy(bias))
-            for name in HEAD_ORDER:
-                weight = np.asarray(state[f"head_{name}_W"], dtype=np.float32)
-                bias = np.asarray(state[f"head_{name}_b"], dtype=np.float32)
+            available = state.get("active_heads")
+            if available is not None:
+                active = [str(name) for name in np.asarray(available).tolist()]
+            else:
+                active = list(HEAD_ORDER)
+            active_loaded: List[str] = []
+            for name in active:
+                if name not in self.heads:
+                    continue
+                weight_key = f"head_{name}_W"
+                bias_key = f"head_{name}_b"
+                if weight_key not in state or bias_key not in state:
+                    raise KeyError(f"NPZ に {weight_key}/{bias_key} が見つかりません")
+                weight = np.asarray(state[weight_key], dtype=np.float32)
+                bias = np.asarray(state[bias_key], dtype=np.float32)
                 head = self.heads[name]
                 head.weight.data.copy_(torch_mod.from_numpy(weight.T))
                 head.bias.data.copy_(torch_mod.from_numpy(bias))
+                active_loaded.append(name)
+            self.active_heads = tuple(active_loaded)
 
     def save_torch(self, path: str) -> None:
         """state_dict とスケーラ情報を保存する。"""
@@ -224,14 +247,17 @@ def predict_logits_batched(
         squeeze = False
         total = int(getattr(features, "shape")[0])  # type: ignore[index]
         fetch = lambda start, end: np.asarray(features[start:end], dtype=np.float32)  # type: ignore[index]
+    active_heads = tuple(getattr(model, "active_heads", HEAD_ORDER))
     if total == 0:
         return {
-            name: np.empty((0, HEAD_SPECS[name]), dtype=np.float32) if not squeeze else np.empty((HEAD_SPECS[name],), dtype=np.float32)
-            for name in HEAD_ORDER
+            name: np.empty((0, HEAD_SPECS[name]), dtype=np.float32)
+            if not squeeze
+            else np.empty((HEAD_SPECS[name],), dtype=np.float32)
+            for name in active_heads
         }
     outputs: Dict[str, np.ndarray] = {
         name: np.empty((total, HEAD_SPECS[name]), dtype=np.float32)
-        for name in HEAD_ORDER
+        for name in active_heads
     }
     was_training = model.training  # type: ignore[attr-defined]
     model.eval()
@@ -242,12 +268,12 @@ def predict_logits_batched(
             xb = torch_mod.from_numpy(batch_np).to(device=device, dtype=torch_mod.float32)
             with _autocast_cm(device, amp):
                 logits = model(xb)
-            for name in HEAD_ORDER:
+            for name in active_heads:
                 outputs[name][start:end] = logits[name].detach().cpu().numpy()
     if was_training:
         model.train()
     if squeeze:
-        return {name: outputs[name][0] for name in HEAD_ORDER}
+        return {name: outputs[name][0] for name in active_heads}
     return outputs
 
 
@@ -400,6 +426,8 @@ class MultiTaskModel:
         dropout: float,
         feature_mean: np.ndarray,
         feature_std: np.ndarray,
+        *,
+        disabled_heads: Sequence[str] = (),
     ) -> None:
         if input_dim <= 0:
             raise ValueError("input_dim は正の整数である必要があります")
@@ -417,6 +445,14 @@ class MultiTaskModel:
         self.head_weights: Dict[str, np.ndarray] = {}
         self.head_biases: Dict[str, np.ndarray] = {}
         self.inference_temperature: float = 1.0
+        disabled_set = {name for name in disabled_heads}
+        unknown = disabled_set - set(HEAD_ORDER)
+        if unknown:
+            raise ValueError(f"無効化対象のヘッド名が不正です: {sorted(unknown)}")
+        self.active_heads: Tuple[str, ...] = tuple(
+            name for name in HEAD_ORDER if name not in disabled_set
+        )
+        self.disabled_heads: Tuple[str, ...] = tuple(disabled_set)
 
     def _standardize_batch(self, features: np.ndarray) -> np.ndarray:
         """特徴量を平均・標準偏差で正規化する。"""
@@ -453,6 +489,8 @@ class MultiTaskModel:
         self.head_biases = {}
         last_dim = self.hidden_dims[-1]
         for name, classes in HEAD_SPECS.items():
+            if name not in self.active_heads:
+                continue
             scale = np.sqrt(2.0 / last_dim)
             self.head_weights[name] = rng.normal(scale=scale, size=(last_dim, classes)).astype(
                 np.float64
@@ -473,7 +511,8 @@ class MultiTaskModel:
         for idx, (W, b) in enumerate(zip(self.trunk_weights, self.trunk_biases)):
             state[f"trunk_W{idx}"] = W.astype(np.float32)
             state[f"trunk_b{idx}"] = b.astype(np.float32)
-        for name in HEAD_ORDER:
+        state["active_heads"] = np.asarray(self.active_heads, dtype="U16")
+        for name in self.active_heads:
             state[f"head_{name}_W"] = self.head_weights[name].astype(np.float32)
             state[f"head_{name}_b"] = self.head_biases[name].astype(np.float32)
         return state
@@ -501,11 +540,22 @@ class MultiTaskModel:
             self.trunk_weights.append(state[key_w].astype(np.float64))
             self.trunk_biases.append(state[key_b].astype(np.float64))
             idx += 1
+        active_arr = state.get("active_heads")
+        if active_arr is not None:
+            active_names = [str(name) for name in np.asarray(active_arr).tolist()]
+        else:
+            active_names = list(HEAD_ORDER)
+        self.active_heads = tuple(active_names)
+        self.disabled_heads = tuple(name for name in HEAD_ORDER if name not in self.active_heads)
         self.head_weights = {}
         self.head_biases = {}
-        for name in HEAD_ORDER:
-            self.head_weights[name] = state[f"head_{name}_W"].astype(np.float64)
-            self.head_biases[name] = state[f"head_{name}_b"].astype(np.float64)
+        for name in self.active_heads:
+            weight_key = f"head_{name}_W"
+            bias_key = f"head_{name}_b"
+            if weight_key not in state or bias_key not in state:
+                raise KeyError(f"状態に {weight_key}/{bias_key} が見つかりません")
+            self.head_weights[name] = state[weight_key].astype(np.float64)
+            self.head_biases[name] = state[bias_key].astype(np.float64)
 
     def save(self, path: str) -> None:
         """モデル状態を NPZ 形式で保存する。"""
@@ -618,7 +668,7 @@ class MultiTaskModel:
         total_loss = 0.0
         grads_w: Dict[str, np.ndarray] = {}
         grads_b: Dict[str, np.ndarray] = {}
-        for name in HEAD_ORDER:
+        for name in self.active_heads:
             W = self.head_weights[name]
             b = self.head_biases[name]
             logits = hidden @ W + b
@@ -631,7 +681,7 @@ class MultiTaskModel:
             grads_w[name] = hidden.T @ diff + weight_decay * W
             grads_b[name] = diff.sum(axis=0)
             total_loss += float(loss)
-        for name in HEAD_ORDER:
+        for name in self.active_heads:
             self.head_weights[name] -= lr * grads_w[name]
             self.head_biases[name] -= lr * grads_b[name]
         return total_loss, grad_hidden
@@ -668,7 +718,7 @@ class MultiTaskModel:
             activations, _, _ = self._forward_trunk(standardized, training=False, rng=rng)
             hidden = activations[-1]
             logits: Dict[str, np.ndarray] = {}
-            for name in HEAD_ORDER:
+            for name in self.active_heads:
                 out = hidden @ self.head_weights[name] + self.head_biases[name]
                 if squeeze:
                     logits[name] = out[0]
@@ -678,13 +728,13 @@ class MultiTaskModel:
 
         sample_count = int(getattr(features, "shape")[0])  # type: ignore[index]
         if sample_count == 0:
-            return {name: np.empty((0, HEAD_SPECS[name]), dtype=np.float64) for name in HEAD_ORDER}
+            return {name: np.empty((0, HEAD_SPECS[name]), dtype=np.float64) for name in self.active_heads}
 
         rng = np.random.default_rng(0)
         batch_size = min(8192, sample_count)
         outputs: Dict[str, np.ndarray] = {
             name: np.empty((sample_count, HEAD_SPECS[name]), dtype=np.float64)
-            for name in HEAD_ORDER
+            for name in self.active_heads
         }
         position = 0
         while position < sample_count:
@@ -692,7 +742,7 @@ class MultiTaskModel:
             batch_idx = np.arange(position, end, dtype=np.int64)
             batch = features[batch_idx]
             hidden, _, _, _ = self._forward_hidden(batch, rng, training=False)
-            for name in HEAD_ORDER:
+            for name in self.active_heads:
                 outputs[name][position:end] = hidden @ self.head_weights[name] + self.head_biases[name]
             position = end
         return outputs
@@ -743,8 +793,14 @@ def train_multitask_model(
     model.dropout = float(np.clip(config.dropout, 0.0, 0.9))
     model.initialize(rng)
 
+    active_heads = tuple(getattr(model, "active_heads", HEAD_ORDER))
+    if not active_heads:
+        raise ValueError("学習対象ヘッドが存在しません")
+
+    head_list = list(active_heads)
+
     train_targets: Dict[str, np.ndarray] = {}
-    for name in HEAD_ORDER:
+    for name in active_heads:
         train_targets[name] = build_soft_targets(
             train_labels[name], train_second[name], HEAD_SPECS[name], config.epsilon_soft
         )
@@ -790,21 +846,19 @@ def train_multitask_model(
         val_logits = model.predict_logits(val_features)
         train_metrics: Dict[str, Dict[str, float]] = {}
         val_metrics: Dict[str, Dict[str, float]] = {}
-        for name in HEAD_ORDER:
+        for name in active_heads:
             train_metrics[name] = compute_metrics(
                 train_logits[name], train_labels[name], train_second[name]
             )
             val_metrics[name] = compute_metrics(
                 val_logits[name], val_labels[name], val_second[name]
             )
-        mean_top3 = float(
-            np.mean([val_metrics[name]["top3"] for name in HEAD_ORDER])
-        )
+        mean_top3 = float(np.mean([val_metrics[name]["top3"] for name in head_list]))
         mean_three_choice = float(
-            np.mean([val_metrics[name]["three_choice"] for name in HEAD_ORDER])
+            np.mean([val_metrics[name]["three_choice"] for name in head_list])
         )
-        mean_top1 = float(np.mean([val_metrics[name]["top1"] for name in HEAD_ORDER]))
-        mean_top2 = float(np.mean([val_metrics[name]["top2"] for name in HEAD_ORDER]))
+        mean_top1 = float(np.mean([val_metrics[name]["top1"] for name in head_list]))
+        mean_top2 = float(np.mean([val_metrics[name]["top2"] for name in head_list]))
         print(
             "epoch {epoch:03d}: loss={loss:.4f} val_top3={top3:.2f}% "
             "val_three={three:.2f}% val_top1={top1:.2f}% val_top2={top2:.2f}%".format(
@@ -868,6 +922,6 @@ def evaluate_multitask(
 
     logits = model.predict_logits(features)
     metrics: Dict[str, Dict[str, float]] = {}
-    for name in HEAD_ORDER:
+    for name in getattr(model, "active_heads", HEAD_ORDER):
         metrics[name] = compute_metrics(logits[name], labels[name], second[name])
     return metrics

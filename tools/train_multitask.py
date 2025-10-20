@@ -210,6 +210,27 @@ def split_dataset(count: int, test_ratio: float, seed: int) -> Tuple[np.ndarray,
     return indices[:train_count], indices[train_count:]
 
 
+def parse_condition_head_list(raw: str) -> Tuple[str, ...]:
+    """条件付き入力として利用するヘッド一覧を解析する。"""
+
+    if not raw:
+        return ()
+    entries = [item.strip() for item in raw.split(",") if item.strip()]
+    if not entries:
+        return ()
+    allowed = set(HEAD_ORDER)
+    result: List[str] = []
+    seen: set[str] = set()
+    for name in entries:
+        if name not in allowed:
+            raise ValueError(f"未知のヘッド名が指定されました: {name}")
+        if name in seen:
+            continue
+        result.append(name)
+        seen.add(name)
+    return tuple(result)
+
+
 def _split_filter_code(code: int) -> Tuple[int, int, int]:
     """96 種類のカラー相関フィルターコードを 3 要素に分解する。"""
 
@@ -895,6 +916,84 @@ class LazyFeatureSubset:
         return batch
 
 
+def _encode_onehot(ids: np.ndarray, class_count: int) -> np.ndarray:
+    """1 次元 ID 配列をワンホット表現に変換する。"""
+
+    ids32 = ids.astype(np.int32, copy=False)
+    out = np.zeros((ids32.shape[0], class_count), dtype=np.float32)
+    if ids32.size == 0:
+        return out
+    valid = (ids32 >= 0) & (ids32 < class_count)
+    if not np.any(valid):
+        return out
+    rows = np.nonzero(valid)[0]
+    out[rows, ids32[valid]] = 1.0
+    return out
+
+
+class AugmentedFeatures:
+    """条件付きヘッドの情報を結合した特徴量ビュー。"""
+
+    def __init__(
+        self,
+        base: object,
+        cond_arrays: Dict[str, np.ndarray],
+        cond_specs: Sequence[Tuple[str, int]],
+        *,
+        encoding: str = "onehot",
+    ) -> None:
+        self._base = base
+        self._specs = list(cond_specs)
+        self._encoding = (encoding or "onehot").lower()
+        if self._encoding not in ("onehot", "id"):
+            raise ValueError(f"未知の条件エンコーディングです: {encoding}")
+        if hasattr(base, "__len__"):
+            self._length = int(len(base))  # type: ignore[arg-type]
+        else:
+            self._length = int(getattr(base, "shape")[0])  # type: ignore[index]
+        base_shape = getattr(base, "shape")
+        base_dim = int(base_shape[1])  # type: ignore[index]
+        self._cond_arrays: Dict[str, np.ndarray] = {
+            name: np.asarray(arr, dtype=np.int16)
+            for name, arr in cond_arrays.items()
+        }
+        for name, _classes in self._specs:
+            if name not in self._cond_arrays:
+                raise KeyError(f"条件付き配列が見つかりません: {name}")
+            if self._cond_arrays[name].shape[0] != self._length:
+                raise ValueError("条件付き配列の長さが特徴量と一致しません")
+        extra = sum((cls if self._encoding == "onehot" else 1) for _, cls in self._specs)
+        self._shape = (self._length, base_dim + extra)
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self._shape
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, idx: object) -> np.ndarray:
+        rows, scalar = _normalize_indices(idx, self._length)
+        base_batch = self._base[rows]
+        batch = np.asarray(base_batch, dtype=np.float32)
+        if batch.ndim == 1:
+            batch = batch[None, :]
+        extras: List[np.ndarray] = []
+        for name, classes in self._specs:
+            ids = np.asarray(self._cond_arrays[name][rows], dtype=np.int32)
+            if ids.ndim == 0:
+                ids = ids.reshape(1)
+            if self._encoding == "onehot":
+                extras.append(_encode_onehot(ids, classes))
+            else:
+                extras.append(ids.astype(np.float32, copy=False).reshape(-1, 1))
+        if extras:
+            batch = np.concatenate([batch] + extras, axis=1)
+        if scalar:
+            return batch[0]
+        return batch
+
+
 def open_indexed_dataset(
     paths: Sequence[Path],
     cache_path: Optional[Path],
@@ -1082,8 +1181,11 @@ def macro_average(metrics: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     result: Dict[str, float] = {}
     if not metrics:
         return result
+    heads = [name for name in HEAD_ORDER if name in metrics]
+    if not heads:
+        heads = list(metrics.keys())
     for key in ("top1", "top2", "top3", "three_choice"):
-        values = [metrics[name].get(key, float("nan")) for name in HEAD_ORDER]
+        values = [metrics[name].get(key, float("nan")) for name in heads]
         result[key] = float(np.nanmean(values))
     return result
 
@@ -1100,14 +1202,15 @@ def _amp_context(device: "torch.device", amp_mode: str):
 
 def train_with_torch_backend(
     args: argparse.Namespace,
-    train_features: "LazyFeatureSubset",
+    train_features: object,
     train_best: Dict[str, np.ndarray],
     train_second: Dict[str, np.ndarray],
-    val_features: "LazyFeatureSubset",
+    val_features: object,
     val_best: Dict[str, np.ndarray],
     val_second: Dict[str, np.ndarray],
     mean: np.ndarray,
     std: np.ndarray,
+    disabled_heads: Sequence[str],
 ) -> Tuple[TorchMultiTask, Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     """PyTorch バックエンドでマルチタスクモデルを学習する。"""
 
@@ -1130,7 +1233,7 @@ def train_with_torch_backend(
             logging.warning("CPU が bfloat16 をサポートしていないため AMP を無効化します")
             amp_mode = "none"
 
-    model = TorchMultiTask(mean, std, dropout=args.dropout)
+    model = TorchMultiTask(mean, std, dropout=args.dropout, disabled_heads=disabled_heads)
     model.inference_temperature = max(float(args.temperature), 1e-6)
     model.to(device)
 
@@ -1147,8 +1250,14 @@ def train_with_torch_backend(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    active_heads = tuple(getattr(model, "active_heads", HEAD_ORDER))
+    if not active_heads:
+        raise ValueError("学習対象ヘッドが存在しません")
+
+    head_list = list(active_heads)
+
     train_targets: Dict[str, np.ndarray] = {}
-    for name in HEAD_ORDER:
+    for name in active_heads:
         train_targets[name] = build_soft_targets(
             train_best[name],
             train_second[name],
@@ -1194,14 +1303,14 @@ def train_with_torch_backend(
             features_np = np.asarray(train_features[batch_idx], dtype=np.float32)
             xb = torch.from_numpy(features_np).to(device=device, dtype=torch.float32)
             target_tensors: Dict[str, torch.Tensor] = {}
-            for name in HEAD_ORDER:
+            for name in active_heads:
                 probs = train_targets[name][batch_idx]
                 target_tensors[name] = torch.from_numpy(probs).to(device=device, dtype=torch.float32)
             optimizer.zero_grad(set_to_none=True)
             with _amp_context(device, amp_mode):
                 logits = model_forward(xb)
                 loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
-                for name in HEAD_ORDER:
+                for name in active_heads:
                     log_probs = torch_F.log_softmax(logits[name], dim=1)
                     loss_tensor = loss_tensor + torch_F.kl_div(
                         log_probs, target_tensors[name], reduction="batchmean"
@@ -1240,14 +1349,14 @@ def train_with_torch_backend(
 
         train_metrics: Dict[str, Dict[str, float]] = {}
         val_metrics: Dict[str, Dict[str, float]] = {}
-        for name in HEAD_ORDER:
+        for name in active_heads:
             train_metrics[name] = compute_metrics(train_logits[name], train_best[name], train_second[name])
             val_metrics[name] = compute_metrics(val_logits[name], val_best[name], val_second[name])
 
-        mean_top3 = float(np.mean([val_metrics[name]["top3"] for name in HEAD_ORDER]))
-        mean_three_choice = float(np.mean([val_metrics[name]["three_choice"] for name in HEAD_ORDER]))
-        mean_top1 = float(np.mean([val_metrics[name]["top1"] for name in HEAD_ORDER]))
-        mean_top2 = float(np.mean([val_metrics[name]["top2"] for name in HEAD_ORDER]))
+        mean_top3 = float(np.mean([val_metrics[name]["top3"] for name in head_list]))
+        mean_three_choice = float(np.mean([val_metrics[name]["three_choice"] for name in head_list]))
+        mean_top1 = float(np.mean([val_metrics[name]["top1"] for name in head_list]))
+        mean_top2 = float(np.mean([val_metrics[name]["top2"] for name in head_list]))
         print(
             "epoch {epoch:03d}: loss={loss:.4f} val_top3={top3:.2f}% val_three={three:.2f}% val_top1={top1:.2f}% val_top2={top2:.2f}%".format(
                 epoch=epoch + 1,
@@ -1289,6 +1398,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=512, help="ミニバッチサイズ")
     parser.add_argument("--seed", type=int, default=42, help="乱数シード")
     parser.add_argument("--dropout", type=float, default=0.1, help="ドロップアウト率")
+    parser.add_argument(
+        "--condition-heads",
+        type=str,
+        default="",
+        help="条件付き入力として利用するヘッド名をカンマ区切りで指定",
+    )
+    parser.add_argument(
+        "--condition-encoding",
+        choices=["onehot", "id"],
+        default="onehot",
+        help="条件付きヘッドを結合する際のエンコーディング方式",
+    )
     parser.add_argument("--hidden-dims", type=int, nargs="*", default=[1024, 512, 256], help="(NumPy バックエンド用) 隠れ層ユニット数")
     parser.add_argument("--epsilon-soft", type=float, default=0.2, help="第 2 候補に割り当てる確率質量")
     parser.add_argument("--test-ratio", type=float, default=0.2, help="評価データ比率")
@@ -1347,6 +1468,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     backend = args.backend.lower()
     if args.amp is None:
         args.amp = "bf16" if backend == "torch" and args.device == "xpu" else "none"
+
+    try:
+        cond_heads = parse_condition_head_list(args.condition_heads)
+    except ValueError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 1
+    condition_encoding = args.condition_encoding.lower()
+    args.condition_encoding = condition_encoding
+    disabled_heads_set = set(cond_heads)
+    active_heads = [name for name in HEAD_ORDER if name not in disabled_heads_set]
+    if not active_heads:
+        print("エラー: 条件付きヘッドの指定により学習対象ヘッドが空になりました", file=sys.stderr)
+        return 1
+    cond_specs = [(name, HEAD_SPECS[name]) for name in cond_heads]
+    disabled_heads_tuple = tuple(disabled_heads_set)
+    if cond_heads:
+        logging.info(
+            "Conditioned heads: %s (encoding: %s)",
+            ", ".join(cond_heads),
+            condition_encoding,
+        )
+    else:
+        logging.info("Conditioned heads: (none)")
+    logging.info("Active heads for training: %s", ", ".join(active_heads))
 
     if args.max_batch <= 0:
         print("エラー: --max-batch には 1 以上を指定してください", file=sys.stderr)
@@ -1443,12 +1588,35 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     total = int(index.shape[0])
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
+
+    cond_best_sources = {name: best_labels[name] for name in cond_heads}
+    cond_best_train: Dict[str, np.ndarray] = {}
+    cond_best_val: Dict[str, np.ndarray] = {}
+    for name in cond_heads:
+        cond_best_train[name] = np.asarray(cond_best_sources[name][train_idx], dtype=np.int16)
+        cond_best_val[name] = np.asarray(cond_best_sources[name][val_idx], dtype=np.int16)
+
+    train_features_base = LazyFeatureSubset(features, train_idx)
+    val_features_base = LazyFeatureSubset(features, val_idx)
+    train_features = AugmentedFeatures(
+        train_features_base,
+        cond_best_train,
+        cond_specs,
+        encoding=args.condition_encoding,
+    )
+    val_features = AugmentedFeatures(
+        val_features_base,
+        cond_best_val,
+        cond_specs,
+        encoding=args.condition_encoding,
+    )
+
     mean_std_loaded = False
     stats_count: Optional[int] = None
     if args.feature_stats_bin is not None:
         try:
             loaded_mean, loaded_std, stats_count = load_feature_scaler_from_binary(
-                args.feature_stats_bin, feature_dim
+                args.feature_stats_bin, train_features.shape[1]
             )
         except FileNotFoundError:
             logging.warning("特徴量統計 %s が見つかりません", args.feature_stats_bin)
@@ -1471,18 +1639,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
 
     if not mean_std_loaded:
+        scaler_indices = np.arange(len(train_features), dtype=np.int64)
         mean, std = compute_feature_scaler_streaming(
-            features,
-            train_idx,
+            train_features,
+            scaler_indices,
             batch_size=int(args.scaler_batch),
             show_progress=ENABLE_PROGRESS,
         )
-    train_features = LazyFeatureSubset(features, train_idx)
-    val_features = LazyFeatureSubset(features, val_idx)
-    train_best = slice_labels_lazy(best_labels, train_idx)
-    train_second = slice_labels_lazy(second_labels, train_idx)
-    val_best = slice_labels_lazy(best_labels, val_idx)
-    val_second = slice_labels_lazy(second_labels, val_idx)
+
+    active_best_labels = {name: best_labels[name] for name in active_heads}
+    active_second_labels = {name: second_labels[name] for name in active_heads}
+    train_best = slice_labels_lazy(active_best_labels, train_idx)
+    train_second = slice_labels_lazy(active_second_labels, train_idx)
+    val_best = slice_labels_lazy(active_best_labels, val_idx)
+    val_second = slice_labels_lazy(active_second_labels, val_idx)
 
     args.batch_size = min(int(args.batch_size), int(args.max_batch))
 
@@ -1498,7 +1668,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed,
         )
 
-        model = MultiTaskModel(features.shape[1], args.hidden_dims, args.dropout, mean, std)
+        model = MultiTaskModel(
+            train_features.shape[1],
+            args.hidden_dims,
+            args.dropout,
+            mean,
+            std,
+            disabled_heads=disabled_heads_tuple,
+        )
         model.inference_temperature = max(float(args.temperature), 1e-6)
         model, train_metrics, val_metrics = train_multitask_model(
             model,
@@ -1512,7 +1689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         print("\n=== 訓練データ精度 ===")
-        for name in HEAD_ORDER:
+        for name in active_heads:
             print(f"{name:16s}: {format_metrics(train_metrics.get(name, {}))}")
         train_macro = macro_average(train_metrics)
         if train_macro:
@@ -1523,7 +1700,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
         print("\n=== 評価データ精度 ===")
-        for name in HEAD_ORDER:
+        for name in active_heads:
             print(f"{name:16s}: {format_metrics(val_metrics.get(name, {}))}")
         val_macro = macro_average(val_metrics)
         if val_macro:
@@ -1550,13 +1727,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 val_second,
                 mean,
                 std,
+                disabled_heads_tuple,
             )
         except ImportError as exc:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
 
         print("\n=== 訓練データ精度 ===")
-        for name in HEAD_ORDER:
+        for name in active_heads:
             print(f"{name:16s}: {format_metrics(train_metrics.get(name, {}))}")
         train_macro = macro_average(train_metrics)
         if train_macro:
@@ -1567,7 +1745,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
         print("\n=== 評価データ精度 ===")
-        for name in HEAD_ORDER:
+        for name in active_heads:
             print(f"{name:16s}: {format_metrics(val_metrics.get(name, {}))}")
         val_macro = macro_average(val_metrics)
         if val_macro:
