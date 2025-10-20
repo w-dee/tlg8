@@ -1273,25 +1273,15 @@ def train_with_torch_backend(
     train_count = len(train_features)
     rng = np.random.default_rng(args.seed)
     total_batches = max(1, (train_count + args.batch_size - 1) // args.batch_size)
-    digits = len(str(total_batches))
-    bar_width = 30
 
     for epoch in range(args.epochs):
         indices = rng.permutation(train_count)
-        progress_rendered = False
-
-        def report_progress(batch_idx: int, total: int) -> None:
-            nonlocal progress_rendered
-            if not ENABLE_PROGRESS:
-                return
-            progress_rendered = True
-            ratio = min(max(batch_idx / total, 0.0), 1.0)
-            filled = min(bar_width, max(0, int(round(ratio * bar_width))))
-            bar = "#" * filled + "-" * (bar_width - filled)
-            sys.stdout.write(
-                f"\rエポック {epoch + 1:03d} {batch_idx:>{digits}}/{total} [{bar}] {ratio * 100:6.2f}%"
-            )
-            sys.stdout.flush()
+        progress = ProgressReporter(
+            total_batches,
+            f"エポック {epoch + 1:03d}",
+            unit="バッチ",
+            enable=ENABLE_PROGRESS,
+        )
 
         model.train()
         model_forward.train()
@@ -1320,10 +1310,9 @@ def train_with_torch_backend(
             batch_size_actual = batch_idx.shape[0]
             epoch_loss += float(loss_tensor.detach().cpu()) * batch_size_actual
             sample_seen += batch_size_actual
-            report_progress(batch_no, total_batches)
+            progress.update(1)
 
-        if progress_rendered:
-            sys.stdout.write("\n")
+        progress.close()
 
         mean_loss = epoch_loss / max(1, sample_seen)
 
