@@ -60,6 +60,7 @@ from multitask_model import (
     TrainConfig,
     build_soft_targets,
     compute_metrics,
+    conditioned_extra_dim,
     pick_device,
     predict_logits_batched,
     train_multitask_model,
@@ -80,6 +81,18 @@ LABEL_FIELD_OFFSET = 8  # ヘッダー 8 バイト分の後にラベル本体が
 FEATURE_STATS_MAGIC = b"FSC8"
 FEATURE_STATS_VERSION = 1
 FEATURE_STATS_HEADER = struct.Struct("<4sIIQ")
+
+
+class FeatureStatsDimensionError(ValueError):
+    """特徴量統計の次元不一致を通知する例外。"""
+
+    def __init__(self, expected: int, actual: int) -> None:
+        super().__init__(
+            f"特徴量統計の次元数が入力データと一致しません (expected={expected}, actual={actual})"
+        )
+        self.expected = int(expected)
+        self.actual = int(actual)
+
 
 try:
     from tqdm import tqdm
@@ -1064,9 +1077,7 @@ def load_feature_scaler_from_binary(path: Path, expected_dim: int) -> Tuple[np.n
         if magic != FEATURE_STATS_MAGIC or version != FEATURE_STATS_VERSION:
             raise ValueError(f"特徴量統計ファイルのマジック/バージョンが不正です: {path}")
         if dimension != expected_dim:
-            raise ValueError(
-                f"特徴量統計の次元数が入力データと一致しません (expected={expected_dim}, actual={dimension})"
-            )
+            raise FeatureStatsDimensionError(expected_dim, dimension)
         sum_bytes = fp.read(8 * dimension)
         if len(sum_bytes) != 8 * dimension:
             raise ValueError("特徴量統計ファイルの sum 部が不足しています")
@@ -1417,6 +1428,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="事前計算した特徴量統計バイナリのパス",
     )
     parser.add_argument(
+        "--import-scaler",
+        type=Path,
+        default=None,
+        help="事前計算済みの特徴量スケーラー (.npz) のパス",
+    )
+    parser.add_argument(
+        "--export-scaler",
+        type=Path,
+        default=None,
+        help="算出した特徴量スケーラー (.npz) の保存先",
+    )
+    parser.add_argument(
         "--progress",
         action="store_true",
         default=True,
@@ -1600,41 +1623,89 @@ def main(argv: Sequence[str] | None = None) -> int:
         encoding=args.condition_encoding,
     )
 
+    final_feature_dim = int(train_features.shape[1])
+    expected_feature_dim = feature_dim + conditioned_extra_dim(cond_heads, args.condition_encoding)
+    if expected_feature_dim != final_feature_dim:
+        logging.debug(
+            "条件付き特徴量次元が想定値と一致しません (expected=%d, actual=%d)",
+            expected_feature_dim,
+            final_feature_dim,
+        )
+    cond_desc = f"heads={','.join(cond_heads) if cond_heads else '(none)'} encoding={args.condition_encoding}"
+
     mean_std_loaded = False
     stats_count: Optional[int] = None
-    if args.feature_stats_bin is not None:
-        try:
-            loaded_mean, loaded_std, stats_count = load_feature_scaler_from_binary(
-                args.feature_stats_bin, train_features.shape[1]
-            )
-        except FileNotFoundError:
-            logging.warning("特徴量統計 %s が見つかりません", args.feature_stats_bin)
-        except ValueError as exc:
-            logging.warning("特徴量統計の読み込みに失敗しました: %s", exc)
-        else:
-            mean = loaded_mean
-            std = loaded_std
-            mean_std_loaded = True
-            logging.info(
-                "特徴量スケーラーを %s から読み込みました (サンプル数=%d)",
-                args.feature_stats_bin,
-                stats_count,
-            )
-            if stats_count is not None and stats_count != total:
-                logging.warning(
-                    "特徴量統計のサンプル数 %d がデータセット行数 %d と一致しません",
-                    stats_count,
-                    total,
-                )
+    scaler_source = ""
+    mean = np.zeros((final_feature_dim,), dtype=np.float32)
+    std = np.ones((final_feature_dim,), dtype=np.float32)
 
-    if not mean_std_loaded:
-        scaler_indices = np.arange(len(train_features), dtype=np.int64)
-        mean, std = compute_feature_scaler_streaming(
-            train_features,
-            scaler_indices,
-            batch_size=int(args.scaler_batch),
-            show_progress=ENABLE_PROGRESS,
-        )
+    if args.import_scaler is not None:
+        import_path = Path(args.import_scaler)
+        with np.load(import_path) as data:
+            if 'mean' not in data or 'std' not in data:
+                raise RuntimeError("インポートしたスケーラーに mean/std が含まれていません")
+            loaded_mean = np.asarray(data['mean'], dtype=np.float32)
+            loaded_std = np.asarray(data['std'], dtype=np.float32)
+        if loaded_mean.shape[0] != final_feature_dim or loaded_std.shape[0] != final_feature_dim:
+            raise RuntimeError(
+                f"インポートしたスケーラーの次元が一致しません (expected={final_feature_dim}, actual_mean={loaded_mean.shape[0]}, actual_std={loaded_std.shape[0]}). 条件: {cond_desc}"
+            )
+        mean = loaded_mean
+        std = loaded_std
+        mean_std_loaded = True
+        scaler_source = f"import:{import_path}"
+        logging.info("特徴量スケーラーを %s からインポートしました (次元=%d)", import_path, final_feature_dim)
+    else:
+        if args.feature_stats_bin is not None:
+            try:
+                loaded_mean, loaded_std, stats_count = load_feature_scaler_from_binary(
+                    args.feature_stats_bin, final_feature_dim
+                )
+            except FileNotFoundError:
+                logging.warning("特徴量統計 %s が見つかりません", args.feature_stats_bin)
+            except FeatureStatsDimensionError as exc:
+                logging.warning(
+                    "特徴量統計の次元が一致しません (expected=%d, actual=%d, 条件=%s)。ストリーミング算出にフォールバックします。",
+                    exc.expected,
+                    exc.actual,
+                    cond_desc,
+                )
+            except ValueError as exc:
+                logging.warning("特徴量統計の読み込みに失敗しました: %s", exc)
+            else:
+                mean = loaded_mean
+                std = loaded_std
+                mean_std_loaded = True
+                scaler_source = f"feature-stats-bin:{args.feature_stats_bin}"
+                logging.info(
+                    "特徴量スケーラーを %s から読み込みました (サンプル数=%d)",
+                    args.feature_stats_bin,
+                    stats_count,
+                )
+                if stats_count is not None and stats_count != total:
+                    logging.warning(
+                        "特徴量統計のサンプル数 %d がデータセット行数 %d と一致しません",
+                        stats_count,
+                        total,
+                    )
+        if not mean_std_loaded:
+            scaler_indices = np.arange(len(train_features), dtype=np.int64)
+            mean, std = compute_feature_scaler_streaming(
+                train_features,
+                scaler_indices,
+                batch_size=int(args.scaler_batch),
+                show_progress=ENABLE_PROGRESS,
+            )
+            mean_std_loaded = True
+            scaler_source = "streaming"
+
+    if args.import_scaler is None and args.export_scaler is not None:
+        export_path = Path(args.export_scaler)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(export_path, mean=mean.astype(np.float32), std=std.astype(np.float32))
+        logging.info("特徴量スケーラーを %s に書き出しました (次元=%d)", export_path, final_feature_dim)
+
+    logging.info("特徴量スケーラーの利用ソース: %s (次元=%d)", scaler_source or "unknown", final_feature_dim)
 
     active_best_labels = {name: best_labels[name] for name in active_heads}
     active_second_labels = {name: second_labels[name] for name in active_heads}

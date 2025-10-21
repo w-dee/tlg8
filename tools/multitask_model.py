@@ -48,6 +48,26 @@ HEAD_ORDER: Tuple[str, ...] = (
 )
 
 
+COND_ONEHOT_SIZES: Dict[str, int] = {
+    "reorder": 8,
+    "interleave": 2,
+}
+
+
+def conditioned_extra_dim(active_heads: Sequence[str], encoding: str) -> int:
+    """条件付きヘッド情報により増加する特徴量次元数を返す。"""
+
+    enc = (encoding or "onehot").lower()
+    if enc == "id":
+        return len(tuple(active_heads))
+    if enc != "onehot":
+        return 0
+    total = 0
+    for name in active_heads:
+        total += COND_ONEHOT_SIZES.get(name, 0)
+    return total
+
+
 def _ensure_torch() -> "torch":
     """PyTorch 利用前に導入状態を検証する。"""
 
