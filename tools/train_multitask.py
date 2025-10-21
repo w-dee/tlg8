@@ -1641,20 +1641,31 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.import_scaler is not None:
         import_path = Path(args.import_scaler)
-        with np.load(import_path) as data:
-            if 'mean' not in data or 'std' not in data:
-                raise RuntimeError("インポートしたスケーラーに mean/std が含まれていません")
-            loaded_mean = np.asarray(data['mean'], dtype=np.float32)
-            loaded_std = np.asarray(data['std'], dtype=np.float32)
-        if loaded_mean.shape[0] != final_feature_dim or loaded_std.shape[0] != final_feature_dim:
-            raise RuntimeError(
-                f"インポートしたスケーラーの次元が一致しません (expected={final_feature_dim}, actual_mean={loaded_mean.shape[0]}, actual_std={loaded_std.shape[0]}). 条件: {cond_desc}"
+        if not import_path.exists():
+            logging.warning(
+                "指定されたスケーラーファイル %s が存在しません。インポートをスキップして再計算します。",
+                import_path,
             )
-        mean = loaded_mean
-        std = loaded_std
-        mean_std_loaded = True
-        scaler_source = f"import:{import_path}"
-        logging.info("特徴量スケーラーを %s からインポートしました (次元=%d)", import_path, final_feature_dim)
+        else:
+            try:
+                with np.load(import_path) as data:
+                    if 'mean' not in data or 'std' not in data:
+                        raise RuntimeError("インポートしたスケーラーに mean/std が含まれていません")
+                    loaded_mean = np.asarray(data['mean'], dtype=np.float32)
+                    loaded_std = np.asarray(data['std'], dtype=np.float32)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"スケーラーファイル {import_path} の読み込みに失敗しました: {exc}"
+                ) from exc
+            if loaded_mean.shape[0] != final_feature_dim or loaded_std.shape[0] != final_feature_dim:
+                raise RuntimeError(
+                    f"インポートしたスケーラーの次元が一致しません (expected={final_feature_dim}, actual_mean={loaded_mean.shape[0]}, actual_std={loaded_std.shape[0]}). 条件: {cond_desc}"
+                )
+            mean = loaded_mean
+            std = loaded_std
+            mean_std_loaded = True
+            scaler_source = f"import:{import_path}"
+            logging.info("特徴量スケーラーを %s からインポートしました (次元=%d)", import_path, final_feature_dim)
     else:
         if args.feature_stats_bin is not None:
             try:
