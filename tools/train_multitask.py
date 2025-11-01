@@ -1494,16 +1494,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="事前計算した特徴量統計バイナリのパス",
     )
     parser.add_argument(
-        "--import-scaler",
+        "--scaler",
         type=Path,
         default=None,
-        help="事前計算済みの特徴量スケーラー (.npz) のパス",
-    )
-    parser.add_argument(
-        "--export-scaler",
-        type=Path,
-        default=None,
-        help="算出した特徴量スケーラー (.npz) の保存先",
+        help="特徴量スケーラー (.npz) のパス。既存ファイルを読み込み、無効なら再計算して上書き",
     )
     parser.add_argument(
         "--progress",
@@ -1707,82 +1701,98 @@ def main(argv: Sequence[str] | None = None) -> int:
     mean = np.zeros((final_feature_dim,), dtype=np.float32)
     std = np.ones((final_feature_dim,), dtype=np.float32)
 
-    if args.import_scaler is not None:
-        import_path = Path(args.import_scaler)
-        if not import_path.exists():
-            logging.warning(
-                "指定されたスケーラーファイル %s が存在しません。インポートをスキップして再計算します。",
-                import_path,
-            )
-        else:
+    scaler_path: Optional[Path] = None
+    scaler_export_required = False
+    if args.scaler is not None:
+        scaler_path = Path(args.scaler)
+        scaler_export_required = True
+        if scaler_path.exists():
             try:
-                with np.load(import_path) as data:
+                with np.load(scaler_path) as data:
                     if 'mean' not in data or 'std' not in data:
-                        raise RuntimeError("インポートしたスケーラーに mean/std が含まれていません")
+                        raise ValueError("インポートしたスケーラーに mean/std が含まれていません")
                     loaded_mean = np.asarray(data['mean'], dtype=np.float32)
                     loaded_std = np.asarray(data['std'], dtype=np.float32)
             except (OSError, ValueError) as exc:
-                raise RuntimeError(
-                    f"スケーラーファイル {import_path} の読み込みに失敗しました: {exc}"
-                ) from exc
-            if loaded_mean.shape[0] != final_feature_dim or loaded_std.shape[0] != final_feature_dim:
-                raise RuntimeError(
-                    f"インポートしたスケーラーの次元が一致しません (expected={final_feature_dim}, actual_mean={loaded_mean.shape[0]}, actual_std={loaded_std.shape[0]}). 条件: {cond_desc}"
+                logging.warning(
+                    "スケーラーファイル %s の読み込みに失敗しました (%s)。再計算します。",
+                    scaler_path,
+                    exc,
                 )
+            else:
+                if loaded_mean.shape[0] != final_feature_dim or loaded_std.shape[0] != final_feature_dim:
+                    logging.warning(
+                        "インポートしたスケーラーの次元が一致しません (expected=%d, actual_mean=%d, actual_std=%d, 条件=%s)。再計算します。",
+                        final_feature_dim,
+                        loaded_mean.shape[0],
+                        loaded_std.shape[0],
+                        cond_desc,
+                    )
+                else:
+                    mean = loaded_mean
+                    std = loaded_std
+                    mean_std_loaded = True
+                    scaler_export_required = False
+                    scaler_source = f"scaler:{scaler_path}"
+                    logging.info(
+                        "特徴量スケーラーを %s からインポートしました (次元=%d)",
+                        scaler_path,
+                        final_feature_dim,
+                    )
+        else:
+            logging.info(
+                "スケーラーファイル %s が存在しません。再計算して書き出します。",
+                scaler_path,
+            )
+
+    if not mean_std_loaded and args.feature_stats_bin is not None:
+        try:
+            loaded_mean, loaded_std, stats_count = load_feature_scaler_from_binary(
+                args.feature_stats_bin, final_feature_dim
+            )
+        except FileNotFoundError:
+            logging.warning("特徴量統計 %s が見つかりません", args.feature_stats_bin)
+        except FeatureStatsDimensionError as exc:
+            logging.warning(
+                "特徴量統計の次元が一致しません (expected=%d, actual=%d, 条件=%s)。ストリーミング算出にフォールバックします。",
+                exc.expected,
+                exc.actual,
+                cond_desc,
+            )
+        except ValueError as exc:
+            logging.warning("特徴量統計の読み込みに失敗しました: %s", exc)
+        else:
             mean = loaded_mean
             std = loaded_std
             mean_std_loaded = True
-            scaler_source = f"import:{import_path}"
-            logging.info("特徴量スケーラーを %s からインポートしました (次元=%d)", import_path, final_feature_dim)
-    else:
-        if args.feature_stats_bin is not None:
-            try:
-                loaded_mean, loaded_std, stats_count = load_feature_scaler_from_binary(
-                    args.feature_stats_bin, final_feature_dim
-                )
-            except FileNotFoundError:
-                logging.warning("特徴量統計 %s が見つかりません", args.feature_stats_bin)
-            except FeatureStatsDimensionError as exc:
-                logging.warning(
-                    "特徴量統計の次元が一致しません (expected=%d, actual=%d, 条件=%s)。ストリーミング算出にフォールバックします。",
-                    exc.expected,
-                    exc.actual,
-                    cond_desc,
-                )
-            except ValueError as exc:
-                logging.warning("特徴量統計の読み込みに失敗しました: %s", exc)
-            else:
-                mean = loaded_mean
-                std = loaded_std
-                mean_std_loaded = True
-                scaler_source = f"feature-stats-bin:{args.feature_stats_bin}"
-                logging.info(
-                    "特徴量スケーラーを %s から読み込みました (サンプル数=%d)",
-                    args.feature_stats_bin,
-                    stats_count,
-                )
-                if stats_count is not None and stats_count != total:
-                    logging.warning(
-                        "特徴量統計のサンプル数 %d がデータセット行数 %d と一致しません",
-                        stats_count,
-                        total,
-                    )
-        if not mean_std_loaded:
-            scaler_indices = np.arange(len(train_features), dtype=np.int64)
-            mean, std = compute_feature_scaler_streaming(
-                train_features,
-                scaler_indices,
-                batch_size=int(args.scaler_batch),
-                show_progress=ENABLE_PROGRESS,
+            scaler_source = f"feature-stats-bin:{args.feature_stats_bin}"
+            logging.info(
+                "特徴量スケーラーを %s から読み込みました (サンプル数=%d)",
+                args.feature_stats_bin,
+                stats_count,
             )
-            mean_std_loaded = True
-            scaler_source = "streaming"
+            if stats_count is not None and stats_count != total:
+                logging.warning(
+                    "特徴量統計のサンプル数 %d がデータセット行数 %d と一致しません",
+                    stats_count,
+                    total,
+                )
 
-    if args.import_scaler is None and args.export_scaler is not None:
-        export_path = Path(args.export_scaler)
-        export_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(export_path, mean=mean.astype(np.float32), std=std.astype(np.float32))
-        logging.info("特徴量スケーラーを %s に書き出しました (次元=%d)", export_path, final_feature_dim)
+    if not mean_std_loaded:
+        scaler_indices = np.arange(len(train_features), dtype=np.int64)
+        mean, std = compute_feature_scaler_streaming(
+            train_features,
+            scaler_indices,
+            batch_size=int(args.scaler_batch),
+            show_progress=ENABLE_PROGRESS,
+        )
+        mean_std_loaded = True
+        scaler_source = "streaming"
+
+    if scaler_export_required and scaler_path is not None:
+        scaler_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(scaler_path, mean=mean.astype(np.float32), std=std.astype(np.float32))
+        logging.info("特徴量スケーラーを %s に書き出しました (次元=%d)", scaler_path, final_feature_dim)
 
     logging.info("特徴量スケーラーの利用ソース: %s (次元=%d)", scaler_source or "unknown", final_feature_dim)
 
