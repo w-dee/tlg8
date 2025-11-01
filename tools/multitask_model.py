@@ -14,6 +14,8 @@ from typing import Callable, Dict, List, Sequence, Tuple, TYPE_CHECKING
 
 import sys
 
+import logging
+
 import numpy as np
 
 try:  # PyTorch が未導入環境でも numpy バックエンドを維持するための遅延インポート
@@ -76,13 +78,48 @@ def _ensure_torch() -> "torch":
     return torch
 
 
-def pick_device(prefer: str = "xpu") -> "torch.device":
+def pick_device(prefer: str = "auto") -> "torch.device":
     """利用可能なデバイスから優先候補を選択するヘルパー。"""
 
     torch_mod = _ensure_torch()
-    prefer_norm = (prefer or "").lower()
-    if prefer_norm == "xpu" and hasattr(torch_mod, "xpu") and torch_mod.xpu.is_available():
-        return torch_mod.device("xpu")
+    prefer_raw = prefer or ""
+    prefer_norm = prefer_raw.lower()
+
+    # auto は CUDA → XPU → MPS → CPU の順に探索する
+    if prefer_norm in ("", "auto"):
+        if torch_mod.cuda.is_available():
+            return torch_mod.device("cuda")
+        if hasattr(torch_mod, "xpu") and torch_mod.xpu.is_available():
+            return torch_mod.device("xpu")
+        if getattr(torch_mod.backends, "mps", None) and torch_mod.backends.mps.is_available():
+            return torch_mod.device("mps")
+        logging.warning("利用可能な GPU が見つからなかったため CPU を使用します")
+        return torch_mod.device("cpu")
+
+    if prefer_norm.startswith("cuda"):
+        if torch_mod.cuda.is_available():
+            try:
+                return torch_mod.device(prefer_raw)
+            except Exception:
+                logging.warning("指定された CUDA デバイス %s を初期化できませんでした。最初の CUDA デバイスを使用します", prefer_raw)
+                return torch_mod.device("cuda")  # type: ignore[arg-type]
+        logging.warning("CUDA デバイスが利用できないため CPU にフォールバックします")
+        return torch_mod.device("cpu")
+
+    if prefer_norm == "xpu":
+        if hasattr(torch_mod, "xpu") and torch_mod.xpu.is_available():
+            return torch_mod.device("xpu")
+        logging.warning("XPU デバイスが見つからないため CPU を使用します")
+        return torch_mod.device("cpu")
+
+    if prefer_norm == "mps":
+        if getattr(torch_mod.backends, "mps", None) and torch_mod.backends.mps.is_available():
+            return torch_mod.device("mps")
+        logging.warning("MPS バックエンドが利用できないため CPU を使用します")
+        return torch_mod.device("cpu")
+
+    if prefer_norm != "cpu":
+        logging.warning("未知のデバイス指定 %s のため CPU にフォールバックします", prefer_raw)
     return torch_mod.device("cpu")
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import io
 import json
@@ -11,6 +12,7 @@ import logging
 import math
 import mmap
 import os
+import queue
 import random
 import struct
 import subprocess
@@ -20,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -798,6 +800,11 @@ class LazyFeatures:
         self._index = index
         self._shape = (index.shape[0], feature_dim)
         self._max_workers = max(1, int(max_workers))
+        self._executor: Optional[ThreadPoolExecutor] = None
+        if self._max_workers > 1:
+            # バッチごとにスレッドプールを張り直すとオーバーヘッドが大きいので再利用する
+            self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="lazyfeat")
+            atexit.register(self._shutdown_executor)
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -809,21 +816,27 @@ class LazyFeatures:
     def __getitem__(self, idx: object) -> np.ndarray:
         rows, scalar = _normalize_indices(idx, len(self))
         batch = np.empty((rows.shape[0], self._shape[1]), dtype=np.float32)
-        if self._max_workers <= 1 or rows.shape[0] <= 1:
+        executor = self._executor
+        if executor is None or rows.shape[0] <= 1:
             for out_idx, rec_idx in enumerate(rows):
                 batch[out_idx] = self._read_and_pack(int(rec_idx))
         else:
-            with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
-                futures = [
-                    executor.submit(self._read_and_pack_with_index, out_idx, int(rec_idx))
-                    for out_idx, rec_idx in enumerate(rows)
-                ]
-                for future in futures:
-                    out_idx, feature = future.result()
-                    batch[out_idx] = feature
+            futures = [
+                executor.submit(self._read_and_pack_with_index, out_idx, int(rec_idx))
+                for out_idx, rec_idx in enumerate(rows)
+            ]
+            for future in futures:
+                out_idx, feature = future.result()
+                batch[out_idx] = feature
         if scalar:
             return batch[0]
         return batch
+
+    def _shutdown_executor(self) -> None:
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._executor = None
 
     def _read_and_pack(self, rec_idx: int) -> np.ndarray:
         file_id, offset = self._index[int(rec_idx)]
@@ -927,6 +940,50 @@ class LazyFeatureSubset:
             if isinstance(batch, np.ndarray) and batch.ndim == 2 and batch.shape[0] == 1:
                 return batch[0]
         return batch
+
+
+def _prefetch_training_batches(
+    train_features: LazyFeatures,
+    train_targets: Dict[str, np.ndarray],
+    active_heads: Sequence[str],
+    batches: Sequence[np.ndarray],
+    *,
+    max_prefetch: int = 2,
+) -> Iterator[Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]]:
+    """学習バッチを非同期に読み出してGPUの待ち時間を削減する。"""
+
+    stop_token: object = object()
+    error_token: object = object()
+    work_queue: queue.Queue[object] = queue.Queue(max(1, int(max_prefetch)))
+
+    def _worker() -> None:
+        try:
+            for batch_idx in batches:
+                features_np = np.asarray(train_features[batch_idx], dtype=np.float32)
+                targets_np = {name: train_targets[name][batch_idx] for name in active_heads}
+                work_queue.put((batch_idx, features_np, targets_np))
+        except Exception as exc:
+            work_queue.put((error_token, exc))
+        finally:
+            work_queue.put(stop_token)
+
+    thread = threading.Thread(target=_worker, name="prefetch_batches", daemon=True)
+    thread.start()
+
+    while True:
+        item = work_queue.get()
+        if item is stop_token:
+            break
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is error_token:
+            _, exc = item
+            raise exc
+        if isinstance(item, tuple) and len(item) == 3:
+            batch_idx, features_np, targets_np = item
+            yield batch_idx, features_np, targets_np
+            continue
+        raise RuntimeError("prefetch バックグラウンドスレッドから予期しない値を受信しました")
+
+    thread.join()
 
 
 def _encode_onehot(ids: np.ndarray, class_count: int) -> np.ndarray:
@@ -1238,7 +1295,12 @@ def train_with_torch_backend(
             pass
 
     device = pick_device(args.device)
-    amp_mode = args.amp.lower()
+    logging.info("PyTorch デバイス: %s", device)
+    amp_arg = (args.amp or "auto").lower()
+    if amp_arg == "auto":
+        amp_mode = "bf16" if device.type == "xpu" else "none"
+    else:
+        amp_mode = amp_arg
     if amp_mode == "bf16" and device.type == "cpu":
         if not hasattr(torch, "cpu") or not getattr(torch.cpu, "is_bf16_supported", lambda: False)():  # type: ignore[attr-defined]
             logging.warning("CPU が bfloat16 をサポートしていないため AMP を無効化します")
@@ -1298,15 +1360,19 @@ def train_with_torch_backend(
         model_forward.train()
         epoch_loss = 0.0
         sample_seen = 0
-        for batch_no, start in enumerate(range(0, train_count, args.batch_size), start=1):
-            end = min(train_count, start + args.batch_size)
-            batch_idx = indices[start:end]
-            features_np = np.asarray(train_features[batch_idx], dtype=np.float32)
-            xb = torch.from_numpy(features_np).to(device=device, dtype=torch.float32)
+        batches = [
+            np.ascontiguousarray(indices[start : min(train_count, start + args.batch_size)], dtype=np.int64)
+            for start in range(0, train_count, args.batch_size)
+        ]
+        for batch_no, (batch_idx, features_np, targets_np) in enumerate(
+            _prefetch_training_batches(train_features, train_targets, active_heads, batches), start=1
+        ):
+            xb_cpu = torch.from_numpy(features_np)
+            xb = xb_cpu.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
             target_tensors: Dict[str, torch.Tensor] = {}
             for name in active_heads:
-                probs = train_targets[name][batch_idx]
-                target_tensors[name] = torch.from_numpy(probs).to(device=device, dtype=torch.float32)
+                target_cpu = torch.from_numpy(targets_np[name])
+                target_tensors[name] = target_cpu.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
             optimizer.zero_grad(set_to_none=True)
             with _amp_context(device, amp_mode):
                 logits = model_forward(xb)
@@ -1465,11 +1531,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=0,
         help="遅延デコードに利用する最大スレッド数 (0 で自動設定)",
     )
-    parser.add_argument("--device", choices=["xpu", "cpu"], default="xpu", help="PyTorch バックエンド用デバイス優先度")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="PyTorch バックエンド用デバイス優先度 (auto/cuda[:index]/xpu/mps/cpu)",
+    )
     parser.add_argument(
         "--amp",
-        choices=["bf16", "none"],
-        default=None,
+        choices=["bf16", "none", "auto"],
+        default="auto",
         help="PyTorch バックエンドで利用する自動混合精度",
     )
     parser.add_argument("--compile", action="store_true", help="torch.compile を試行する")
@@ -1478,9 +1549,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     backend = args.backend.lower()
-    if args.amp is None:
-        args.amp = "bf16" if backend == "torch" and args.device == "xpu" else "none"
-
     try:
         cond_heads = parse_condition_head_list(args.condition_heads)
     except ValueError as exc:
