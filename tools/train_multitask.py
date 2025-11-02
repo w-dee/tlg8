@@ -50,6 +50,16 @@ else:
 try:  # PyTorch を利用する場合にのみ必要
     import torch
     from torch.nn import functional as torch_F
+
+    # Ampere 以降の TF32 制御を明示し、高速な行列演算を常時有効化する
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "high"
+    except Exception:
+        pass
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
 except Exception:  # pragma: no cover - PyTorch 非導入環境
     torch = None  # type: ignore[assignment]
     torch_F = None  # type: ignore[assignment]
@@ -1786,6 +1796,15 @@ def train_with_torch_backend(
             logging.warning("この PyTorch では torch.compile が利用できないため通常モードで実行します")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=8,
+        threshold=1e-4,
+        min_lr=1e-5,
+        verbose=True,
+    )
 
     active_heads = tuple(getattr(model, "active_heads", HEAD_ORDER))
     if not active_heads:
@@ -1939,9 +1958,20 @@ def train_with_torch_backend(
             )
         )
 
-        if mean_top3 > best_metric + 1e-6:
+        try:
+            scheduler.step(mean_top3)
+        except Exception:
+            pass  # スケジューラ更新で例外が発生した場合は学習を継続する
+
+        if mean_top3 > best_metric + 1e-4:
             best_metric = mean_top3
-            best_state = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
+            state_source = (
+                model_forward._orig_mod if hasattr(model_forward, "_orig_mod") else model_forward
+            )
+            best_state = {
+                key: tensor.detach().cpu().clone()
+                for key, tensor in state_source.state_dict().items()
+            }
             best_train_metrics = train_metrics
             best_val_metrics = val_metrics
             patience_counter = 0
@@ -1952,9 +1982,12 @@ def train_with_torch_backend(
                 break
 
     if best_state is not None:
-        model.load_state_dict(best_state)
-        if model_forward is not model:
-            model_forward.load_state_dict(best_state)
+        target_model = (
+            model_forward._orig_mod if hasattr(model_forward, "_orig_mod") else model_forward
+        )
+        target_model.load_state_dict(best_state)
+        if model is not target_model:
+            model.load_state_dict(best_state)
 
     dump_dir = getattr(args, "dump_logits", None)
     if dump_dir is not None:
