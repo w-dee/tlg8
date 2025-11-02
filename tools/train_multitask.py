@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import atexit
 import hashlib
 import io
@@ -1796,15 +1797,22 @@ def train_with_torch_backend(
             logging.warning("この PyTorch では torch.compile が利用できないため通常モードで実行します")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
+    scheduler_kwargs = dict(
+        optimizer=optimizer,
         mode="max",
         factor=0.5,
         patience=8,
         threshold=1e-4,
         min_lr=1e-5,
-        verbose=True,
     )
+    # 古い PyTorch では verbose 引数が存在しないため動的に判定する
+    try:
+        signature = inspect.signature(torch.optim.lr_scheduler.ReduceLROnPlateau)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None and "verbose" in signature.parameters:
+        scheduler_kwargs["verbose"] = True
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(**scheduler_kwargs)
 
     active_heads = tuple(getattr(model, "active_heads", HEAD_ORDER))
     if not active_heads:
