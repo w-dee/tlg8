@@ -4,6 +4,7 @@
 # ML intermediate directory
 /data/
 /models/
+/.cache/
 
 
 # Analysis temporary

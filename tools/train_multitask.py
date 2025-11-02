@@ -1067,6 +1067,224 @@ class AugmentedFeatures:
         return batch
 
 
+FEATURE_CACHE_META_VERSION = 1
+
+
+def _feature_cache_meta_path(cache_path: Path) -> Path:
+    """特徴量キャッシュメタデータのパスを生成する。"""
+
+    if cache_path.suffix:
+        return cache_path.with_suffix(cache_path.suffix + ".meta.json")
+    return cache_path.parent / f"{cache_path.name}.meta.json"
+
+
+def _feature_cache_files_match(files: Sequence[FileRef], meta_files: object) -> bool:
+    """メタデータと実際の入力ファイル構成が一致するか確認する。"""
+
+    if not isinstance(meta_files, list) or len(meta_files) != len(files):
+        return False
+    for ref, entry in zip(files, meta_files):
+        if not isinstance(entry, dict):
+            return False
+        try:
+            recorded_path = Path(entry["path"]).resolve()
+            recorded_size = int(entry["size"])
+            recorded_mtime = float(entry["mtime"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if recorded_path != ref.path.resolve():
+            return False
+        if recorded_size != int(ref.size):
+            return False
+        if not math.isclose(float(ref.mtime), recorded_mtime, rel_tol=0.0, abs_tol=1e-6):
+            return False
+    return True
+
+
+def _try_load_feature_cache(
+    cache_path: Path,
+    files: Sequence[FileRef],
+    *,
+    expected_records: int,
+    expected_dim: int,
+    cond_heads: Sequence[str],
+    cond_encoding: str,
+) -> Optional[np.memmap]:
+    """既存の特徴量キャッシュが利用可能なら mmap して返す。"""
+
+    meta_path = _feature_cache_meta_path(cache_path)
+    if not cache_path.exists() or not meta_path.exists():
+        return None
+    try:
+        with meta_path.open("r", encoding="utf-8") as fp:
+            meta = json.load(fp)
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("特徴量キャッシュメタデータの読み込みに失敗しました (%s)", exc)
+        return None
+
+    try:
+        version = int(meta.get("version", 0))
+        record_count = int(meta.get("record_count", 0))
+        feature_dim = int(meta.get("feature_dim", 0))
+    except (TypeError, ValueError):
+        logging.warning("特徴量キャッシュメタデータの基本情報が不正です")
+        return None
+
+    if version != FEATURE_CACHE_META_VERSION:
+        logging.warning("特徴量キャッシュのメタデータバージョンが一致しません (meta=%d)", version)
+        return None
+    if record_count != expected_records or feature_dim != expected_dim:
+        logging.warning(
+            "特徴量キャッシュの形状が現在の設定と一致しません (records=%d/%d, dim=%d/%d)",
+            record_count,
+            expected_records,
+            feature_dim,
+            expected_dim,
+        )
+        return None
+
+    recorded_heads = meta.get("condition_heads", [])
+    recorded_encoding = str(meta.get("condition_encoding", "")).lower()
+    if list(recorded_heads) != list(cond_heads) or recorded_encoding != cond_encoding.lower():
+        logging.warning("特徴量キャッシュの条件付き設定が現在の CLI と一致しません")
+        return None
+
+    if not _feature_cache_files_match(files, meta.get("files")):
+        logging.warning("特徴量キャッシュの入力ファイル構成が一致しません。再構築します。")
+        return None
+
+    try:
+        arr = np.load(cache_path, mmap_mode="r", allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        logging.warning("特徴量キャッシュ %s の読み込みに失敗しました: %s", cache_path, exc)
+        return None
+
+    if arr.ndim != 2 or arr.shape[0] != expected_records or arr.shape[1] != expected_dim:
+        logging.warning("特徴量キャッシュファイルの形状が不正です (shape=%s)", arr.shape)
+        return None
+
+    logging.info("特徴量キャッシュを利用します: %s (shape=%d×%d)", cache_path, arr.shape[0], arr.shape[1])
+    return arr
+
+
+def _build_feature_cache(
+    cache_path: Path,
+    files: Sequence[FileRef],
+    base_features: LazyFeatures,
+    *,
+    cond_arrays: Dict[str, np.ndarray],
+    cond_specs: Sequence[Tuple[str, int]],
+    cond_encoding: str,
+    cond_heads: Sequence[str],
+    total: int,
+    expected_dim: int,
+    chunk_size: int,
+) -> np.memmap:
+    """特徴量キャッシュを新規作成して mmap を返す。"""
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path = _feature_cache_meta_path(cache_path)
+    feature_source: object
+    if cond_specs:
+        feature_source = AugmentedFeatures(base_features, cond_arrays, cond_specs, encoding=cond_encoding)
+    else:
+        feature_source = base_features
+
+    from numpy.lib.format import open_memmap
+    mm = open_memmap(str(cache_path), mode="w+", dtype=np.float32, shape=(total, expected_dim))
+
+    # ヘッダ付き .npy を作る。これなら直後の np.load(..., mmap_mode="r") と整合する
+    progress = ProgressReporter(
+        total,
+        "特徴量キャッシュ構築中",
+        unit="サンプル",
+        enable=ENABLE_PROGRESS and total > 0,
+    )
+    step = max(1, chunk_size)
+    try:
+        for start in range(0, total, step):
+            end = min(total, start + step)
+            batch = np.asarray(feature_source[start:end], dtype=np.float32)
+            if batch.ndim == 1:
+                batch = batch.reshape(1, -1)
+            if batch.shape[1] != expected_dim:
+                raise ValueError(f"キャッシュ構築中に特徴量次元が一致しません (expected={expected_dim}, actual={batch.shape[1]})")
+            mm[start:end, :] = batch
+            if progress is not None:
+                progress.update(end - start)
+    finally:
+        progress.close()
+        mm.flush()
+
+    meta = {
+        "version": FEATURE_CACHE_META_VERSION,
+        "record_count": int(total),
+        "feature_dim": int(expected_dim),
+        "condition_heads": list(cond_heads),
+        "condition_encoding": cond_encoding.lower(),
+        "files": [
+            {
+                "path": str(ref.path.resolve()),
+                "size": int(ref.size),
+                "mtime": float(ref.mtime),
+            }
+            for ref in files
+        ],
+    }
+    with meta_path.open("w", encoding="utf-8") as fp:
+        json.dump(meta, fp)
+
+    del mm  # mmap を明示的にクローズする
+    arr = np.load(cache_path, mmap_mode="r", allow_pickle=False)
+    logging.info("特徴量キャッシュを構築しました: %s (shape=%d×%d)", cache_path, arr.shape[0], arr.shape[1])
+    return arr
+
+
+def load_or_build_feature_cache(
+    cache_path: Path,
+    files: Sequence[FileRef],
+    base_features: LazyFeatures,
+    *,
+    cond_arrays: Dict[str, np.ndarray],
+    cond_specs: Sequence[Tuple[str, int]],
+    cond_encoding: str,
+    cond_heads: Sequence[str],
+    total: int,
+    expected_dim: int,
+    chunk_size: int = 65536,
+) -> np.memmap:
+    """特徴量キャッシュをロードまたは構築して mmap を返す。"""
+
+    cache = _try_load_feature_cache(
+        cache_path,
+        files,
+        expected_records=total,
+        expected_dim=expected_dim,
+        cond_heads=cond_heads,
+        cond_encoding=cond_encoding,
+    )
+    if cache is not None:
+        return cache
+    logging.info(
+        "特徴量キャッシュ %s を再構築します (records=%d, dim=%d)",
+        cache_path,
+        total,
+        expected_dim,
+    )
+    return _build_feature_cache(
+        cache_path,
+        files,
+        base_features,
+        cond_arrays=cond_arrays,
+        cond_specs=cond_specs,
+        cond_encoding=cond_encoding,
+        cond_heads=cond_heads,
+        total=total,
+        expected_dim=expected_dim,
+        chunk_size=max(1, int(chunk_size)),
+    )
+
+
 def open_indexed_dataset(
     paths: Sequence[Path],
     cache_path: Optional[Path],
@@ -1548,6 +1766,10 @@ def train_with_torch_backend(
     model = TorchMultiTask(mean, std, dropout=args.dropout, disabled_heads=disabled_heads)
     model.inference_temperature = max(float(args.temperature), 1e-6)
     model.to(device)
+    if device.type == "cuda":
+        first_param = next(model.parameters(), None)
+        if first_param is not None:
+            assert first_param.is_cuda, "Model is not on CUDA"
 
     if device.type == "cuda" and hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")  # type: ignore[attr-defined]
@@ -1644,6 +1866,10 @@ def train_with_torch_backend(
                 if non_blocking:
                     target_cpu = target_cpu.pin_memory()
                 target_tensors[name] = target_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+            if device.type == "cuda":
+                assert xb.is_cuda, "Input batch not on CUDA"
+                for tensor in target_tensors.values():
+                    assert tensor.is_cuda, "Target tensor not on CUDA"
             optimizer.zero_grad(set_to_none=True)
             with _amp_context(device, amp_mode):
                 logits = model_forward(xb)
@@ -1791,6 +2017,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--export-dir", type=Path, help="学習済みモデルの保存先ディレクトリ")
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
+    parser.add_argument(
+        "--feature-cache",
+        type=Path,
+        default=None,
+        help="JSONL から抽出した特徴量をキャッシュする NPY ファイルへのパス",
+    )
     parser.add_argument("--labels-meta", type=Path, default=Path(".cache/labels.meta.json"), help="ラベルキャッシュのメタデータパス")
     parser.add_argument("--labels-bin", type=Path, default=Path(".cache/labels.bin"), help="ラベルキャッシュのバイナリパス")
     parser.add_argument("--build-label-cache", action="store_true", help="キャッシュ不整合時に事前抽出を自動実行")
@@ -1859,9 +2091,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     backend = args.backend.lower()
     if backend == "torch" and torch is not None:
         args.device_resolved = pick_device(args.device)
-    eval_batch_display = (
-        args.eval_batch_size if args.eval_batch_size is not None and args.eval_batch_size > 0 else args.batch_size
-    )
+    eval_batch_display = args.eval_batch_size or args.batch_size
     print(
         f"INFO: Backend={args.backend}, Device={args.device}, AMP={args.amp}, "
         f"Batch={args.batch_size}, EvalBatch={eval_batch_display}"
@@ -1876,6 +2106,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         cuda_available = False
         cuda_name = "N/A"
     print(f"INFO: torch.cuda.is_available()={cuda_available}, cuda_device={cuda_name}")
+    if torch is not None:
+        try:
+            torch.set_num_threads(1)
+        except Exception:
+            logging.debug("torch.set_num_threads の設定に失敗しました", exc_info=True)
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(1)
+            except Exception:
+                logging.debug("torch.set_num_interop_threads の設定に失敗しました", exc_info=True)
 
     try:
         cond_heads = parse_condition_head_list(args.condition_heads)
@@ -1998,35 +2238,56 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
     cond_best_sources = {name: best_labels[name] for name in cond_heads}
-    cond_best_train: Dict[str, np.ndarray] = {}
-    cond_best_val: Dict[str, np.ndarray] = {}
-    for name in cond_heads:
-        cond_best_train[name] = np.asarray(cond_best_sources[name][train_idx], dtype=np.int16)
-        cond_best_val[name] = np.asarray(cond_best_sources[name][val_idx], dtype=np.int16)
-
-    train_features_base = LazyFeatureSubset(features, train_idx)
-    val_features_base = LazyFeatureSubset(features, val_idx)
-    train_features = AugmentedFeatures(
-        train_features_base,
-        cond_best_train,
-        cond_specs,
-        encoding=args.condition_encoding,
-    )
-    val_features = AugmentedFeatures(
-        val_features_base,
-        cond_best_val,
-        cond_specs,
-        encoding=args.condition_encoding,
-    )
-
-    final_feature_dim = int(train_features.shape[1])
     expected_feature_dim = feature_dim + conditioned_extra_dim(cond_heads, args.condition_encoding)
-    if expected_feature_dim != final_feature_dim:
-        logging.debug(
-            "条件付き特徴量次元が想定値と一致しません (expected=%d, actual=%d)",
-            expected_feature_dim,
-            final_feature_dim,
+
+    feature_cache_array: Optional[np.memmap] = None
+    if args.feature_cache is not None:
+        cond_arrays_full: Dict[str, np.ndarray] = {}
+        for name in cond_heads:
+            cond_arrays_full[name] = np.asarray(cond_best_sources[name][:], dtype=np.int16)
+        feature_cache_array = load_or_build_feature_cache(
+            args.feature_cache,
+            file_refs,
+            features,
+            cond_arrays=cond_arrays_full,
+            cond_specs=cond_specs,
+            cond_encoding=args.condition_encoding,
+            cond_heads=cond_heads,
+            total=total,
+            expected_dim=expected_feature_dim,
+            chunk_size=max(args.batch_size, args.max_batch),
         )
+        train_features = LazyFeatureSubset(feature_cache_array, train_idx)
+        val_features = LazyFeatureSubset(feature_cache_array, val_idx)
+        final_feature_dim = int(feature_cache_array.shape[1])
+    else:
+        cond_best_train: Dict[str, np.ndarray] = {}
+        cond_best_val: Dict[str, np.ndarray] = {}
+        for name in cond_heads:
+            cond_best_train[name] = np.asarray(cond_best_sources[name][train_idx], dtype=np.int16)
+            cond_best_val[name] = np.asarray(cond_best_sources[name][val_idx], dtype=np.int16)
+
+        train_features_base = LazyFeatureSubset(features, train_idx)
+        val_features_base = LazyFeatureSubset(features, val_idx)
+        train_features = AugmentedFeatures(
+            train_features_base,
+            cond_best_train,
+            cond_specs,
+            encoding=args.condition_encoding,
+        )
+        val_features = AugmentedFeatures(
+            val_features_base,
+            cond_best_val,
+            cond_specs,
+            encoding=args.condition_encoding,
+        )
+        final_feature_dim = int(train_features.shape[1])
+        if expected_feature_dim != final_feature_dim:
+            logging.debug(
+                "条件付き特徴量次元が想定値と一致しません (expected=%d, actual=%d)",
+                expected_feature_dim,
+                final_feature_dim,
+            )
     cond_desc = f"heads={','.join(cond_heads) if cond_heads else '(none)'} encoding={args.condition_encoding}"
 
     mean_std_loaded = False
