@@ -50,12 +50,6 @@ HEAD_ORDER: Tuple[str, ...] = (
 )
 
 
-COND_ONEHOT_SIZES: Dict[str, int] = {
-    "reorder": 8,
-    "interleave": 2,
-}
-
-
 def conditioned_extra_dim(active_heads: Sequence[str], encoding: str) -> int:
     """条件付きヘッド情報により増加する特徴量次元数を返す。"""
 
@@ -66,7 +60,11 @@ def conditioned_extra_dim(active_heads: Sequence[str], encoding: str) -> int:
         return 0
     total = 0
     for name in active_heads:
-        total += COND_ONEHOT_SIZES.get(name, 0)
+        classes = HEAD_SPECS.get(name)
+        if classes is None:
+            # 未知のヘッド名は事前検証で弾かれる想定だが、安全のため無視する
+            continue
+        total += classes
     return total
 
 
