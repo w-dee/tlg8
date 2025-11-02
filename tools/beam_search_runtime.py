@@ -325,6 +325,7 @@ def select_block_config_batched(
         device,
         batch_size=batch_size,
         amp=amp,
+        allow_cpu_transfer=True,
     )
     sample_count = next(iter(logits_batch.values())).shape[0]
     results: List[object] = []

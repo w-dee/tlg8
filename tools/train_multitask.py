@@ -959,8 +959,11 @@ def _prefetch_training_batches(
     def _worker() -> None:
         try:
             for batch_idx in batches:
-                features_np = np.asarray(train_features[batch_idx], dtype=np.float32)
-                targets_np = {name: train_targets[name][batch_idx] for name in active_heads}
+                features_np = np.ascontiguousarray(train_features[batch_idx], dtype=np.float32)
+                targets_np = {
+                    name: np.ascontiguousarray(train_targets[name][batch_idx], dtype=np.float32)
+                    for name in active_heads
+                }
                 work_queue.put((batch_idx, features_np, targets_np))
         except Exception as exc:
             work_queue.put((error_token, exc))
@@ -1169,11 +1172,19 @@ def predict_logits_with_progress(
     batch_size: int,
     amp: str,
     desc: str,
+    allow_cpu_transfer: bool = False,
 ) -> Dict[str, np.ndarray]:
     """predict_logits_batched にプログレスバーを付与したラッパー。"""
 
     if not ENABLE_PROGRESS:
-        return predict_logits_batched(model, features, device, batch_size=batch_size, amp=amp)
+        return predict_logits_batched(
+            model,
+            features,
+            device,
+            batch_size=batch_size,
+            amp=amp,
+            allow_cpu_transfer=allow_cpu_transfer,
+        )
 
     if isinstance(features, np.ndarray):
         total = int(features.shape[0]) if features.ndim > 1 else 1
@@ -1183,11 +1194,25 @@ def predict_logits_with_progress(
     progress = ProgressReporter(total, desc, unit="サンプル", enable=ENABLE_PROGRESS)
     if total <= 0:
         progress.close()
-        return predict_logits_batched(model, features, device, batch_size=batch_size, amp=amp)
+        return predict_logits_batched(
+            model,
+            features,
+            device,
+            batch_size=batch_size,
+            amp=amp,
+            allow_cpu_transfer=allow_cpu_transfer,
+        )
 
     if isinstance(features, np.ndarray):
         try:
-            return predict_logits_batched(model, features, device, batch_size=batch_size, amp=amp)
+            return predict_logits_batched(
+                model,
+                features,
+                device,
+                batch_size=batch_size,
+                amp=amp,
+                allow_cpu_transfer=allow_cpu_transfer,
+            )
         finally:
             progress.update(total)
             progress.close()
@@ -1228,9 +1253,205 @@ def predict_logits_with_progress(
 
     wrapped = _ProgressiveFeatures(features, progress)
     try:
-        return predict_logits_batched(model, wrapped, device, batch_size=batch_size, amp=amp)
+        return predict_logits_batched(
+            model,
+            wrapped,
+            device,
+            batch_size=batch_size,
+            amp=amp,
+            allow_cpu_transfer=allow_cpu_transfer,
+        )
     finally:
         progress.close()
+
+
+def compute_metrics_on_device_with_progress(
+    model: "torch.nn.Module",
+    features: object,
+    device: "torch.device",
+    best: Dict[str, np.ndarray],
+    second: Dict[str, np.ndarray],
+    *,
+    batch_size: int,
+    amp: str,
+    desc: str,
+) -> Dict[str, Dict[str, float]]:
+    """GPU 上でロジット指標を集計しつつプログレスを表示する。"""
+
+    if torch is None:
+        raise ImportError("PyTorch が利用できません")
+
+    total = 0
+    if isinstance(features, np.ndarray):
+        total = int(features.shape[0]) if features.ndim > 1 else 1
+    else:
+        total = int(getattr(features, "shape")[0])  # type: ignore[index]
+
+    progress = ProgressReporter(total, desc, unit="サンプル", enable=ENABLE_PROGRESS and total > 0)
+    try:
+        return _compute_metrics_on_device(
+            model,
+            features,
+            device,
+            best,
+            second,
+            batch_size=batch_size,
+            amp=amp,
+            progress=progress if ENABLE_PROGRESS and total > 0 else None,
+        )
+    finally:
+        progress.close()
+
+
+def _compute_metrics_on_device(
+    model: "torch.nn.Module",
+    features: object,
+    device: "torch.device",
+    best: Dict[str, np.ndarray],
+    second: Dict[str, np.ndarray],
+    *,
+    batch_size: int,
+    amp: str,
+    progress: Optional[ProgressReporter] = None,
+) -> Dict[str, Dict[str, float]]:
+    """GPU 上で top-k 指標を集計する内部実装。"""
+
+    if torch is None:
+        raise ImportError("PyTorch が利用できません")
+
+    if batch_size <= 0:
+        raise ValueError("batch_size は正の整数である必要があります")
+
+    active_heads = tuple(getattr(model, "active_heads", tuple(best.keys())))
+    if not active_heads:
+        return {}
+
+    if isinstance(features, np.ndarray):
+        arr = np.asarray(features, dtype=np.float32)
+        total = int(arr.shape[0]) if arr.ndim > 1 else 1
+        fetch = lambda start, end: np.ascontiguousarray(arr[start:end], dtype=np.float32)
+    else:
+        total = int(getattr(features, "shape")[0])  # type: ignore[index]
+        fetch = lambda start, end: np.ascontiguousarray(features[start:end], dtype=np.float32)  # type: ignore[index]
+
+    if total == 0:
+        return {
+            name: {
+                "top1": float("nan"),
+                "top2": float("nan"),
+                "top3": float("nan"),
+                "three_choice": float("nan"),
+            }
+            for name in active_heads
+        }
+
+    was_training = bool(model.training)
+    model.eval()
+
+    non_blocking = device.type == "cuda"
+    metrics_buf: Dict[str, Dict[str, torch.Tensor]] = {}
+    for name in active_heads:
+        metrics_buf[name] = {
+            "total": torch.zeros((), device=device, dtype=torch.long),
+            "top1": torch.zeros((), device=device, dtype=torch.long),
+            "top2": torch.zeros((), device=device, dtype=torch.long),
+            "top3": torch.zeros((), device=device, dtype=torch.long),
+            "three_choice": torch.zeros((), device=device, dtype=torch.long),
+        }
+
+    try:
+        with torch.no_grad():
+            for start in range(0, total, batch_size):
+                end = min(total, start + batch_size)
+                batch_np = fetch(start, end)
+                if batch_np.ndim == 1:
+                    batch_np = batch_np[None, :]
+                xb = torch.from_numpy(batch_np)
+                if non_blocking:
+                    xb = xb.pin_memory()
+                xb = xb.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+                with _amp_context(device, amp):
+                    logits = model(xb)
+                batch_size_actual = xb.shape[0]
+                if progress is not None:
+                    progress.update(batch_size_actual)
+                for name in active_heads:
+                    head_logits = logits[name]
+                    stats = metrics_buf[name]
+                    stats["total"] += batch_size_actual
+                    best_slice = np.ascontiguousarray(best[name][start:end], dtype=np.int64)
+                    second_slice = np.ascontiguousarray(second[name][start:end], dtype=np.int64)
+                    best_tensor = torch.from_numpy(best_slice)
+                    second_tensor = torch.from_numpy(second_slice)
+                    if non_blocking:
+                        best_tensor = best_tensor.pin_memory()
+                        second_tensor = second_tensor.pin_memory()
+                    best_dev = best_tensor.to(device=device, dtype=torch.long, non_blocking=non_blocking)
+                    second_dev = second_tensor.to(device=device, dtype=torch.long, non_blocking=non_blocking)
+                    classes = head_logits.shape[1]
+                    k = min(3, classes)
+                    topk_indices = torch.topk(head_logits, k=k, dim=1).indices
+                    pred1 = topk_indices[:, 0]
+                    stats["top1"] += (pred1 == best_dev).sum()
+                    if classes >= 2:
+                        in_top2 = (topk_indices[:, : min(2, k)] == best_dev.unsqueeze(1)).any(dim=1)
+                    else:
+                        in_top2 = pred1 == best_dev
+                    stats["top2"] += in_top2.sum()
+                    in_top3 = (topk_indices[:, :k] == best_dev.unsqueeze(1)).any(dim=1)
+                    stats["top3"] += in_top3.sum()
+                    valid_second = second_dev >= 0
+                    match_three = (pred1 == best_dev) | (valid_second & (pred1 == second_dev))
+                    stats["three_choice"] += match_three.sum()
+    finally:
+        if was_training:
+            model.train()
+
+    metrics: Dict[str, Dict[str, float]] = {}
+    for name in active_heads:
+        stats = metrics_buf[name]
+        total_count = int(stats["total"].item())
+        if total_count == 0:
+            metrics[name] = {
+                "top1": float("nan"),
+                "top2": float("nan"),
+                "top3": float("nan"),
+                "three_choice": float("nan"),
+            }
+            continue
+        metrics[name] = {
+            "top1": float(stats["top1"].item() / total_count),
+            "top2": float(stats["top2"].item() / total_count),
+            "top3": float(stats["top3"].item() / total_count),
+            "three_choice": float(stats["three_choice"].item() / total_count),
+        }
+    return metrics
+
+
+def dump_logits_to_npz(
+    model: "torch.nn.Module",
+    features: object,
+    device: "torch.device",
+    *,
+    batch_size: int,
+    amp: str,
+    desc: str,
+    output_path: Path,
+) -> None:
+    """ロジットを明示的に保存する (CPU 転送を伴う) ユーティリティ。"""
+
+    logging.info("%s: CPU 転送を伴うロジット書き出しを開始します -> %s", desc, output_path)
+    logits = predict_logits_with_progress(
+        model,
+        features,
+        device,
+        batch_size=batch_size,
+        amp=amp,
+        desc=desc,
+        allow_cpu_transfer=True,
+    )
+    np.savez(output_path, **logits)
+    logging.info("%s: ロジットを書き出しました", desc)
 
 
 def format_metrics(metrics: Dict[str, float]) -> str:
@@ -1261,11 +1482,17 @@ def macro_average(metrics: Dict[str, Dict[str, float]]) -> Dict[str, float]:
 def _amp_context(device: "torch.device", amp_mode: str):
     """AMP 設定に応じて適切なコンテキストを返す。"""
 
-    if torch is None or amp_mode.lower() != "bf16":
+    if torch is None:
+        return nullcontext()
+    mode = (amp_mode or "none").lower()
+    if mode not in ("bf16", "fp16"):
+        return nullcontext()
+    dtype = torch.bfloat16 if mode == "bf16" else torch.float16
+    if device.type == "cpu":
         return nullcontext()
     if device.type == "xpu" and hasattr(torch, "xpu"):
-        return torch.xpu.amp.autocast(dtype=torch.bfloat16)  # type: ignore[attr-defined]
-    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        return torch.xpu.amp.autocast(dtype=dtype)  # type: ignore[attr-defined]
+    return torch.autocast(device_type=device.type, dtype=dtype)
 
 
 def train_with_torch_backend(
@@ -1294,21 +1521,36 @@ def train_with_torch_backend(
         except Exception:
             pass
 
-    device = pick_device(args.device)
+    device = getattr(args, "device_resolved", None)
+    if device is None:
+        device = pick_device(args.device)
     logging.info("PyTorch デバイス: %s", device)
     amp_arg = (args.amp or "auto").lower()
     if amp_arg == "auto":
         amp_mode = "bf16" if device.type == "xpu" else "none"
     else:
         amp_mode = amp_arg
-    if amp_mode == "bf16" and device.type == "cpu":
-        if not hasattr(torch, "cpu") or not getattr(torch.cpu, "is_bf16_supported", lambda: False)():  # type: ignore[attr-defined]
-            logging.warning("CPU が bfloat16 をサポートしていないため AMP を無効化します")
+    if amp_mode not in ("none", "bf16", "fp16"):
+        logging.warning("未知の AMP 指定 %s のため無効化します", amp_mode)
+        amp_mode = "none"
+    if device.type == "cpu" and amp_mode in ("bf16", "fp16"):
+        logging.warning("CPU では指定された AMP モード %s を利用できないため無効化します", amp_mode)
+        amp_mode = "none"
+    if device.type == "cuda" and amp_mode == "bf16":
+        is_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        if not is_supported:
+            logging.warning("この CUDA デバイスは bfloat16 をサポートしていないため AMP を無効化します")
             amp_mode = "none"
+    if device.type == "xpu" and amp_mode == "fp16":
+        logging.warning("XPU では fp16 AMP をサポートしていないため無効化します")
+        amp_mode = "none"
 
     model = TorchMultiTask(mean, std, dropout=args.dropout, disabled_heads=disabled_heads)
     model.inference_temperature = max(float(args.temperature), 1e-6)
     model.to(device)
+
+    if device.type == "cuda" and hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")  # type: ignore[attr-defined]
 
     model_forward = model
     if args.compile:
@@ -1329,14 +1571,39 @@ def train_with_torch_backend(
 
     head_list = list(active_heads)
 
+    train_best_np = {name: np.ascontiguousarray(train_best[name], dtype=np.int64) for name in active_heads}
+    train_second_np = {name: np.ascontiguousarray(train_second[name], dtype=np.int64) for name in active_heads}
+    val_best_np = {name: np.ascontiguousarray(val_best[name], dtype=np.int64) for name in active_heads}
+    val_second_np = {name: np.ascontiguousarray(val_second[name], dtype=np.int64) for name in active_heads}
+
     train_targets: Dict[str, np.ndarray] = {}
     for name in active_heads:
         train_targets[name] = build_soft_targets(
-            train_best[name],
-            train_second[name],
+            train_best_np[name],
+            train_second_np[name],
             HEAD_SPECS[name],
             args.epsilon_soft,
         ).astype(np.float32)
+        train_targets[name] = np.ascontiguousarray(train_targets[name], dtype=np.float32)
+
+    eval_batch_raw = getattr(args, "eval_batch_size", None)
+    if eval_batch_raw is None or int(eval_batch_raw) <= 0:
+        eval_batch_raw = args.batch_size
+    eval_batch = max(1, int(eval_batch_raw))
+    eval_batch = min(eval_batch, int(args.max_batch))
+
+    if device.type == "cuda" and args.batch_size < 8192:
+        logging.warning("WARNING: Small batch on CUDA; increase --batch-size to reduce host↔device overhead.")
+
+    logging.info(
+        "Training start: backend=torch device=%s amp=%s batch=%d eval_batch=%d metrics_on_gpu=yes",
+        device,
+        amp_mode,
+        args.batch_size,
+        eval_batch,
+    )
+
+    non_blocking = device.type == "cuda"
 
     best_state: Optional[Dict[str, torch.Tensor]] = None
     best_train_metrics: Dict[str, Dict[str, float]] = {}
@@ -1368,11 +1635,15 @@ def train_with_torch_backend(
             _prefetch_training_batches(train_features, train_targets, active_heads, batches), start=1
         ):
             xb_cpu = torch.from_numpy(features_np)
-            xb = xb_cpu.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
+            if non_blocking:
+                xb_cpu = xb_cpu.pin_memory()
+            xb = xb_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
             target_tensors: Dict[str, torch.Tensor] = {}
             for name in active_heads:
                 target_cpu = torch.from_numpy(targets_np[name])
-                target_tensors[name] = target_cpu.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
+                if non_blocking:
+                    target_cpu = target_cpu.pin_memory()
+                target_tensors[name] = target_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
             optimizer.zero_grad(set_to_none=True)
             with _amp_context(device, amp_mode):
                 logits = model_forward(xb)
@@ -1385,7 +1656,8 @@ def train_with_torch_backend(
             loss_tensor.backward()
             optimizer.step()
             batch_size_actual = batch_idx.shape[0]
-            epoch_loss += float(loss_tensor.detach().cpu()) * batch_size_actual
+            loss_scalar = float(loss_tensor.detach().item())
+            epoch_loss += loss_scalar * batch_size_actual
             sample_seen += batch_size_actual
             progress.update(1)
 
@@ -1393,31 +1665,38 @@ def train_with_torch_backend(
 
         mean_loss = epoch_loss / max(1, sample_seen)
 
-        model_forward.eval()
-        model.eval()
-        eval_batch = min(args.max_batch, 8192)
-        train_logits = predict_logits_with_progress(
+        logging.info(
+            "訓練ロジット算出開始: device=%s amp=%s batch=%d metrics_on_gpu=yes",
+            device,
+            amp_mode,
+            eval_batch,
+        )
+        train_metrics = compute_metrics_on_device_with_progress(
             model_forward,
             train_features,
             device,
+            train_best_np,
+            train_second_np,
             batch_size=eval_batch,
             amp=amp_mode,
             desc="訓練ロジット算出中",
         )
-        val_logits = predict_logits_with_progress(
+        logging.info(
+            "評価ロジット算出開始: device=%s amp=%s batch=%d metrics_on_gpu=yes",
+            device,
+            amp_mode,
+            eval_batch,
+        )
+        val_metrics = compute_metrics_on_device_with_progress(
             model_forward,
             val_features,
             device,
+            val_best_np,
+            val_second_np,
             batch_size=eval_batch,
             amp=amp_mode,
             desc="評価ロジット算出中",
         )
-
-        train_metrics: Dict[str, Dict[str, float]] = {}
-        val_metrics: Dict[str, Dict[str, float]] = {}
-        for name in active_heads:
-            train_metrics[name] = compute_metrics(train_logits[name], train_best[name], train_second[name])
-            val_metrics[name] = compute_metrics(val_logits[name], val_best[name], val_second[name])
 
         mean_top3 = float(np.mean([val_metrics[name]["top3"] for name in head_list]))
         mean_three_choice = float(np.mean([val_metrics[name]["three_choice"] for name in head_list]))
@@ -1451,6 +1730,29 @@ def train_with_torch_backend(
         if model_forward is not model:
             model_forward.load_state_dict(best_state)
 
+    dump_dir = getattr(args, "dump_logits", None)
+    if dump_dir is not None:
+        dump_path = Path(dump_dir)
+        dump_path.mkdir(parents=True, exist_ok=True)
+        dump_logits_to_npz(
+            model_forward,
+            train_features,
+            device,
+            batch_size=eval_batch,
+            amp=amp_mode,
+            desc="訓練ロジットダンプ中",
+            output_path=dump_path / "train_logits.npz",
+        )
+        dump_logits_to_npz(
+            model_forward,
+            val_features,
+            device,
+            batch_size=eval_batch,
+            amp=amp_mode,
+            desc="評価ロジットダンプ中",
+            output_path=dump_path / "val_logits.npz",
+        )
+
     return model, best_train_metrics, best_val_metrics
 
 
@@ -1462,6 +1764,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--lr", type=float, default=1e-3, help="学習率")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="L2 正則化係数")
     parser.add_argument("--batch-size", type=int, default=512, help="ミニバッチサイズ")
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=None,
+        help="評価時のミニバッチサイズ (未指定時は学習バッチと同じ)",
+    )
     parser.add_argument("--seed", type=int, default=42, help="乱数シード")
     parser.add_argument("--dropout", type=float, default=0.1, help="ドロップアウト率")
     parser.add_argument(
@@ -1533,16 +1841,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--amp",
-        choices=["bf16", "none", "auto"],
+        choices=["bf16", "fp16", "none", "auto"],
         default="auto",
         help="PyTorch バックエンドで利用する自動混合精度",
     )
     parser.add_argument("--compile", action="store_true", help="torch.compile を試行する")
+    parser.add_argument(
+        "--dump-logits",
+        type=Path,
+        default=None,
+        help="評価ロジットを NPZ として保存するディレクトリ (明示指定時のみ CPU 転送)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     backend = args.backend.lower()
+    if backend == "torch" and torch is not None:
+        args.device_resolved = pick_device(args.device)
+    eval_batch_display = (
+        args.eval_batch_size if args.eval_batch_size is not None and args.eval_batch_size > 0 else args.batch_size
+    )
+    print(
+        f"INFO: Backend={args.backend}, Device={args.device}, AMP={args.amp}, "
+        f"Batch={args.batch_size}, EvalBatch={eval_batch_display}"
+    )
+    if torch is not None:
+        cuda_available = torch.cuda.is_available()
+        try:
+            cuda_name = torch.cuda.get_device_name(0) if cuda_available else "N/A"
+        except Exception:
+            cuda_name = "N/A"
+    else:
+        cuda_available = False
+        cuda_name = "N/A"
+    print(f"INFO: torch.cuda.is_available()={cuda_available}, cuda_device={cuda_name}")
+
     try:
         cond_heads = parse_condition_head_list(args.condition_heads)
     except ValueError as exc:

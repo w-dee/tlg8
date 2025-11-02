@@ -79,13 +79,12 @@ def _ensure_torch() -> "torch":
 
 
 def pick_device(prefer: str = "auto") -> "torch.device":
-    """利用可能なデバイスから優先候補を選択するヘルパー。"""
+    """CLI 指定に忠実なデバイス選択を行うヘルパー。"""
 
     torch_mod = _ensure_torch()
     prefer_raw = prefer or ""
     prefer_norm = prefer_raw.lower()
 
-    # auto は CUDA → XPU → MPS → CPU の順に探索する
     if prefer_norm in ("", "auto"):
         if torch_mod.cuda.is_available():
             return torch_mod.device("cuda")
@@ -96,41 +95,58 @@ def pick_device(prefer: str = "auto") -> "torch.device":
         logging.warning("利用可能な GPU が見つからなかったため CPU を使用します")
         return torch_mod.device("cpu")
 
-    if prefer_norm.startswith("cuda"):
+    if prefer_norm == "cuda":
+        if torch_mod.cuda.is_available():
+            return torch_mod.device("cuda")
+        logging.warning("CUDA が要求されましたが利用できないため CPU にフォールバックします")
+        return torch_mod.device("cpu")
+
+    if prefer_norm.startswith("cuda:"):
         if torch_mod.cuda.is_available():
             try:
                 return torch_mod.device(prefer_raw)
             except Exception:
-                logging.warning("指定された CUDA デバイス %s を初期化できませんでした。最初の CUDA デバイスを使用します", prefer_raw)
-                return torch_mod.device("cuda")  # type: ignore[arg-type]
-        logging.warning("CUDA デバイスが利用できないため CPU にフォールバックします")
+                logging.warning("CUDA デバイス %s の初期化に失敗したため最初の CUDA デバイスを使用します", prefer_raw)
+                return torch_mod.device("cuda")
+        logging.warning("CUDA が要求されましたが利用できないため CPU にフォールバックします")
+        return torch_mod.device("cpu")
+
+    if prefer_norm == "cpu":
         return torch_mod.device("cpu")
 
     if prefer_norm == "xpu":
         if hasattr(torch_mod, "xpu") and torch_mod.xpu.is_available():
             return torch_mod.device("xpu")
-        logging.warning("XPU デバイスが見つからないため CPU を使用します")
+        logging.warning("XPU が要求されましたが利用できないため CPU にフォールバックします")
         return torch_mod.device("cpu")
 
     if prefer_norm == "mps":
         if getattr(torch_mod.backends, "mps", None) and torch_mod.backends.mps.is_available():
             return torch_mod.device("mps")
-        logging.warning("MPS バックエンドが利用できないため CPU を使用します")
+        logging.warning("MPS が要求されましたが利用できないため CPU にフォールバックします")
         return torch_mod.device("cpu")
 
-    if prefer_norm != "cpu":
-        logging.warning("未知のデバイス指定 %s のため CPU にフォールバックします", prefer_raw)
-    return torch_mod.device("cpu")
+    try:
+        return torch_mod.device(prefer_raw)
+    except Exception:
+        logging.warning("未知または初期化失敗のデバイス指定 %s のため CPU にフォールバックします", prefer_raw)
+        return torch_mod.device("cpu")
 
 
 def _autocast_cm(device: "torch.device", amp: str) -> object:
     """AMP 設定に応じた自動混合精度コンテキストを返す。"""
 
-    if torch is None or amp.lower() != "bf16":
+    if torch is None:
+        return nullcontext()
+    mode = (amp or "none").lower()
+    if mode not in ("bf16", "fp16"):
+        return nullcontext()
+    dtype = torch.bfloat16 if mode == "bf16" else torch.float16
+    if device.type == "cpu":
         return nullcontext()
     if device.type == "xpu" and hasattr(torch, "xpu"):
-        return torch.xpu.amp.autocast(dtype=torch.bfloat16)  # type: ignore[attr-defined]
-    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        return torch.xpu.amp.autocast(dtype=dtype)  # type: ignore[attr-defined]
+    return torch.autocast(device_type=device.type, dtype=dtype)
 
 
 class TorchMultiTask(nn.Module if nn is not None else object):
@@ -287,6 +303,7 @@ def predict_logits_batched(
     *,
     batch_size: int = 8192,
     amp: str = "bf16",
+    allow_cpu_transfer: bool = False,
 ) -> Dict[str, np.ndarray]:
     """PyTorch モデルでバッチ推論を行い NumPy 配列を返す。"""
 
@@ -312,6 +329,11 @@ def predict_logits_batched(
             else np.empty((HEAD_SPECS[name],), dtype=np.float32)
             for name in active_heads
         }
+    if torch_mod.device(device).type == "cuda" and not allow_cpu_transfer:
+        raise RuntimeError(
+            "Per-batch CPU logits pull disabled on CUDA. Use on-GPU metric accumulation or --dump-logits explicitly."
+        )
+
     outputs: Dict[str, np.ndarray] = {
         name: np.empty((total, HEAD_SPECS[name]), dtype=np.float32)
         for name in active_heads
