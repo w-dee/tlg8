@@ -1774,9 +1774,14 @@ def train_with_torch_backend(
         logging.warning("XPU では fp16 AMP をサポートしていないため無効化します")
         amp_mode = "none"
 
-    model = TorchMultiTask(mean, std, dropout=args.dropout, disabled_heads=disabled_heads)
-    model.inference_temperature = max(float(args.temperature), 1e-6)
-    model.to(device)
+    model = TorchMultiTask(mean, std, dropout=args.dropout, disabled_heads=disabled_heads).to(device)
+    # 既存モデルから初期化（入力統計はロード側に合わせる）
+    if args.init_from is not None:
+        loaded = TorchMultiTask.load_torch(str(args.init_from), map_location=device)
+        model.load_state_dict(loaded.state_dict(), strict=True)
+        model.inference_temperature = getattr(loaded, "inference_temperature", 1.0)
+    else:
+        model.inference_temperature = max(float(args.temperature), 1e-6)
     if device.type == "cuda":
         first_param = next(model.parameters(), None)
         if first_param is not None:
@@ -1819,6 +1824,16 @@ def train_with_torch_backend(
         raise ValueError("学習対象ヘッドが存在しません")
 
     head_list = list(active_heads)
+
+    # ヘッド別損失重みのパース
+    head_loss_w = {name: 1.0 for name in active_heads}
+    if args.head_loss_weights:
+        for kv in args.head_loss_weights.split(","):
+            k, v = kv.split("=")
+            k = k.strip()
+            v = float(v)
+            if k in head_loss_w:
+                head_loss_w[k] = v
 
     train_best_np = {name: np.ascontiguousarray(train_best[name], dtype=np.int64) for name in active_heads}
     train_second_np = {name: np.ascontiguousarray(train_second[name], dtype=np.int64) for name in active_heads}
@@ -1903,9 +1918,8 @@ def train_with_torch_backend(
                 loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
                 for name in active_heads:
                     log_probs = torch_F.log_softmax(logits[name], dim=1)
-                    loss_tensor = loss_tensor + torch_F.kl_div(
-                        log_probs, target_tensors[name], reduction="batchmean"
-                    )
+                    loss_h = torch_F.kl_div(log_probs, target_tensors[name], reduction="batchmean")
+                    loss_tensor = loss_tensor + head_loss_w[name] * loss_h
             loss_tensor.backward()
             optimizer.step()
             batch_size_actual = batch_idx.shape[0]
@@ -2056,6 +2070,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--test-ratio", type=float, default=0.2, help="評価データ比率")
     parser.add_argument("--patience", type=int, default=20, help="早期終了の待機エポック数")
     parser.add_argument("--export-dir", type=Path, help="学習済みモデルの保存先ディレクトリ")
+    parser.add_argument("--init-from", type=Path, default=None, help="保存済みPyTorchモデルから初期化")
+    parser.add_argument(
+        "--head-loss-weights",
+        type=str,
+        default="",
+        help="ヘッド別の損失重み (例: predictor=1.0,filter_perm=2.5)",
+    )
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
     parser.add_argument(
