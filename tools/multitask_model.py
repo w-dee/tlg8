@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Sequence, Tuple, TYPE_CHECKING
+from typing import Callable, Dict, List, Sequence, Tuple, TYPE_CHECKING, Mapping
 
 import sys
 
@@ -180,10 +180,14 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self.fc3 = nn.Linear(1536, self.hidden_dim)
         self.dropout1 = nn.Dropout(self.dropout_rate)
         self.dropout2 = nn.Dropout(self.dropout_rate)
-        disabled_set = {name for name in disabled_heads}
+        disabled_seq = tuple(disabled_heads)
+        disabled_set = {name for name in disabled_seq}
         unknown = disabled_set - set(HEAD_ORDER)
         if unknown:
             raise ValueError(f"無効化対象のヘッド名が不正です: {sorted(unknown)}")
+        self.disabled_heads: Tuple[str, ...] = tuple(
+            name for name in HEAD_ORDER if name in disabled_set
+        )
         self.active_heads: Tuple[str, ...] = tuple(
             name for name in HEAD_ORDER if name not in disabled_set
         )
@@ -269,15 +273,19 @@ class TorchMultiTask(nn.Module if nn is not None else object):
     def save_torch(self, path: str) -> None:
         """state_dict とスケーラ情報を保存する。"""
 
-        _ensure_torch()
+        torch_mod = _ensure_torch()
+        state_dict = {k: v.detach().cpu() for k, v in self.state_dict().items()}
+        mean_np = np.asarray(self.feature_mean.detach().cpu().numpy(), dtype=np.float32)
+        std_np = np.asarray(self.feature_std.detach().cpu().numpy(), dtype=np.float32)
         payload = {
-            "state_dict": {k: v.detach().cpu() for k, v in self.state_dict().items()},
-            "mean": self.feature_mean.detach().cpu().numpy(),
-            "std": self.feature_std.detach().cpu().numpy(),
-            "dropout": self.dropout_rate,
-            "inference_temperature": self.inference_temperature,
+            "train_mean": mean_np.tolist(),
+            "train_std": std_np.tolist(),
+            "dropout": float(self.dropout_rate),
+            "disabled_heads": list(self.disabled_heads),
+            "inference_temperature": float(self.inference_temperature),
+            "state_dict": state_dict,
         }
-        torch.save(payload, path)  # type: ignore[union-attr]
+        torch_mod.save(payload, path)  # type: ignore[union-attr]
 
     @staticmethod
     def load_torch(path: str, map_location=None):
@@ -289,22 +297,77 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         """
         import torch as _torch
         import torch.serialization as _ser
+        logger = logging.getLogger(__name__)
         try:
-            # (A) allowlist を追加して weights_only=True で読む
-            _ser.add_safe_globals([__import__("numpy")._core.multiarray._reconstruct])
+            _ser.add_safe_globals([np._core.multiarray._reconstruct])  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
             payload = _torch.load(path, map_location=map_location, weights_only=True)
         except Exception:
-            # (B) それでも失敗する場合は weights_only=False（※信頼済みファイル前提）
             payload = _torch.load(path, map_location=map_location, weights_only=False)
 
         if isinstance(payload, TorchMultiTask):
             return payload
-        m = TorchMultiTask(payload["train_mean"], payload["train_std"],
-                           dropout=payload.get("dropout", 0.0),
-                           disabled_heads=payload.get("disabled_heads", []))
-        m.load_state_dict(payload["state_dict"])
-        m.inference_temperature = payload.get("inference_temperature", 1.0)
-        return m
+
+        state: Mapping[str, object]
+        dropout = 0.1
+        disabled_heads: Sequence[str] = ()
+        inference_temperature = 1.0
+        train_mean_raw: object | None = None
+        train_std_raw: object | None = None
+
+        if isinstance(payload, Mapping):
+            state_candidate = payload.get("state_dict")
+            if isinstance(state_candidate, Mapping):
+                state = state_candidate
+            else:
+                state = payload  # type: ignore[assignment]
+            train_mean_raw = payload.get("train_mean", payload.get("mean"))
+            train_std_raw = payload.get("train_std", payload.get("std"))
+            dropout_value = payload.get("dropout", payload.get("dropout_rate"))
+            dropout = float(dropout_value) if dropout_value is not None else 0.1
+            disabled_heads = tuple(str(name) for name in payload.get("disabled_heads", ()))  # type: ignore[arg-type]
+            inference_temperature = float(payload.get("inference_temperature", 1.0))
+        else:
+            state = payload  # type: ignore[assignment]
+
+        def _as_array(raw: object | None) -> np.ndarray | None:
+            if raw is None:
+                return None
+            if hasattr(raw, "detach"):
+                raw = raw.detach().cpu().numpy()  # type: ignore[union-attr]
+            return np.asarray(raw, dtype=np.float32)
+
+        train_mean = _as_array(train_mean_raw)
+        train_std = _as_array(train_std_raw)
+
+        if (train_mean is None or train_std is None) and isinstance(state, Mapping):
+            mean_buf = state.get("feature_mean")
+            std_buf = state.get("feature_std")
+            if mean_buf is not None and std_buf is not None:
+                train_mean = _as_array(mean_buf)
+                train_std = _as_array(std_buf)
+
+        if train_mean is None or train_std is None:
+            raise ValueError("train_mean/train_std がチェックポイントから復元できませんでした")
+
+        if not isinstance(state, Mapping):
+            raise TypeError("state_dict 形式が不正です")
+
+        model = TorchMultiTask(
+            train_mean,
+            train_std,
+            dropout=dropout,
+            disabled_heads=disabled_heads,
+        )
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            logger.warning("load_torch: 未ロードキー数=%d 例=%s", len(missing), list(missing)[:8])
+        if unexpected:
+            logger.warning("load_torch: 余剰キー数=%d 例=%s", len(unexpected), list(unexpected)[:8])
+        model.inference_temperature = inference_temperature
+        return model
 
 def predict_logits_batched(
     model: TorchMultiTask,

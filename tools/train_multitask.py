@@ -27,6 +27,8 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 try:  # 高速 JSON デコードが利用可能ならば切り替える
     import orjson as _fastjson  # type: ignore[import]
 except Exception:  # pragma: no cover - orjson 未導入環境
@@ -1773,6 +1775,36 @@ def train_with_torch_backend(
     if device.type == "xpu" and amp_mode == "fp16":
         logging.warning("XPU では fp16 AMP をサポートしていないため無効化します")
         amp_mode = "none"
+
+    import numpy as _np
+
+    train_mean = None
+    train_std = None
+
+    try:
+        scaler_path = Path(args.scaler) if args.scaler else None
+        if scaler_path is not None and scaler_path.exists():
+            with _np.load(scaler_path) as _sc:
+                if "mean" in _sc and "std" in _sc:
+                    train_mean = _np.asarray(_sc["mean"], dtype=_np.float32)
+                    train_std = _np.asarray(_sc["std"], dtype=_np.float32)
+                    logger.info("スケーラーから train_mean/std を復元 (dims=%d)", train_mean.shape[0])
+    except Exception as _exc:
+        logger.warning("スケーラーからの mean/std 復元に失敗: %s", _exc)
+
+    if (train_mean is None or train_std is None) and args.feature_cache:
+        try:
+            feats = _np.load(args.feature_cache, mmap_mode="r")
+            train_mean = _np.asarray(feats.mean(axis=0), dtype=_np.float32)
+            train_std = _np.asarray(feats.std(axis=0) + 1e-8, dtype=_np.float32)
+            logger.info("特徴量キャッシュから train_mean/std を推定 (dims=%d)", train_mean.shape[0])
+        except Exception as _exc:
+            logger.warning("特徴量キャッシュからの mean/std 推定に失敗: %s", _exc)
+
+    if train_mean is None or train_std is None:
+        train_mean = _np.asarray(mean, dtype=_np.float32)
+        train_std = _np.asarray(std, dtype=_np.float32)
+        logger.info("既存 mean/std を利用して train_mean/std を初期化 (dims=%d)", train_mean.shape[0])
 
     model = TorchMultiTask(train_mean, train_std, dropout=args.dropout, disabled_heads=disabled_heads).to(device)
     # 既存モデルから初期化（保存形式を自動判別）
