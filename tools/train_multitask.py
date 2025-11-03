@@ -1774,12 +1774,45 @@ def train_with_torch_backend(
         logging.warning("XPU では fp16 AMP をサポートしていないため無効化します")
         amp_mode = "none"
 
-    model = TorchMultiTask(mean, std, dropout=args.dropout, disabled_heads=disabled_heads).to(device)
-    # 既存モデルから初期化（入力統計はロード側に合わせる）
+    model = TorchMultiTask(train_mean, train_std, dropout=args.dropout, disabled_heads=disabled_heads).to(device)
+    # 既存モデルから初期化（保存形式を自動判別）
     if args.init_from is not None:
-        loaded = TorchMultiTask.load_torch(str(args.init_from), map_location=device)
-        model.load_state_dict(loaded.state_dict(), strict=True)
-        model.inference_temperature = getattr(loaded, "inference_temperature", 1.0)
+        import torch as _torch
+        import torch.serialization as _ser
+        from collections.abc import Mapping
+
+        def _safe_load_any(path, map_location):
+            # (A) safe_globals を追加して weights_only=True を試す
+            try:
+                import numpy as _np
+                _ser.add_safe_globals([_np._core.multiarray._reconstruct])
+                return _torch.load(path, map_location=map_location, weights_only=True)
+            except Exception:
+                # (B) フォールバック（信頼済みファイル前提）
+                return _torch.load(path, map_location=map_location, weights_only=False)
+
+        payload = _safe_load_any(str(args.init_from), map_location=device)
+
+        # 3 形式に対応：
+        # (1) TorchMultiTask オブジェクト
+        # (2) {"state_dict": ..., <meta...>} の辞書
+        # (3) 純 state_dict（= そのまま key->Tensor）
+        if isinstance(payload, TorchMultiTask):
+            state = payload.state_dict()
+            model.inference_temperature = getattr(payload, "inference_temperature", 1.0)
+        elif isinstance(payload, Mapping) and "state_dict" in payload:
+            state = payload["state_dict"]
+            model.inference_temperature = payload.get("inference_temperature", getattr(model, "inference_temperature", 1.0))
+        else:
+            # 純 state_dict とみなす
+            state = payload
+
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            logger.warning(f"[init-from] missing keys: {len(missing)} e.g. {missing[:8]}")
+        if unexpected:
+            logger.warning(f"[init-from] unexpected keys: {len(unexpected)} e.g. {unexpected[:8]}")
+
     else:
         model.inference_temperature = max(float(args.temperature), 1e-6)
     if device.type == "cuda":

@@ -280,19 +280,31 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         torch.save(payload, path)  # type: ignore[union-attr]
 
     @staticmethod
-    def load_torch(path: str, *, map_location: str | "torch.device" | None = None) -> "TorchMultiTask":
-        """保存済み PyTorch モデルを復元する。"""
+    def load_torch(path: str, map_location=None):
+        """
+        PyTorch 2.6+ は torch.load の既定が weights_only=True になったため、
+        古い pickle（numpy._core.multiarray._reconstruct 等）で UnpicklingError が起きる。
+        信頼できるチェックポイントに対してのみ、(A) safe_globals 追加 → weights_only=True、
+        それでも無理なら (B) weights_only=False にフォールバックする。
+        """
+        import torch as _torch
+        import torch.serialization as _ser
+        try:
+            # (A) allowlist を追加して weights_only=True で読む
+            _ser.add_safe_globals([__import__("numpy")._core.multiarray._reconstruct])
+            payload = _torch.load(path, map_location=map_location, weights_only=True)
+        except Exception:
+            # (B) それでも失敗する場合は weights_only=False（※信頼済みファイル前提）
+            payload = _torch.load(path, map_location=map_location, weights_only=False)
 
-        torch_mod = _ensure_torch()
-        payload = torch_mod.load(path, map_location=map_location)
-        mean = np.asarray(payload["mean"], dtype=np.float32)
-        std = np.asarray(payload["std"], dtype=np.float32)
-        dropout = float(payload.get("dropout", 0.1))
-        model = TorchMultiTask(mean, std, dropout=dropout)
-        model.load_state_dict(payload["state_dict"])  # type: ignore[arg-type]
-        model.inference_temperature = float(payload.get("inference_temperature", 1.0))
-        return model
-
+        if isinstance(payload, TorchMultiTask):
+            return payload
+        m = TorchMultiTask(payload["train_mean"], payload["train_std"],
+                           dropout=payload.get("dropout", 0.0),
+                           disabled_heads=payload.get("disabled_heads", []))
+        m.load_state_dict(payload["state_dict"])
+        m.inference_temperature = payload.get("inference_temperature", 1.0)
+        return m
 
 def predict_logits_batched(
     model: TorchMultiTask,
