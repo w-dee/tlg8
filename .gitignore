@@ -5,6 +5,8 @@
 /data/
 /models/
 /.cache/
+/runs/
+
 
 
 # Analysis temporary
