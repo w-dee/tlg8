@@ -1983,8 +1983,28 @@ def train_with_torch_backend(
                 loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
                 for name in active_heads:
                     log_probs = torch_F.log_softmax(logits[name], dim=1)
-                    loss_h = torch_F.kl_div(log_probs, target_tensors[name], reduction="batchmean")
-                    loss_tensor = loss_tensor + head_loss_w[name] * loss_h
+                    if name != "filter_perm":
+                        loss_h = torch_F.kl_div(log_probs, target_tensors[name], reduction="batchmean")
+                        loss_tensor = loss_tensor + head_loss_w[name] * loss_h
+                    else:
+                        # ---- filter_perm: hard-example + focal weighting ----
+                        with torch.no_grad():
+                            probs = log_probs.exp()
+                            true_idx = target_tensors[name].argmax(dim=1)               # (B,)
+                            p_true = probs.gather(1, true_idx.unsqueeze(1)).squeeze(1)  # (B,)
+                            topk_idx = logits[name].topk(3, dim=1).indices               # (B,3)
+                            hard_mask = (topk_idx != true_idx.unsqueeze(1)).all(dim=1)  # True if NOT in top-3
+                            # weights: (1 + alpha) for hard, *= (1 - p_true)^gamma (focal)
+                            w = torch.ones_like(p_true)
+                            if args.perm_hard_alpha > 0:
+                                w = w + args.perm_hard_alpha * hard_mask.float()
+                            if args.perm_focal_gamma > 0:
+                                w = w * (1.0 - p_true).pow(args.perm_focal_gamma)
+                        # per-sample KL, then weight & mean
+                        kl_per_sample = torch_F.kl_div(log_probs, target_tensors[name], reduction="none").sum(dim=1)
+                        loss_h = (w * kl_per_sample).mean()
+                        loss_tensor = loss_tensor + head_loss_w[name] * loss_h
+
             loss_tensor.backward()
             optimizer.step()
             batch_size_actual = batch_idx.shape[0]
@@ -2142,6 +2162,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="",
         help="ヘッド別の損失重み (例: predictor=1.0,filter_perm=2.5)",
     )
+    parser.add_argument("--perm-hard-alpha", type=float, default=1.0, help="filter_perm の hard例(真ラベルがtop3外)の加重倍率-1 (1.0で2倍)")
+    parser.add_argument("--perm-focal-gamma", type=float, default=1.0, help="filter_perm の focal重みのγ (0で無効)")
+
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
     parser.add_argument(
