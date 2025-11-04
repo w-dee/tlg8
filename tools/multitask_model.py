@@ -38,6 +38,7 @@ HEAD_SPECS: Dict[str, int] = {
     "filter_secondary": 4,
     "reorder": 8,
     "interleave": 2,
+    "perm": 6,
 }
 
 HEAD_ORDER: Tuple[str, ...] = (
@@ -178,6 +179,13 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self.fc1 = nn.Linear(self.input_dim, 2048)
         self.fc2 = nn.Linear(2048, 1536)
         self.fc3 = nn.Linear(1536, self.hidden_dim)
+        self.perm_hidden = nn.Sequential(
+            nn.Linear(self.hidden_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+        )
+        self.perm_classifier = nn.Linear(256, HEAD_SPECS["filter_perm"])
+        self.perm_logit_scale: float = 1.0
         self.dropout1 = nn.Dropout(self.dropout_rate)
         self.dropout2 = nn.Dropout(self.dropout_rate)
         disabled_seq = tuple(disabled_heads)
@@ -188,15 +196,44 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self.disabled_heads: Tuple[str, ...] = tuple(
             name for name in HEAD_ORDER if name in disabled_set
         )
-        self.active_heads: Tuple[str, ...] = tuple(
+        self._base_active_heads: Tuple[str, ...] = tuple(
             name for name in HEAD_ORDER if name not in disabled_set
         )
-        heads: Dict[str, nn.Linear] = {}
-        for name, classes in HEAD_SPECS.items():
-            if name in self.active_heads:
-                heads[name] = nn.Linear(self.hidden_dim, classes)
+        heads: Dict[str, nn.Module] = {}
+        for name in self._base_active_heads:
+            if name == "filter_perm":
+                continue
+            heads[name] = nn.Linear(self.hidden_dim, HEAD_SPECS[name])
+        heads["perm"] = nn.Linear(self.hidden_dim, HEAD_SPECS["perm"])
         self.heads = nn.ModuleDict(heads)
+        self._condition_heads: Tuple[str, ...] = ()
+        self._update_active_heads()
         self.inference_temperature: float = 1.0
+
+    def _update_active_heads(self) -> None:
+        extras: List[str] = []
+        seen: set[str] = set()
+        for name in self._condition_heads:
+            if name in self.heads and name not in self._base_active_heads and name not in seen:
+                extras.append(name)
+                seen.add(name)
+        self.active_heads = self._base_active_heads + tuple(extras)
+
+    def set_condition_heads(self, names: Sequence[str]) -> None:
+        unique: List[str] = []
+        seen: set[str] = set()
+        for name in names:
+            if name in self.heads and name not in seen:
+                unique.append(name)
+                seen.add(name)
+        self._condition_heads = tuple(unique)
+        self._update_active_heads()
+
+    def set_perm_logit_scale(self, scale: float | None) -> None:
+        if scale is None:
+            self.perm_logit_scale = 1.0
+        else:
+            self.perm_logit_scale = float(scale)
 
     def forward(self, x: "torch.Tensor") -> Dict[str, "torch.Tensor"]:
         """標準化後にトランクとヘッドを順伝播する。"""
@@ -213,7 +250,14 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         h = self.dropout2(h)
         h = F.gelu(self.fc3(h))
         outputs: Dict[str, torch.Tensor] = {}
+        perm_hidden = self.perm_hidden(h)
+        perm_logits = self.perm_classifier(perm_hidden)
+        if self.perm_logit_scale != 1.0:
+            perm_logits = perm_logits * self.perm_logit_scale
+        outputs["filter_perm"] = perm_logits
         for name in self.active_heads:
+            if name == "filter_perm":
+                continue
             outputs[name] = self.heads[name](h)
         return outputs
 

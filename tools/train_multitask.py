@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from collections import Counter
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -76,6 +77,7 @@ from multitask_model import (
     build_soft_targets,
     compute_metrics,
     conditioned_extra_dim,
+    _deterministic_topk_indices,
     pick_device,
     predict_logits_batched,
     train_multitask_model,
@@ -246,7 +248,7 @@ def parse_condition_head_list(raw: str) -> Tuple[str, ...]:
     entries = [item.strip() for item in raw.split(",") if item.strip()]
     if not entries:
         return ()
-    allowed = set(HEAD_ORDER)
+    allowed = set(HEAD_ORDER) | {"perm"}
     result: List[str] = []
     seen: set[str] = set()
     for name in entries:
@@ -257,6 +259,18 @@ def parse_condition_head_list(raw: str) -> Tuple[str, ...]:
         result.append(name)
         seen.add(name)
     return tuple(result)
+
+
+def effective_class_weights(counts: np.ndarray, beta: float) -> "torch.Tensor":
+    """有効サンプル数に基づくクラス重みを算出する。"""
+
+    if torch is None:
+        raise ImportError("PyTorch が必要です")
+    counts64 = np.asarray(counts, dtype=np.float64).clip(min=1.0)
+    beta = float(beta)
+    weights = (1.0 - beta) / (1.0 - np.power(beta, counts64))
+    weights = weights * (counts64.size / np.sum(weights))
+    return torch.from_numpy(weights.astype(np.float32))
 
 
 def _split_filter_code(code: int) -> Tuple[int, int, int]:
@@ -776,6 +790,8 @@ class FastLabels:
         ("filter_secondary", True): 9,
         ("reorder", True): 10,
         ("interleave", True): 11,
+        ("perm", False): 1,
+        ("perm", True): 7,
     }
 
     def __init__(self, store: FastLabelStore, head: str, *, use_second: bool) -> None:
@@ -889,13 +905,14 @@ class LazyLabels:
             return int(entry.get("reorder", default_scalar))
         if self._head == "interleave":
             return int(entry.get("interleave", default_scalar))
-        if self._head in ("filter_perm", "filter_primary", "filter_secondary"):
+        if self._head in ("filter_perm", "filter_primary", "filter_secondary", "perm"):
             code = int(entry.get("filter", default_filter))
             perm, primary, secondary = _split_filter_code(code)
             mapping = {
                 "filter_perm": perm,
                 "filter_primary": primary,
                 "filter_secondary": secondary,
+                "perm": perm,
             }
             return mapping[self._head]
         raise KeyError(f"未知のヘッド名です: {self._head}")
@@ -1581,6 +1598,8 @@ def _compute_metrics_on_device(
 
     non_blocking = device.type == "cuda"
     metrics_buf: Dict[str, Dict[str, torch.Tensor]] = {}
+    margin_values: Dict[str, List[np.ndarray]] = {}
+    confusion_pairs: Dict[str, Counter] = {}
     for name in active_heads:
         metrics_buf[name] = {
             "total": torch.zeros((), device=device, dtype=torch.long),
@@ -1621,7 +1640,8 @@ def _compute_metrics_on_device(
                     second_dev = second_tensor.to(device=device, dtype=torch.long, non_blocking=non_blocking)
                     classes = head_logits.shape[1]
                     k = min(3, classes)
-                    topk_indices = torch.topk(head_logits, k=k, dim=1).indices
+                    topk = torch.topk(head_logits, k=k, dim=1)
+                    topk_indices = topk.indices
                     pred1 = topk_indices[:, 0]
                     stats["top1"] += (pred1 == best_dev).sum()
                     if classes >= 2:
@@ -1634,6 +1654,17 @@ def _compute_metrics_on_device(
                     valid_second = second_dev >= 0
                     match_three = (pred1 == best_dev) | (valid_second & (pred1 == second_dev))
                     stats["three_choice"] += match_three.sum()
+                    if name == "filter_perm":
+                        topk_values = topk.values
+                        third_idx = min(2, k - 1)
+                        third_logit = topk_values[:, third_idx]
+                        true_logit = head_logits.gather(1, best_dev.unsqueeze(1)).squeeze(1)
+                        margin = (true_logit - third_logit).detach().cpu().numpy()
+                        if margin.size > 0:
+                            margin_values.setdefault(name, []).append(margin)
+                        counter = confusion_pairs.setdefault(name, Counter())
+                        pred_cpu = pred1.detach().cpu().tolist()
+                        counter.update(zip(best_slice.tolist(), pred_cpu))
     finally:
         if was_training:
             model.train()
@@ -1656,6 +1687,17 @@ def _compute_metrics_on_device(
             "top3": float(stats["top3"].item() / total_count),
             "three_choice": float(stats["three_choice"].item() / total_count),
         }
+        if name in margin_values and margin_values[name]:
+            margins_np = np.concatenate(margin_values[name])
+            if margins_np.size > 0:
+                metrics[name]["margin_p10"] = float(np.percentile(margins_np, 10.0))
+                metrics[name]["margin_p50"] = float(np.percentile(margins_np, 50.0))
+        counter = confusion_pairs.get(name)
+        if counter:
+            top_pairs = counter.most_common(10)
+            metrics[name]["confusion_topk"] = [
+                (int(t), int(p), int(c)) for (t, p), c in top_pairs
+            ]
     return metrics
 
 
@@ -1668,6 +1710,7 @@ def dump_logits_to_npz(
     amp: str,
     desc: str,
     output_path: Path,
+    targets: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     """ロジットを明示的に保存する (CPU 転送を伴う) ユーティリティ。"""
 
@@ -1681,7 +1724,28 @@ def dump_logits_to_npz(
         desc=desc,
         allow_cpu_transfer=True,
     )
-    np.savez(output_path, **logits)
+    extras: Dict[str, np.ndarray] = {}
+    if targets is not None and "filter_perm" in logits and "filter_perm" in targets:
+        perm_logits = np.asarray(logits["filter_perm"], dtype=np.float32)
+        true_ids = np.asarray(targets["filter_perm"], dtype=np.int64)
+        if true_ids.shape[0] == perm_logits.shape[0]:
+            extras["true_ids_perm"] = true_ids
+            pred_ids = perm_logits.argmax(axis=1).astype(np.int64)
+            extras["pred_ids_perm"] = pred_ids
+            top3 = _deterministic_topk_indices(perm_logits, 3).astype(np.int64)
+            extras["top3_ids_perm"] = top3
+            if top3.shape[1] > 0:
+                third_pos = min(2, top3.shape[1] - 1)
+                topk_vals = np.take_along_axis(perm_logits, top3, axis=1)
+                third_vals = topk_vals[:, third_pos]
+                true_vals = perm_logits[np.arange(perm_logits.shape[0]), true_ids]
+                extras["margins_perm"] = (true_vals - third_vals).astype(np.float32)
+        else:
+            logging.warning(
+                "true_ids_perm の長さ %d がロジット数 %d と一致しません", true_ids.shape[0], perm_logits.shape[0]
+            )
+    payload: Dict[str, np.ndarray] = {**logits, **extras}
+    np.savez(output_path, **payload)
     logging.info("%s: ロジットを書き出しました", desc)
 
 
@@ -1737,6 +1801,7 @@ def train_with_torch_backend(
     mean: np.ndarray,
     std: np.ndarray,
     disabled_heads: Sequence[str],
+    condition_heads: Sequence[str],
 ) -> Tuple[TorchMultiTask, Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     """PyTorch バックエンドでマルチタスクモデルを学習する。"""
 
@@ -1807,6 +1872,8 @@ def train_with_torch_backend(
         logger.info("既存 mean/std を利用して train_mean/std を初期化 (dims=%d)", train_mean.shape[0])
 
     model = TorchMultiTask(train_mean, train_std, dropout=args.dropout, disabled_heads=disabled_heads).to(device)
+    if hasattr(model, "set_condition_heads"):
+        model.set_condition_heads(condition_heads)
     # 既存モデルから初期化（保存形式を自動判別）
     if args.init_from is not None:
         import torch as _torch
@@ -1839,6 +1906,33 @@ def train_with_torch_backend(
             # 純 state_dict とみなす
             state = payload
 
+        if isinstance(state, Mapping):
+            # 形状不一致パラメータは strict=False でも例外になるため事前に間引く
+            model_state = model.state_dict()
+            pruned_keys: List[str] = []
+            try:
+                state = state.copy()  # type: ignore[assignment]
+            except AttributeError:
+                state = dict(state)  # type: ignore[assignment]
+            for key in list(state.keys()):
+                if key not in model_state:
+                    continue
+                src_tensor = state[key]
+                tgt_tensor = model_state[key]
+                src_shape = tuple(src_tensor.shape) if hasattr(src_tensor, "shape") else None  # type: ignore[attr-defined]
+                tgt_shape = tuple(tgt_tensor.shape) if hasattr(tgt_tensor, "shape") else None  # type: ignore[attr-defined]
+                if src_shape is None or tgt_shape is None:
+                    continue
+                if src_shape != tgt_shape:
+                    pruned_keys.append(f"{key}: {src_shape}->{tgt_shape}")
+                    state.pop(key)
+            if pruned_keys:
+                logger.warning(
+                    "[init-from] 形状不一致のため %d 個のパラメータを読み込み対象から除外しました (例: %s)",
+                    len(pruned_keys),
+                    ", ".join(pruned_keys[:4]),
+                )
+
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:
             logger.warning(f"[init-from] missing keys: {len(missing)} e.g. {missing[:8]}")
@@ -1847,6 +1941,8 @@ def train_with_torch_backend(
 
     else:
         model.inference_temperature = max(float(args.temperature), 1e-6)
+    if hasattr(model, "set_perm_logit_scale"):
+        model.set_perm_logit_scale(args.perm_logit_scale)
     if device.type == "cuda":
         first_param = next(model.parameters(), None)
         if first_param is not None:
@@ -1865,6 +1961,34 @@ def train_with_torch_backend(
                 model_forward = model
         else:
             logging.warning("この PyTorch では torch.compile が利用できないため通常モードで実行します")
+
+    def _log_perm_diagnostics(split: str, metrics: Dict[str, Dict[str, float]]) -> None:
+        perm_metrics = metrics.get("filter_perm")
+        if perm_metrics:
+            margin_p10 = perm_metrics.get("margin_p10")
+            margin_p50 = perm_metrics.get("margin_p50")
+            logging.info(
+                "%s filter_perm: top1=%.2f%% top3=%.2f%% margin_p10=%.4f margin_p50=%.4f",
+                split,
+                perm_metrics.get("top1", float("nan")) * 100.0,
+                perm_metrics.get("top3", float("nan")) * 100.0,
+                margin_p10 if margin_p10 is not None else float("nan"),
+                margin_p50 if margin_p50 is not None else float("nan"),
+            )
+            top_pairs = perm_metrics.get("confusion_topk")
+            if top_pairs:
+                formatted = ", ".join(f"t{t}->p{p}:{c}" for t, p, c in top_pairs)
+                logging.info("%s filter_perm confusion topK: %s", split, formatted)
+        for cond_name in condition_heads:
+            head_metrics = metrics.get(cond_name)
+            if head_metrics:
+                logging.info(
+                    "%s %s: top1=%.2f%% top3=%.2f%%",
+                    split,
+                    cond_name,
+                    head_metrics.get("top1", float("nan")) * 100.0,
+                    head_metrics.get("top3", float("nan")) * 100.0,
+                )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler_kwargs = dict(
@@ -1914,6 +2038,19 @@ def train_with_torch_backend(
             args.epsilon_soft,
         ).astype(np.float32)
         train_targets[name] = np.ascontiguousarray(train_targets[name], dtype=np.float32)
+
+    class_weights_perm_tensor: Optional["torch.Tensor"] = None
+    if args.perm_class_balance == "effective":
+        perm_labels = train_best_np.get("filter_perm")
+        if perm_labels is not None:
+            counts = np.bincount(perm_labels, minlength=HEAD_SPECS["filter_perm"])
+            try:
+                class_weights_perm_tensor = effective_class_weights(counts, args.perm_class_beta).to(device=device)
+            except Exception as exc:
+                logging.warning("filter_perm のクラス重み計算に失敗しました: %s", exc)
+                class_weights_perm_tensor = None
+        else:
+            logging.warning("filter_perm の訓練ラベルが見つからないためクラス重みを適用できません")
 
     eval_batch_raw = getattr(args, "eval_batch_size", None)
     if eval_batch_raw is None or int(eval_batch_raw) <= 0:
@@ -2007,7 +2144,11 @@ def train_with_torch_backend(
                                 w = w * (1.0 - p_true).pow(args.perm_focal_gamma)
                         # per-sample KL, then weight & mean
                         kl_per_sample = torch_F.kl_div(log_probs, target_tensors[name], reduction="none").sum(dim=1)
-                        loss_h = (w * kl_per_sample).mean()
+                        loss_weights = w
+                        if class_weights_perm_tensor is not None:
+                            class_w = class_weights_perm_tensor[true_idx]
+                            loss_weights = loss_weights * class_w
+                        loss_h = (loss_weights * kl_per_sample).mean()
                         loss_tensor += head_loss_w[name] * loss_h
 
                         # (3) perm: Top-3 マージン補助損失（true が第3位logitを margin だけ上回る）
@@ -2048,6 +2189,7 @@ def train_with_torch_backend(
             amp=amp_mode,
             desc="訓練ロジット算出中",
         )
+        _log_perm_diagnostics("train", train_metrics)
         logging.info(
             "評価ロジット算出開始: device=%s amp=%s batch=%d metrics_on_gpu=yes",
             device,
@@ -2064,6 +2206,7 @@ def train_with_torch_backend(
             amp=amp_mode,
             desc="評価ロジット算出中",
         )
+        _log_perm_diagnostics("val", val_metrics)
 
         mean_top3 = float(np.mean([val_metrics[name]["top3"] for name in head_list]))
         mean_three_choice = float(np.mean([val_metrics[name]["three_choice"] for name in head_list]))
@@ -2123,6 +2266,7 @@ def train_with_torch_backend(
             amp=amp_mode,
             desc="訓練ロジットダンプ中",
             output_path=dump_path / "train_logits.npz",
+            targets={"filter_perm": train_best_np.get("filter_perm", np.array([], dtype=np.int64))},
         )
         dump_logits_to_npz(
             model_forward,
@@ -2132,6 +2276,7 @@ def train_with_torch_backend(
             amp=amp_mode,
             desc="評価ロジットダンプ中",
             output_path=dump_path / "val_logits.npz",
+            targets={"filter_perm": val_best_np.get("filter_perm", np.array([], dtype=np.int64))},
         )
 
     return model, best_train_metrics, best_val_metrics
@@ -2157,7 +2302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--condition-heads",
         type=str,
         default="",
-        help="条件付き入力として利用するヘッド名をカンマ区切りで指定",
+        help="条件付き入力として利用するヘッド名をカンマ区切りで指定 (例: interleave,perm)",
     )
     parser.add_argument(
         "--condition-encoding",
@@ -2174,7 +2319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--head-loss-weights",
         type=str,
-        default="",
+        default="filter_perm=3.8,interleave=0.5,perm=0.4",
         help="ヘッド別の損失重み (例: predictor=1.0,filter_perm=2.5)",
     )
     parser.add_argument("--perm-hard-alpha", type=float, default=1.0, help="filter_perm の hard例(真ラベルがtop3外)の加重倍率-1 (1.0で2倍)")
@@ -2182,6 +2327,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--perm-logit-scale", type=float, default=1.0, help="filter_perm のロジットを softmax前に乗算 (s>1 で鋭化)")
     parser.add_argument("--perm-margin", type=float, default=0.5, help="true_logit - 3rd_logit >= margin を促す (0で無効)")
     parser.add_argument("--perm-margin-weight", type=float, default=0.5, help="perm マージン補助損失の重み")
+    parser.add_argument(
+        "--perm-class-balance",
+        choices=["none", "effective"],
+        default="none",
+        help="filter_perm 損失に有効サンプル数ベースのクラス重みを適用する方式",
+    )
+    parser.add_argument(
+        "--perm-class-beta",
+        type=float,
+        default=0.999,
+        help="有効サンプル数重みの β パラメータ (0<β<1)",
+    )
 
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
@@ -2292,13 +2449,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     condition_encoding = args.condition_encoding.lower()
     args.condition_encoding = condition_encoding
-    disabled_heads_set = set(cond_heads)
-    active_heads = [name for name in HEAD_ORDER if name not in disabled_heads_set]
-    if not active_heads:
-        print("エラー: 条件付きヘッドの指定により学習対象ヘッドが空になりました", file=sys.stderr)
-        return 1
+    disabled_heads_set: set[str] = set()
+    active_heads = list(HEAD_ORDER)
+    for name in cond_heads:
+        if name not in active_heads:
+            active_heads.append(name)
     cond_specs = [(name, HEAD_SPECS[name]) for name in cond_heads]
-    disabled_heads_tuple = tuple(disabled_heads_set)
+    disabled_heads_tuple: Tuple[str, ...] = ()
     if cond_heads:
         logging.info(
             "Conditioned heads: %s (encoding: %s)",
@@ -2401,6 +2558,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         best_labels = {name: LazyLabels(reader, index, name, use_second=False) for name in HEAD_ORDER}
         second_labels = {name: LazyLabels(reader, index, name, use_second=True) for name in HEAD_ORDER}
+
+    best_labels["perm"] = best_labels["filter_perm"]
+    second_labels["perm"] = second_labels["filter_perm"]
 
     total = int(index.shape[0])
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
@@ -2640,11 +2800,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 mean,
                 std,
                 disabled_heads_tuple,
+                cond_heads,
             )
         except ImportError as exc:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
 
+        active_heads = tuple(getattr(torch_model, "active_heads", tuple(active_heads)))
         print("\n=== 訓練データ精度 ===")
         for name in active_heads:
             print(f"{name:16s}: {format_metrics(train_metrics.get(name, {}))}")
