@@ -1,7 +1,7 @@
 """TLG8 用マルチタスク学習モデルの実装モジュール。
 
 本モジュールは 8x8 ブロック特徴量を入力とし、各圧縮フェーズ
-（predictor / filter_perm / filter_primary / filter_secondary / reorder / interleave）の
+（predictor / filter_primary / filter_secondary / reorder / interleave）の
 分類を同時に行う多層パーセプトロンを提供する。学習・評価・推論および
 NPZ 形式での保存 / 復元機能を一括して実装する。
 """
@@ -33,17 +33,14 @@ if TYPE_CHECKING:  # 型チェック時のみ使用
 # 各ヘッドのクラス数定義
 HEAD_SPECS: Dict[str, int] = {
     "predictor": 8,
-    "filter_perm": 6,
     "filter_primary": 4,
     "filter_secondary": 4,
     "reorder": 8,
     "interleave": 2,
-    "perm": 6,
 }
 
 HEAD_ORDER: Tuple[str, ...] = (
     "predictor",
-    "filter_perm",
     "filter_primary",
     "filter_secondary",
     "reorder",
@@ -179,13 +176,6 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self.fc1 = nn.Linear(self.input_dim, 2048)
         self.fc2 = nn.Linear(2048, 1536)
         self.fc3 = nn.Linear(1536, self.hidden_dim)
-        self.perm_hidden = nn.Sequential(
-            nn.Linear(self.hidden_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.1),
-        )
-        self.perm_classifier = nn.Linear(256, HEAD_SPECS["filter_perm"])
-        self.perm_logit_scale: float = 1.0
         self.dropout1 = nn.Dropout(self.dropout_rate)
         self.dropout2 = nn.Dropout(self.dropout_rate)
         disabled_seq = tuple(disabled_heads)
@@ -201,10 +191,7 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         )
         heads: Dict[str, nn.Module] = {}
         for name in self._base_active_heads:
-            if name == "filter_perm":
-                continue
             heads[name] = nn.Linear(self.hidden_dim, HEAD_SPECS[name])
-        heads["perm"] = nn.Linear(self.hidden_dim, HEAD_SPECS["perm"])
         self.heads = nn.ModuleDict(heads)
         self._condition_heads: Tuple[str, ...] = ()
         self._update_active_heads()
@@ -229,12 +216,6 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self._condition_heads = tuple(unique)
         self._update_active_heads()
 
-    def set_perm_logit_scale(self, scale: float | None) -> None:
-        if scale is None:
-            self.perm_logit_scale = 1.0
-        else:
-            self.perm_logit_scale = float(scale)
-
     def forward(self, x: "torch.Tensor") -> Dict[str, "torch.Tensor"]:
         """標準化後にトランクとヘッドを順伝播する。"""
 
@@ -250,14 +231,7 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         h = self.dropout2(h)
         h = F.gelu(self.fc3(h))
         outputs: Dict[str, torch.Tensor] = {}
-        perm_hidden = self.perm_hidden(h)
-        perm_logits = self.perm_classifier(perm_hidden)
-        if self.perm_logit_scale != 1.0:
-            perm_logits = perm_logits * self.perm_logit_scale
-        outputs["filter_perm"] = perm_logits
         for name in self.active_heads:
-            if name == "filter_perm":
-                continue
             outputs[name] = self.heads[name](h)
         return outputs
 
@@ -526,18 +500,30 @@ def build_soft_targets(
 ) -> np.ndarray:
     """最良候補と第 2 候補からソフトターゲット分布を構築する。"""
 
+    if class_count <= 0:
+        raise ValueError("class_count は正の整数である必要があります")
     epsilon = float(np.clip(epsilon, 0.0, 0.5))
     targets = np.zeros((best.shape[0], class_count), dtype=np.float64)
+    uniform = 1.0 / float(class_count)
     for idx in range(best.shape[0]):
         b = int(best[idx])
-        if b < 0 or b >= class_count:
-            raise ValueError("best ラベルがクラス数の範囲外です")
-        s = int(second[idx]) if idx < second.shape[0] else -1
-        if s >= 0 and s < class_count and s != b:
-            targets[idx, b] = 1.0 - epsilon
-            targets[idx, s] = epsilon
+        positives: List[int] = []
+        if 0 <= b < class_count:
+            positives.append(b)
         else:
-            targets[idx, b] = 1.0
+            raise ValueError("best ラベルがクラス数の範囲外です")
+        if idx < second.shape[0]:
+            s = int(second[idx])
+            if 0 <= s < class_count and s != b:
+                positives.append(s)
+        if positives:
+            share = 1.0 / float(len(positives))
+            for pid in positives:
+                targets[idx, pid] = share
+        else:
+            targets[idx, :] = uniform
+    if epsilon > 0.0:
+        targets = targets * (1.0 - epsilon) + epsilon * uniform
     return targets
 
 

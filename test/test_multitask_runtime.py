@@ -38,8 +38,6 @@ class MultiTaskModelTest(unittest.TestCase):
                 # 未初期化なので標準的な形状で設定する。
                 if name == "predictor":
                     cls = 8
-                elif name == "filter_perm":
-                    cls = 6
                 elif name in ("filter_primary", "filter_secondary"):
                     cls = 4
                 elif name == "reorder":
@@ -60,7 +58,6 @@ class MultiTaskModelTest(unittest.TestCase):
         logits = self.model.predict_logits(features)
         self.assertEqual(set(logits.keys()), set(HEAD_ORDER))
         self.assertEqual(logits["predictor"].shape, (8,))
-        self.assertEqual(logits["filter_perm"].shape, (6,))
         self.assertEqual(logits["filter_primary"].shape, (4,))
         self.assertEqual(logits["filter_secondary"].shape, (4,))
         self.assertEqual(logits["reorder"].shape, (8,))
@@ -82,8 +79,8 @@ class MultiTaskModelTest(unittest.TestCase):
         best = np.array([1, 2], dtype=np.int32)
         second = np.array([1, 0], dtype=np.int32)
         targets = build_soft_targets(best, second, 4, epsilon=0.2)
-        self.assertTrue(np.allclose(targets[0], [0.0, 1.0, 0.0, 0.0]))
-        self.assertTrue(np.allclose(targets[1], [0.2, 0.0, 0.8, 0.0]))
+        self.assertTrue(np.allclose(targets[0], [0.05, 0.85, 0.05, 0.05]))
+        self.assertTrue(np.allclose(targets[1], [0.45, 0.05, 0.45, 0.05]))
 
 
 class BeamSearchTest(unittest.TestCase):
@@ -99,7 +96,7 @@ class BeamSearchTest(unittest.TestCase):
         self.model.trunk_weights = [weight]
         self.model.trunk_biases = [np.zeros(2, dtype=np.float64)]
         for name in HEAD_ORDER:
-            cls = 8 if name in ("predictor", "reorder") else 6 if name == "filter_perm" else 4 if name in ("filter_primary", "filter_secondary") else 2
+            cls = 8 if name in ("predictor", "reorder") else 4 if name in ("filter_primary", "filter_secondary") else 2
             self.model.head_weights[name] = np.zeros((2, cls), dtype=np.float64)
             self.model.head_biases[name] = np.zeros(cls, dtype=np.float64)
 
@@ -113,8 +110,9 @@ class BeamSearchTest(unittest.TestCase):
             calls.append(config)
             return config["predictor"] + config["filter"] + config["reorder"] + config["interleave"]
 
-        config, bits = select_block_config(features, self.model, encoder)
-        self.assertLessEqual(len(calls), 16)
+        config, bits, stats = select_block_config(features, self.model, encoder)
+        self.assertLessEqual(stats["evaluated"], len(calls))
+        self.assertGreater(stats["evaluated"], 0)
         self.assertIsInstance(config, dict)
         self.assertIsInstance(bits, int)
 

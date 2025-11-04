@@ -1,22 +1,68 @@
-"""マルチタスクモデル出力を用いた段階的ビームサーチ推論。"""
+"""マルチタスクモデル出力を用いたビームサーチ推論ユーティリティ。"""
 
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Sequence, Tuple
+import math
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from multitask_model import (
     MultiTaskModel,
     TorchMultiTask,
-    build_filter_candidates,
     log_softmax,
     predict_logits_batched,
 )
-
+from utils.perm_candidates import gen_perm_candidates
 
 LOGGER = logging.getLogger(__name__)
+
+# DNN でスコアリングする軸の展開順序。
+AXIS_ORDER: Tuple[str, ...] = (
+    "reorder",
+    "interleave",
+    "predictor",
+    "filter_primary",
+    "filter_secondary",
+)
+
+# 代理コスト（ビット・時間）テーブル。現状は最小構成のプレースホルダ。
+AXIS_BITS_COST: Dict[str, Dict[int, float]] = {}
+AXIS_TIME_COST: Dict[str, Dict[int, float]] = {}
+
+
+@dataclass(frozen=True)
+class AxisCandidate:
+    """単一軸における候補値と対数確率。"""
+
+    value: int
+    log_prob: float
+
+
+@dataclass(order=True)
+class BeamNode:
+    """ビームサーチ中の部分構成を保持するノード。"""
+
+    priority: float
+    axis_index: int = field(compare=False)
+    log_prob: float = field(compare=False)
+    bits_cost: float = field(compare=False)
+    time_cost: float = field(compare=False)
+    choices: Dict[str, int] = field(compare=False, default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BeamCandidate:
+    """最終的な構成候補とその代理コスト。"""
+
+    config: Dict[str, int]
+    cost: float
+    log_prob: float
+    bits_cost: float
+    time_cost: float
+
 
 def _ensure_vector(arr: np.ndarray) -> np.ndarray:
     """1 次元ロジット配列を取得するヘルパー。"""
@@ -38,223 +84,133 @@ def _deterministic_top_indices(vec: np.ndarray, k: int) -> np.ndarray:
     return order[: min(k, order.shape[0])]
 
 
-def _candidate_scores(vec: np.ndarray, indices: Sequence[int]) -> Dict[int, float]:
-    """指定インデックスの log-softmax 値を取得する。"""
+def _build_axis_candidates(logits: Mapping[str, np.ndarray], axis: str, topk: int) -> List[AxisCandidate]:
+    """指定軸の top-k 候補を log-softmax 値と共に生成する。"""
 
-    if not indices:
-        return {}
+    if axis not in logits:
+        raise KeyError(f"logits に軸 {axis} が存在しません")
+    vec = _ensure_vector(logits[axis])
+    indices = _deterministic_top_indices(vec, max(1, topk))
     log_probs = log_softmax(vec[None, :])[0]
-    return {int(idx): float(log_probs[int(idx)]) for idx in indices}
-
-
-def _select_with_margin(
-    vec: np.ndarray, max_k: int, margin: float
-) -> Tuple[List[int], float, float]:
-    """マージン条件に基づき上位候補リストを返す。"""
-
-    top_indices = _deterministic_top_indices(vec, max_k)
-    if top_indices.size == 0:
-        return [], float("inf"), float("inf")
-    scores = vec[top_indices]
-    margin12 = float("inf")
-    margin23 = float("inf")
-    if top_indices.size >= 2:
-        margin12 = float(scores[0] - scores[1])
-    if top_indices.size >= 3:
-        margin23 = float(scores[1] - scores[2])
-
-    if top_indices.size >= 2 and margin12 > margin:
-        selected = top_indices[:1]
-    elif top_indices.size >= 3:
-        if margin12 <= margin and margin23 <= margin:
-            selected = top_indices[:3]
-        else:
-            selected = top_indices[:2]
-    else:
-        selected = top_indices
-    return [int(idx) for idx in selected], margin12, margin23
-
-
-def _enumerate_candidates(
-    logits: Dict[str, np.ndarray],
-    max_trials: int,
-    margin_reorder: float,
-    margin_interleave: float,
-    margin_filter_perm: float,
-    margin_predictor: float,
-    temperature: float,
-) -> List[Tuple[Dict[str, int], float]]:
-    """モデルロジットから最大 max_trials 件の候補構成を生成する。"""
-
-    temp = max(float(temperature), 1e-6)
-    predictor_vec = _ensure_vector(logits["predictor"]) / temp
-    reorder_vec = _ensure_vector(logits["reorder"]) / temp
-    interleave_vec = _ensure_vector(logits["interleave"]) / temp
-    perm_vec = _ensure_vector(logits["filter_perm"]) / temp
-    primary_vec = _ensure_vector(logits["filter_primary"]) / temp
-    secondary_vec = _ensure_vector(logits["filter_secondary"]) / temp
-
-    predictor_candidates, predictor_margin, predictor_margin23 = _select_with_margin(
-        predictor_vec, 3, margin_predictor
-    )
-    reorder_candidates, reorder_margin, reorder_margin23 = _select_with_margin(
-        reorder_vec, 3, margin_reorder
-    )
-    interleave_candidates, interleave_margin, _ = _select_with_margin(
-        interleave_vec, 3, margin_interleave
-    )
-    perm_candidates, perm_margin, _ = _select_with_margin(
-        perm_vec, 2, margin_filter_perm
-    )
-    primary_indices = _deterministic_top_indices(primary_vec, 3)
-    secondary_indices = _deterministic_top_indices(secondary_vec, 3)
-
-    LOGGER.info(
-        "ヘッド predictor: k=%d margin12=%.3f margin23=%.3f 候補=%s",
-        len(predictor_candidates),
-        predictor_margin,
-        predictor_margin23,
-        predictor_candidates,
-    )
-    LOGGER.info(
-        "ヘッド reorder: k=%d margin12=%.3f margin23=%.3f 候補=%s",
-        len(reorder_candidates),
-        reorder_margin,
-        reorder_margin23,
-        reorder_candidates,
-    )
-    LOGGER.info(
-        "ヘッド interleave: k=%d margin12=%.3f 候補=%s",
-        len(interleave_candidates),
-        interleave_margin,
-        interleave_candidates,
-    )
-    LOGGER.info(
-        "ヘッド filter_perm: k=%d margin12=%.3f 候補=%s",
-        len(perm_candidates),
-        perm_margin,
-        perm_candidates,
-    )
-
-    perm_scores = _candidate_scores(perm_vec, perm_candidates)
-    primary_scores = _candidate_scores(primary_vec, primary_indices)
-    secondary_scores = _candidate_scores(secondary_vec, secondary_indices)
-
-    base_product = (
-        max(1, len(reorder_candidates))
-        * max(1, len(interleave_candidates))
-        * max(1, len(predictor_candidates))
-    )
-    allow_six = base_product * 6 <= max_trials
-    filter_max = 6 if allow_six else 4
-
-    filter_candidates = build_filter_candidates(
-        [(pid, perm_scores[pid]) for pid in perm_candidates],
-        [(int(idx), primary_scores[int(idx)]) for idx in primary_indices],
-        [(int(idx), secondary_scores[int(idx)]) for idx in secondary_indices],
-        max_candidates=filter_max,
-    )
-
-    if not filter_candidates:
-        perm_fallback = perm_candidates[0] if perm_candidates else 0
-        primary_fallback = int(primary_indices[0]) if primary_indices.size else 0
-        secondary_fallback = int(secondary_indices[0]) if secondary_indices.size else 0
-        code = ((perm_fallback % 6) << 4) | ((primary_fallback % 4) << 2) | (secondary_fallback % 4)
-        filter_candidates = [(code, 0.0)]
-
-    def total_combos() -> int:
-        return (
-            len(reorder_candidates)
-            * len(interleave_candidates)
-            * len(filter_candidates)
-            * len(predictor_candidates)
-        )
-
-    total = total_combos()
-    for target in (6, 4, 3, 2):
-        if total <= max_trials:
-            break
-        if len(filter_candidates) > target:
-            filter_candidates = filter_candidates[:target]
-            total = total_combos()
-            LOGGER.info(
-                "フィルター候補を %d 件に削減 (総組合せ=%d)",
-                len(filter_candidates),
-                total,
-            )
-
-    if total > max_trials and len(predictor_candidates) > 1:
-        new_len = 2 if len(predictor_candidates) > 2 else 1
-        predictor_candidates = predictor_candidates[:new_len]
-        total = total_combos()
-        LOGGER.info(
-            "predictor 候補を %d 件に削減 (margin12=%.3f 総組合せ=%d)",
-            len(predictor_candidates),
-            predictor_margin,
-            total,
-        )
-
-    if total > max_trials and len(reorder_candidates) > 1:
-        new_len = 2 if len(reorder_candidates) > 2 else 1
-        reorder_candidates = reorder_candidates[:new_len]
-        total = total_combos()
-        LOGGER.info(
-            "reorder 候補を %d 件に削減 (margin12=%.3f 総組合せ=%d)",
-            len(reorder_candidates),
-            reorder_margin,
-            total,
-        )
-
-    if total > max_trials and len(interleave_candidates) > 1:
-        interleave_candidates = interleave_candidates[:1]
-        total = total_combos()
-        LOGGER.info(
-            "interleave 候補を %d 件に削減 (margin12=%.3f 総組合せ=%d)",
-            len(interleave_candidates),
-            interleave_margin,
-            total,
-        )
-
-    total = total_combos()
-    if total > max_trials:
-        LOGGER.warning("組合せ削減で上限 %d 件を下回れませんでした (総組合せ=%d)", max_trials, total)
-
-    predictor_scores = _candidate_scores(predictor_vec, predictor_candidates)
-    reorder_scores = _candidate_scores(reorder_vec, reorder_candidates)
-    interleave_scores = _candidate_scores(interleave_vec, interleave_candidates)
-
-    LOGGER.info(
-        "最終候補数 reorder=%d interleave=%d filter=%d predictor=%d 総組合せ=%d",
-        len(reorder_candidates),
-        len(interleave_candidates),
-        len(filter_candidates),
-        len(predictor_candidates),
-        total_combos(),
-    )
-
-    candidates: List[Tuple[Dict[str, int], float]] = []
-    for reorder_id in reorder_candidates:
-        for interleave_id in interleave_candidates:
-            for filter_code, filter_score in filter_candidates:
-                for predictor_id in predictor_candidates:
-                    score = (
-                        predictor_scores[predictor_id]
-                        + filter_score
-                        + reorder_scores[reorder_id]
-                        + interleave_scores[interleave_id]
-                    )
-                    config = {
-                        "predictor": int(predictor_id),
-                        "filter": int(filter_code),
-                        "reorder": int(reorder_id),
-                        "interleave": int(interleave_id),
-                    }
-                    candidates.append((config, score))
-
-    candidates.sort(key=lambda item: item[1], reverse=True)
-    if len(candidates) > max_trials:
-        candidates = candidates[:max_trials]
+    candidates = [AxisCandidate(int(idx), float(log_probs[int(idx)])) for idx in indices]
+    if not candidates:
+        candidates = [AxisCandidate(0, float(log_probs.max()))]
     return candidates
+
+
+def _axis_cost(table: Mapping[str, Mapping[int, float]], axis: str, value: int) -> float:
+    """軸ごとの代理コストを返す。"""
+
+    mapping = table.get(axis)
+    if mapping is None:
+        return 0.0
+    return float(mapping.get(int(value), 0.0))
+
+
+def _pack_filter_code(perm: int, primary: int, secondary: int) -> int:
+    """perm / primary / secondary から 6*4*4 = 96 種のフィルターコードを生成する。"""
+
+    perm_mod = int(perm) % 6
+    primary_mod = int(primary) % 4
+    secondary_mod = int(secondary) % 4
+    return (perm_mod << 4) | (primary_mod << 2) | secondary_mod
+
+
+def _perm_prior(rank: int) -> float:
+    """ヒューリスティック perm の順位に基づく擬似対数事前確率。"""
+
+    return -0.2 * float(rank)
+
+
+def _generate_beam_candidates(
+    logits: Mapping[str, np.ndarray],
+    image_stats: Mapping[str, object] | None,
+    *,
+    dnn_topk: int,
+    beam_width: int,
+    beam_slack: float,
+    perm_candidate_mode: str,
+    perm_kmax: int,
+    time_penalty_lambda: float,
+    axis_bits_cost: Mapping[str, Mapping[int, float]] | None = None,
+    axis_time_cost: Mapping[str, Mapping[int, float]] | None = None,
+) -> List[BeamCandidate]:
+    """DNN ロジットと統計からビーム候補を生成する。"""
+
+    axis_bits_cost = axis_bits_cost or AXIS_BITS_COST
+    axis_time_cost = axis_time_cost or AXIS_TIME_COST
+    axis_candidates: Dict[str, List[AxisCandidate]] = {}
+    for axis in AXIS_ORDER:
+        axis_candidates[axis] = _build_axis_candidates(logits, axis, dnn_topk)
+    if perm_candidate_mode == "rule":
+        perm_ids = gen_perm_candidates(image_stats, k_max=perm_kmax)
+    else:
+        perm_ids = list(range(min(perm_kmax, 6)))
+    if not perm_ids:
+        perm_ids = [0]
+
+    beam: List[BeamNode] = [
+        BeamNode(priority=0.0, axis_index=0, log_prob=0.0, bits_cost=0.0, time_cost=0.0, choices={})
+    ]
+    best_cost = math.inf
+
+    for axis_idx, axis in enumerate(AXIS_ORDER):
+        next_nodes: List[BeamNode] = []
+        candidates = axis_candidates[axis]
+        for node in beam:
+            for candidate in candidates:
+                choices = dict(node.choices)
+                choices[axis] = candidate.value
+                bits_cost = node.bits_cost + _axis_cost(axis_bits_cost, axis, candidate.value)
+                time_cost = node.time_cost + _axis_cost(axis_time_cost, axis, candidate.value)
+                log_prob = node.log_prob + candidate.log_prob
+                priority = bits_cost + time_penalty_lambda * time_cost - log_prob
+                if best_cost < math.inf and priority > best_cost * (1.0 + beam_slack):
+                    continue
+                next_nodes.append(
+                    BeamNode(
+                        priority=priority,
+                        axis_index=axis_idx + 1,
+                        log_prob=log_prob,
+                        bits_cost=bits_cost,
+                        time_cost=time_cost,
+                        choices=choices,
+                    )
+                )
+        if not next_nodes:
+            LOGGER.warning("軸 %s の候補が空のためフォールバックします", axis)
+            next_nodes = beam
+        next_nodes.sort()
+        beam = next_nodes[: max(1, beam_width)]
+
+    final_candidates: List[BeamCandidate] = []
+    for node in beam:
+        primary = node.choices.get("filter_primary", 0)
+        secondary = node.choices.get("filter_secondary", 0)
+        for rank, perm_id in enumerate(perm_ids):
+            perm_log_prior = _perm_prior(rank)
+            bits_cost = node.bits_cost + _axis_cost(axis_bits_cost, "perm", perm_id)
+            time_cost = node.time_cost + _axis_cost(axis_time_cost, "perm", perm_id)
+            log_prob = node.log_prob + perm_log_prior
+            cost = bits_cost + time_penalty_lambda * time_cost - log_prob
+            config = {
+                "predictor": node.choices.get("predictor", 0),
+                "filter": _pack_filter_code(perm_id, primary, secondary),
+                "reorder": node.choices.get("reorder", 0),
+                "interleave": node.choices.get("interleave", 0),
+            }
+            final_candidates.append(
+                BeamCandidate(
+                    config=config,
+                    cost=cost,
+                    log_prob=log_prob,
+                    bits_cost=bits_cost,
+                    time_cost=time_cost,
+                )
+            )
+            best_cost = min(best_cost, cost)
+    final_candidates.sort(key=lambda item: (item.cost, item.config["filter"]))
+    return final_candidates
 
 
 def select_block_config(
@@ -262,42 +218,65 @@ def select_block_config(
     model: MultiTaskModel,
     try_encode_block: Callable[[Dict[str, int]], int] | None,
     *,
-    margin_reorder: float = 0.5,
-    margin_interleave: float = 0.5,
-    margin_filter_perm: float = 0.4,
-    margin_predictor: float = 0.4,
-    max_trials: int = 16,
-    temperature: float | None = None,
-):
-    """段階的ビームサーチにより最終ブロック構成を決定する。"""
+    beam_width: int = 4,
+    beam_slack: float = 0.02,
+    perm_candidate_mode: str = "rule",
+    perm_kmax: int = 4,
+    dnn_topk: int = 3,
+    time_penalty_lambda: float = 0.0,
+    image_stats: Mapping[str, object] | None = None,
+) -> object:
+    """ビームサーチで最適ブロック構成を選択する。"""
 
     logits = model.predict_logits(features)
-    candidates = _enumerate_candidates(
+    candidates = _generate_beam_candidates(
         logits,
-        max_trials,
-        margin_reorder,
-        margin_interleave,
-        margin_filter_perm,
-        margin_predictor,
-        temperature if temperature is not None else model.inference_temperature,
+        image_stats,
+        dnn_topk=dnn_topk,
+        beam_width=beam_width,
+        beam_slack=float(max(0.0, beam_slack)),
+        perm_candidate_mode=perm_candidate_mode,
+        perm_kmax=perm_kmax,
+        time_penalty_lambda=time_penalty_lambda,
     )
-
     if try_encode_block is None:
-        return candidates
+        return [(cand.config, cand.cost) for cand in candidates]
 
-    best_config = None
-    best_bits = None
-    eval_count = 0
-    for config, _score in candidates:
-        bits = int(try_encode_block(config))
-        eval_count += 1
+    best_config: Optional[Dict[str, int]] = None
+    best_bits: Optional[int] = None
+    best_cost: Optional[float] = None
+    evaluated = 0
+    for idx, cand in enumerate(candidates):
+        if best_cost is not None and cand.cost > best_cost * (1.0 + beam_slack):
+            LOGGER.debug(
+                "スラック基準で候補展開を停止 idx=%d cost=%.4f best=%.4f slack=%.3f",
+                idx,
+                cand.cost,
+                best_cost,
+                beam_slack,
+            )
+            break
+        bits = int(try_encode_block(cand.config))
+        evaluated += 1
         if best_bits is None or bits < best_bits:
             best_bits = bits
-            best_config = config
-    if eval_count > max_trials:
-        raise RuntimeError("最大試行回数を超過しました")
-    LOGGER.info("実際に評価した組合せ=%d", eval_count)
-    return best_config, best_bits
+            best_config = cand.config
+            best_cost = cand.cost
+    LOGGER.info(
+        "ビーム候補数=%d 評価=%d 最良コスト=%.4f",
+        len(candidates),
+        evaluated,
+        best_cost if best_cost is not None else float("nan"),
+    )
+    stats = {
+        "heuristic_candidates": len(candidates),
+        "evaluated": evaluated,
+        "best_cost": best_cost,
+        "beam_width": beam_width,
+        "dnn_topk": dnn_topk,
+        "perm_kmax": perm_kmax,
+    }
+    return best_config, best_bits, stats
 
 
 def select_block_config_batched(
@@ -307,15 +286,16 @@ def select_block_config_batched(
     device,
     batch_size: int = 8192,
     amp: str = "bf16",
-    margin_reorder: float = 0.5,
-    margin_interleave: float = 0.5,
-    margin_filter_perm: float = 0.4,
-    margin_predictor: float = 0.4,
-    max_trials: int = 16,
-    temperature: float | None = None,
+    beam_width: int = 4,
+    beam_slack: float = 0.02,
+    perm_candidate_mode: str = "rule",
+    perm_kmax: int = 4,
+    dnn_topk: int = 3,
+    time_penalty_lambda: float = 0.0,
+    image_stats_batch: Sequence[Mapping[str, object]] | None = None,
     try_encode_block: Callable[[Dict[str, int]], int] | None = None,
-):
-    """複数ブロックの特徴量をまとめてビームサーチ推論する。"""
+) -> List[object]:
+    """複数ブロックをまとめてビームサーチ推論する。"""
 
     if features_batch.ndim == 1:
         features_batch = features_batch[None, :]
@@ -331,29 +311,32 @@ def select_block_config_batched(
     results: List[object] = []
     for idx in range(sample_count):
         single_logits = {name: arr[idx : idx + 1] for name, arr in logits_batch.items()}
-        candidates = _enumerate_candidates(
+        stats_map = image_stats_batch[idx] if image_stats_batch and idx < len(image_stats_batch) else None
+        candidates = _generate_beam_candidates(
             single_logits,
-            max_trials,
-            margin_reorder,
-            margin_interleave,
-            margin_filter_perm,
-            margin_predictor,
-            temperature if temperature is not None else model.inference_temperature,
+            stats_map,
+            dnn_topk=dnn_topk,
+            beam_width=beam_width,
+            beam_slack=float(max(0.0, beam_slack)),
+            perm_candidate_mode=perm_candidate_mode,
+            perm_kmax=perm_kmax,
+            time_penalty_lambda=time_penalty_lambda,
         )
         if try_encode_block is None:
-            results.append(candidates)
+            results.append([(cand.config, cand.cost) for cand in candidates])
             continue
-        best_config = None
-        best_bits = None
-        eval_count = 0
-        for config, _score in candidates:
-            bits = int(try_encode_block(config))
-            eval_count += 1
+        best_config: Optional[Dict[str, int]] = None
+        best_bits: Optional[int] = None
+        best_cost: Optional[float] = None
+        evaluated = 0
+        for cand in candidates:
+            if best_cost is not None and cand.cost > best_cost * (1.0 + beam_slack):
+                break
+            bits = int(try_encode_block(cand.config))
+            evaluated += 1
             if best_bits is None or bits < best_bits:
                 best_bits = bits
-                best_config = config
-        if eval_count > max_trials:
-            raise RuntimeError("最大試行回数を超過しました")
-        LOGGER.info("実際に評価した組合せ=%d", eval_count)
-        results.append((best_config, best_bits))
+                best_config = cand.config
+                best_cost = cand.cost
+        results.append((best_config, best_bits, {"evaluated": evaluated, "best_cost": best_cost}))
     return results
