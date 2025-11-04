@@ -261,6 +261,27 @@ def parse_condition_head_list(raw: str) -> Tuple[str, ...]:
     return tuple(result)
 
 
+def parse_head_loss_weights(raw: str) -> Dict[str, float]:
+    """ヘッド別損失重み指定文字列を辞書に変換する。"""
+
+    if not raw:
+        return {}
+    weights: Dict[str, float] = {}
+    for token in raw.split(","):
+        entry = token.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(f"不正なヘッド損失指定です: {entry}")
+        key, value = entry.split("=", 1)
+        key = key.strip()
+        try:
+            weights[key] = float(value)
+        except ValueError as exc:
+            raise ValueError(f"ヘッド損失重みの数値が不正です: {entry}") from exc
+    return weights
+
+
 def effective_class_weights(counts: np.ndarray, beta: float) -> "torch.Tensor":
     """有効サンプル数に基づくクラス重みを算出する。"""
 
@@ -1948,15 +1969,9 @@ def train_with_torch_backend(
 
     head_list = list(active_heads)
 
-    # ヘッド別損失重みのパース
-    head_loss_w = {name: 1.0 for name in active_heads}
-    if args.head_loss_weights:
-        for kv in args.head_loss_weights.split(","):
-            k, v = kv.split("=")
-            k = k.strip()
-            v = float(v)
-            if k in head_loss_w:
-                head_loss_w[k] = v
+    # ヘッド別損失重み (指定が無いヘッドは 1.0)
+    weight_config = getattr(args, "head_loss_weights", {})
+    head_loss_w = {name: float(weight_config.get(name, 1.0)) for name in active_heads}
 
     train_best_np = {name: np.ascontiguousarray(train_best[name], dtype=np.int64) for name in active_heads}
     train_second_np = {name: np.ascontiguousarray(train_second[name], dtype=np.int64) for name in active_heads}
@@ -1972,6 +1987,37 @@ def train_with_torch_backend(
             args.epsilon_soft,
         ).astype(np.float32)
         train_targets[name] = np.ascontiguousarray(train_targets[name], dtype=np.float32)
+
+    perm_weights_tensor: Optional["torch.Tensor"] = None
+    perm_weight_device: Optional["torch.Tensor"] = None
+    filter_perm_weight = float(weight_config.get("filter_perm", head_loss_w.get("filter_perm", 1.0)))
+    if (
+        args.perm_class_balance == "effective"
+        and filter_perm_weight > 0.0
+        and "filter_perm" in train_best_np
+    ):
+        num_classes_perm = HEAD_SPECS.get("filter_perm")
+        if num_classes_perm is None:
+            logging.warning("filter_perm のクラス数が未定義のためクラス重みは適用されません")
+        else:
+            labels_perm = np.asarray(train_best_np["filter_perm"], dtype=np.int64)
+            valid_perm = labels_perm[labels_perm >= 0]
+            counts = np.bincount(valid_perm, minlength=int(num_classes_perm))
+            if counts.size == 0 or valid_perm.size == 0:
+                logging.warning("filter_perm のクラス頻度が取得できなかったためクラス重みは適用されません")
+            else:
+                try:
+                    perm_weights_tensor = effective_class_weights(counts, args.perm_class_beta)
+                except Exception as exc:
+                    logging.warning("filter_perm のクラス重み算出に失敗したため無効化します: %s", exc)
+                    perm_weights_tensor = None
+                else:
+                    logging.info(
+                        "filter_perm に有効サンプル数ベースのクラス重みを適用します (beta=%.4f)",
+                        float(args.perm_class_beta),
+                    )
+    if perm_weights_tensor is not None:
+        perm_weight_device = perm_weights_tensor.to(device=device)
 
     eval_batch_raw = getattr(args, "eval_batch_size", None)
     if eval_batch_raw is None or int(eval_batch_raw) <= 0:
@@ -2041,9 +2087,23 @@ def train_with_torch_backend(
                 loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
                 for name in active_heads:
                     _logits = logits[name]
+                    weight = float(head_loss_w.get(name, 1.0))
+                    if weight <= 0.0:
+                        continue
                     log_probs = torch_F.log_softmax(_logits, dim=1)
-                    loss_h = torch_F.kl_div(log_probs, target_tensors[name], reduction="batchmean")
-                    loss_tensor += head_loss_w[name] * loss_h
+                    targets_h = target_tensors[name]
+                    if (
+                        name == "filter_perm"
+                        and args.perm_class_balance == "effective"
+                        and perm_weight_device is not None
+                    ):
+                        kl_elem = torch_F.kl_div(log_probs, targets_h, reduction="none").sum(dim=1)
+                        true_ids = torch.argmax(targets_h, dim=1)
+                        cls_weight = perm_weight_device[true_ids]
+                        loss_h = (cls_weight * kl_elem).mean()
+                    else:
+                        loss_h = torch_F.kl_div(log_probs, targets_h, reduction="batchmean")
+                    loss_tensor += weight * loss_h
 
             loss_tensor.backward()
             optimizer.step()
@@ -2234,6 +2294,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="predictor=1.2,filter_primary=1.2,filter_secondary=1.0,reorder=0.6,interleave=0.6",
         help="ヘッド別の損失重み (例: predictor=1.0,filter_primary=1.0)",
     )
+    parser.add_argument(
+        "--perm-class-balance",
+        choices=["none", "effective"],
+        default="none",
+        help="filter_perm ヘッド向けクラス重み方式 (loss 重み > 0 の場合のみ有効)",
+    )
+    parser.add_argument(
+        "--perm-class-beta",
+        type=float,
+        default=0.999,
+        help="有効サンプル数ベースのクラス重みに用いる beta 値",
+    )
+    parser.add_argument(
+        "--ranker-mode",
+        action="store_true",
+        help="filter_perm の予測/損失を無効化し、ランカー系ヘッドのみ学習する",
+    )
 
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
@@ -2308,6 +2385,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
+    try:
+        head_loss_dict = parse_head_loss_weights(args.head_loss_weights)
+    except ValueError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 1
+    args.head_loss_weights = head_loss_dict
+    known_heads = set(HEAD_ORDER) | {"filter_perm"}
+    for name in head_loss_dict:
+        if name not in known_heads:
+            logging.warning("--head-loss-weights に未知のヘッド名が指定されています: %s", name)
+
+    if args.ranker_mode:
+        logging.info("ランカーモードを有効化: filter_perm ヘッドを無効化します")
+        args.head_loss_weights["filter_perm"] = 0.0
+
     backend = args.backend.lower()
     if backend == "torch" and torch is not None:
         args.device_resolved = pick_device(args.device)
@@ -2337,6 +2429,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             except Exception:
                 logging.debug("torch.set_num_interop_threads の設定に失敗しました", exc_info=True)
 
+    cond_raw = args.condition_heads or ""
+    cond_guard = {item.strip() for item in cond_raw.split(",") if item.strip()}
+    leak_guard_set = {"filter_perm", "perm", "filter_primary", "filter_secondary", "predictor", "reorder"}
+    illegal = cond_guard & leak_guard_set
+    if illegal:
+        print(
+            "エラー: Leak: --condition-heads must not include predictive/unknown labels: "
+            f"{sorted(illegal)}",
+            file=sys.stderr,
+        )
+        return 1
     try:
         cond_heads = parse_condition_head_list(args.condition_heads)
     except ValueError as exc:
@@ -2349,19 +2452,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in cond_heads:
         if name not in active_heads:
             active_heads.append(name)
+    filter_perm_weight = float(args.head_loss_weights.get("filter_perm", 1.0))
+    if (args.ranker_mode or filter_perm_weight <= 0.0) and "filter_perm" in HEAD_ORDER:
+        disabled_heads_set.add("filter_perm")
     try:
         cond_specs = [(name, HEAD_SPECS[name]) for name in cond_heads]
-        leak_guard_set = {"filter_perm", "perm", "filter_primary", "filter_secondary", "predictor", "reorder"}
-        illegal = leak_guard_set & set(cond_heads)
-        if illegal:
-            raise ValueError(
-                "Leak: condition-heads must not include predictive/unknown-at-inference labels: "
-                f"{sorted(illegal)}"
-            )
     except ValueError as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
+    if disabled_heads_set:
+        active_heads = [name for name in active_heads if name not in disabled_heads_set]
     disabled_heads_tuple: Tuple[str, ...] = ()
+    if disabled_heads_set:
+        disabled_heads_tuple = tuple(name for name in HEAD_ORDER if name in disabled_heads_set)
     if cond_heads:
         logging.info(
             "Conditioned heads: %s (encoding: %s)",
