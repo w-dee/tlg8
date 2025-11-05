@@ -82,7 +82,7 @@ static_assert(sizeof(HeadDesc) == 16, "HeadDesc サイズが想定と異なり�
 struct FileMeta {
     fs::path path;
     std::uint64_t size = 0;
-    std::int64_t mtime = 0;
+    double mtime = 0.0;
 };
 
 std::optional<HeadSpec> find_head(const std::string& name) {
@@ -94,10 +94,11 @@ std::optional<HeadSpec> find_head(const std::string& name) {
     return std::nullopt;
 }
 
-std::int64_t to_unix_seconds(const fs::file_time_type& tp) {
+double to_unix_seconds(const fs::file_time_type& tp) {
     using namespace std::chrono;
     const auto sctp = time_point_cast<system_clock::duration>(tp - fs::file_time_type::clock::now() + system_clock::now());
-    return duration_cast<seconds>(sctp.time_since_epoch()).count();
+    const auto seconds = duration_cast<duration<double>>(sctp.time_since_epoch());
+    return seconds.count();
 }
 
 bool parse_args(int argc, char** argv, Options& opts) {
