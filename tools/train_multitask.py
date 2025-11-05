@@ -30,6 +30,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FAST_LABELCACHE_TOOL = PROJECT_ROOT / "build" / "tlg8_labelcache"
+FAST_FEATCACHE_TOOL = PROJECT_ROOT / "build" / "tlg8_featcache"
+RANKER_DEFAULT_HEADS = ["predictor", "reorder", "interleave", "filter_primary", "filter_secondary"]
+RANKER_DEFAULT_TOPK = 2
+
 try:  # 高速 JSON デコードが利用可能ならば切り替える
     import orjson as _fastjson  # type: ignore[import]
 except Exception:  # pragma: no cover - orjson 未導入環境
@@ -94,6 +100,11 @@ LABEL_STRUCT = struct.Struct("<IHH12hI92x")
 LABEL_RECORD_SIZE = LABEL_STRUCT.size
 LABEL_FIELD_COUNT = 12
 LABEL_FIELD_OFFSET = 8  # ヘッダー 8 バイト分の後にラベル本体が続く
+
+RANKER_LABEL_HEADER_STRUCT = struct.Struct("<8sIIQQQQ")
+RANKER_LABEL_HEAD_STRUCT = struct.Struct("<IIII")
+RANKER_LABEL_MAGIC = b"TLG8LBL\0"
+RANKER_TOPK_MAGIC = b"TLG8TK\0"
 
 FEATURE_STATS_MAGIC = b"FSC8"
 FEATURE_STATS_VERSION = 1
@@ -494,6 +505,40 @@ def compute_label_cache_hashes(
     return results, dataset_hasher.hexdigest()
 
 
+def _load_ranker_cache_from_meta(
+    meta_path: Path,
+    meta: Dict[str, object],
+    bin_path: Path,
+    files: Sequence[FileRef],
+    expected_records: int,
+) -> RankerLabelCache:
+    """C++ フォーマットのラベルキャッシュをメタ情報から初期化する。"""
+
+    try:
+        record_count = int(meta.get("n_samples", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ラベルキャッシュメタデータのサンプル数が解釈できません") from exc
+    if record_count != expected_records:
+        raise ValueError("ラベルキャッシュの件数が現在のデータセットと一致しません")
+    if not _feature_cache_files_match(files, meta.get("source_files")):
+        raise ValueError("ラベルキャッシュの入力ファイル情報が一致しません")
+    topk_info = meta.get("topk")
+    topk_path: Optional[Path] = None
+    topk_k = 0
+    if isinstance(topk_info, dict):
+        try:
+            topk_k = int(topk_info.get("k", 0))
+        except (TypeError, ValueError):
+            topk_k = 0
+        path_val = topk_info.get("path")
+        if isinstance(path_val, str) and path_val:
+            candidate = Path(path_val)
+            if not candidate.is_absolute():
+                candidate = meta_path.parent / candidate
+            topk_path = candidate
+    return RankerLabelCache(meta, bin_path, topk_path=topk_path, topk_k=topk_k)
+
+
 def try_load_label_cache(
     meta_path: Path,
     bin_path: Path,
@@ -501,7 +546,7 @@ def try_load_label_cache(
     expected_records: int,
     *,
     show_progress: bool,
-) -> Optional[FastLabelStore]:
+) -> Optional[object]:
     """ラベルキャッシュが利用可能なら FastLabelStore を初期化する。"""
 
     if not meta_path.exists() or not bin_path.exists():
@@ -512,6 +557,16 @@ def try_load_label_cache(
     except (OSError, json.JSONDecodeError) as exc:
         logging.warning("ラベルキャッシュメタデータを読み取れません: %s", exc)
         return None
+
+    format_val = meta.get("format")
+    if isinstance(format_val, str) and format_val == "tlg8-ranker-labels":
+        try:
+            cache = _load_ranker_cache_from_meta(meta_path, meta, bin_path, files, expected_records)
+        except Exception as exc:
+            logging.warning("C++ ラベルキャッシュの読み込みに失敗しました: %s", exc)
+            return None
+        logging.info("C++ ラベルキャッシュを利用します (%s)", bin_path)
+        return cache
 
     try:
         schema_val = int(meta.get("schema", 0))
@@ -632,6 +687,68 @@ def invoke_preextractor(
     logging.info("preextract_labels.py を起動します: %s", " ".join(cmd))
     result = subprocess.run(cmd, check=False)
     return int(result.returncode)
+
+
+def ensure_ranker_label_cache_cpp(
+    tool_path: Path,
+    inputs: Sequence[Path],
+    *,
+    meta_path: Path,
+    bin_path: Path,
+    topk_path: Path,
+    heads: Sequence[str],
+    topk: int,
+) -> None:
+    """C++ 製ラベルキャッシュを生成するユーティリティ。"""
+
+    if not tool_path.exists():
+        raise FileNotFoundError(f"tlg8_labelcache が見つかりません: {tool_path}")
+    bin_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    if topk > 0:
+        topk_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd: List[str] = [str(tool_path)]
+    for path in inputs:
+        cmd.extend(["--jsonl", str(path)])
+    cmd.extend(["--out-bin", str(bin_path), "--out-meta", str(meta_path)])
+    if heads:
+        cmd.extend(["--heads", ",".join(heads)])
+    if topk > 0:
+        cmd.extend(["--out-topk", str(topk_path), "--topk", str(int(topk))])
+    logging.info("tlg8_labelcache を起動します: %s", " ".join(cmd))
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"tlg8_labelcache の実行に失敗しました (exit={result.returncode})")
+
+
+def ensure_ranker_feature_cache_cpp(
+    tool_path: Path,
+    inputs: Sequence[Path],
+    *,
+    out_npy: Path,
+    out_scaler: Path,
+    out_meta: Path,
+    out_idx: Optional[Path] = None,
+) -> None:
+    """C++ 製特徴量キャッシュを生成するユーティリティ。"""
+
+    if not tool_path.exists():
+        raise FileNotFoundError(f"tlg8_featcache が見つかりません: {tool_path}")
+    out_npy.parent.mkdir(parents=True, exist_ok=True)
+    out_scaler.parent.mkdir(parents=True, exist_ok=True)
+    out_meta.parent.mkdir(parents=True, exist_ok=True)
+    if out_idx is not None:
+        out_idx.parent.mkdir(parents=True, exist_ok=True)
+    cmd: List[str] = [str(tool_path)]
+    for path in inputs:
+        cmd.extend(["--jsonl", str(path)])
+    cmd.extend(["--out-npy", str(out_npy), "--out-scaler", str(out_scaler), "--out-meta", str(out_meta)])
+    if out_idx is not None:
+        cmd.extend(["--out-idx", str(out_idx)])
+    logging.info("tlg8_featcache を起動します: %s", " ".join(cmd))
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"tlg8_featcache の実行に失敗しました (exit={result.returncode})")
 
 
 class JsonlReader:
@@ -793,6 +910,211 @@ class FastLabelStore:
             self._mmap.close()
         finally:
             self._file.close()
+
+
+class RankerLabelView:
+    """C++ 版ラベルキャッシュ上の単一ヘッドビュー。"""
+
+    def __init__(self, array: np.ndarray, invalid_value: int) -> None:
+        self._array = array
+        self._invalid_value = int(invalid_value)
+
+    def __len__(self) -> int:
+        return int(self._array.shape[0])
+
+    def __getitem__(self, idx: object) -> np.ndarray:
+        rows, scalar = _normalize_indices(idx, len(self))
+        values = self._array[rows]
+        out = values.astype(np.int32, copy=True)
+        out[out == self._invalid_value] = -1
+        if scalar:
+            return int(out[0])
+        return out
+
+
+class RankerLabelCache:
+    """C++ 実装のラベルキャッシュを numpy.memmap として提供する。"""
+
+    def __init__(
+        self,
+        meta: Dict[str, object],
+        bin_path: Path,
+        *,
+        topk_path: Optional[Path],
+        topk_k: int,
+    ) -> None:
+        self._meta = meta
+        self._bin_path = Path(bin_path)
+        self._topk_path = topk_path
+        self._topk_k = int(max(0, topk_k))
+        self._record_count = int(meta.get("n_samples", 0))
+        if self._record_count <= 0:
+            raise ValueError("ラベルキャッシュのサンプル数が不正です")
+        self._invalid_value = int(meta.get("invalid_value", 0xFFFF))
+
+        header, head_descs = _read_ranker_label_header(self._bin_path, expect_magic=RANKER_LABEL_MAGIC)
+        if header["version"] != 1:
+            raise ValueError("ラベルキャッシュのバージョンが不正です")
+        if header["n_samples"] != self._record_count:
+            raise ValueError("ラベルキャッシュのサンプル数がメタデータと一致しません")
+        try:
+            meta_hash = int(meta.get("jsonl_hash", header["jsonl_hash"]))
+        except (TypeError, ValueError):
+            meta_hash = header["jsonl_hash"]
+        if int(header["jsonl_hash"]) != meta_hash:
+            logging.warning("ラベルキャッシュの JSONL ハッシュがメタデータと一致しません")
+        heads_meta = meta.get("heads")
+        if not isinstance(heads_meta, list) or len(heads_meta) != int(header["n_heads"]):
+            raise ValueError("ラベルキャッシュのヘッド情報が不正です")
+
+        sample_stride = 0
+        for desc in head_descs:
+            sample_stride = max(sample_stride, int(desc["offset"]) + int(desc["stride"]))
+        if sample_stride <= 0:
+            raise ValueError("ラベルキャッシュのストライド計算に失敗しました")
+        if sample_stride % 2 != 0:
+            raise ValueError("ラベルキャッシュのストライドが 2 バイト境界になっていません")
+
+        self._raw = np.memmap(
+            str(self._bin_path),
+            dtype=np.uint8,
+            mode="r",
+            offset=int(header["data_off"]),
+            shape=(self._record_count, sample_stride),
+        )
+        self._u16 = self._raw.view("<u2")
+
+        self._best_arrays: Dict[str, np.ndarray] = {}
+        self._second_arrays: Dict[str, np.ndarray] = {}
+
+        topk_arrays: Optional[np.ndarray] = None
+        topk_descs: Optional[List[Dict[str, int]]] = None
+        if self._topk_path is not None and self._topk_k > 0 and self._topk_path.exists():
+            topk_header, tk_descs = _read_ranker_label_header(self._topk_path, expect_magic=RANKER_TOPK_MAGIC)
+            if topk_header["version"] != 1:
+                raise ValueError("topK ラベルキャッシュのバージョンが不正です")
+            if topk_header["n_samples"] != self._record_count:
+                raise ValueError("topK ラベルキャッシュのサンプル数が一致しません")
+            if int(topk_header["n_heads"]) != len(head_descs):
+                raise ValueError("topK ラベルキャッシュのヘッド数が一致しません")
+            topk_stride = 0
+            for desc in tk_descs:
+                topk_stride = max(topk_stride, int(desc["offset"]) + int(desc["stride"]))
+            if topk_stride <= 0:
+                raise ValueError("topK ラベルキャッシュのストライド計算に失敗しました")
+            if topk_stride % 2 != 0:
+                raise ValueError("topK ラベルキャッシュのストライドが 2 バイト境界になっていません")
+            self._topk_raw = np.memmap(
+                str(self._topk_path),
+                dtype=np.uint8,
+                mode="r",
+                offset=int(topk_header["data_off"]),
+                shape=(self._record_count, topk_stride),
+            )
+            topk_arrays = self._topk_raw.view("<u2")
+            topk_descs = tk_descs
+        else:
+            self._topk_raw = None
+
+        for idx, entry in enumerate(heads_meta):
+            if not isinstance(entry, dict):
+                raise ValueError("ラベルキャッシュのヘッド記述子が壊れています")
+            name = str(entry.get("name"))
+            desc = head_descs[idx]
+            offset_bytes = int(desc["offset"])
+            stride_bytes = int(desc["stride"])
+            if stride_bytes <= 0 or stride_bytes % 2 != 0:
+                raise ValueError("ラベルキャッシュのヘッド stride が不正です")
+            start = offset_bytes // 2
+            width = stride_bytes // 2
+            if start + width > self._u16.shape[1]:
+                raise ValueError("ラベルキャッシュのヘッド範囲が配列を超えています")
+            view = self._u16[:, start : start + width]
+            if width >= 1:
+                self._best_arrays[name] = view[:, 0]
+            else:
+                self._best_arrays[name] = np.full((self._record_count,), self._invalid_value, dtype=np.uint16)
+            second_array: np.ndarray
+            if topk_arrays is not None and topk_descs is not None:
+                tk_desc = topk_descs[idx]
+                tk_offset = int(tk_desc["offset"]) // 2
+                tk_width = max(0, int(tk_desc["stride"]) // 2)
+                if tk_offset + tk_width > topk_arrays.shape[1]:
+                    raise ValueError("topK ラベルキャッシュのヘッド範囲が不正です")
+                if tk_width >= 2:
+                    second_array = topk_arrays[:, tk_offset + 1]
+                else:
+                    second_array = np.full((self._record_count,), self._invalid_value, dtype=np.uint16)
+            else:
+                second_array = np.full((self._record_count,), self._invalid_value, dtype=np.uint16)
+            self._second_arrays[name] = second_array
+
+    def make(self, head: str, *, use_second: bool) -> RankerLabelView:
+        try:
+            if use_second:
+                return RankerLabelView(self._second_arrays[head], self._invalid_value)
+            return RankerLabelView(self._best_arrays[head], self._invalid_value)
+        except KeyError as exc:
+            raise KeyError(f"未知のヘッド名です: {head}") from exc
+
+    @property
+    def record_count(self) -> int:
+        return int(self._record_count)
+
+    def close(self) -> None:
+        if isinstance(getattr(self, "_raw", None), np.memmap):
+            try:
+                self._raw._mmap.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if isinstance(getattr(self, "_topk_raw", None), np.memmap):
+            try:
+                self._topk_raw._mmap.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+
+def _read_ranker_label_header(path: Path, *, expect_magic: bytes) -> Tuple[Dict[str, int], List[Dict[str, int]]]:
+    """C++ 版ラベルキャッシュヘッダーを読み取り構造化する。"""
+
+    with Path(path).open("rb") as fp:
+        header_raw = fp.read(RANKER_LABEL_HEADER_STRUCT.size)
+        if len(header_raw) != RANKER_LABEL_HEADER_STRUCT.size:
+            raise ValueError(f"ラベルキャッシュヘッダーが不足しています: {path}")
+        magic, version, n_heads, n_samples, head_off, data_off, jsonl_hash = RANKER_LABEL_HEADER_STRUCT.unpack(
+            header_raw
+        )
+        expected = expect_magic.rstrip(b"\0")
+        actual = magic.rstrip(b"\0")
+        if actual != expected:
+            raise ValueError(f"ラベルキャッシュのマジックが不正です (expected={expected!r}, actual={actual!r})")
+        if n_heads <= 0:
+            raise ValueError("ラベルキャッシュのヘッド数が不正です")
+        fp.seek(int(head_off))
+        head_descs: List[Dict[str, int]] = []
+        for _ in range(int(n_heads)):
+            data = fp.read(RANKER_LABEL_HEAD_STRUCT.size)
+            if len(data) != RANKER_LABEL_HEAD_STRUCT.size:
+                raise ValueError("ラベルキャッシュのヘッド記述子が不足しています")
+            name_id, n_classes, stride, offset = RANKER_LABEL_HEAD_STRUCT.unpack(data)
+            head_descs.append(
+                {
+                    "name_id": int(name_id),
+                    "n_classes": int(n_classes),
+                    "stride": int(stride),
+                    "offset": int(offset),
+                }
+            )
+    header = {
+        "magic": actual,
+        "version": int(version),
+        "n_heads": int(n_heads),
+        "n_samples": int(n_samples),
+        "head_off": int(head_off),
+        "data_off": int(data_off),
+        "jsonl_hash": int(jsonl_hash),
+    }
+    return header, head_descs
 
 
 class FastLabels:
@@ -1157,10 +1479,11 @@ def _try_load_feature_cache(
     expected_dim: int,
     cond_heads: Sequence[str],
     cond_encoding: str,
+    meta_path: Optional[Path] = None,
 ) -> Optional[np.memmap]:
     """既存の特徴量キャッシュが利用可能なら mmap して返す。"""
 
-    meta_path = _feature_cache_meta_path(cache_path)
+    meta_path = meta_path or _feature_cache_meta_path(cache_path)
     if not cache_path.exists() or not meta_path.exists():
         return None
     try:
@@ -1169,6 +1492,40 @@ def _try_load_feature_cache(
     except (OSError, json.JSONDecodeError) as exc:
         logging.warning("特徴量キャッシュメタデータの読み込みに失敗しました (%s)", exc)
         return None
+
+    format_val = meta.get("format")
+    if isinstance(format_val, str) and format_val == "tlg8-ranker-features":
+        try:
+            record_count = int(meta.get("n_samples", 0))
+            feature_dim = int(meta.get("feature_dim", 0))
+        except (TypeError, ValueError):
+            logging.warning("C++ 特徴量キャッシュのメタデータが不正です")
+            return None
+        if record_count != expected_records or feature_dim != expected_dim:
+            logging.warning(
+                "C++ 特徴量キャッシュの形状が一致しません (records=%d/%d, dim=%d/%d)",
+                record_count,
+                expected_records,
+                feature_dim,
+                expected_dim,
+            )
+            return None
+        if cond_heads:
+            logging.warning("条件付き特徴量指定時は C++ 特徴量キャッシュを利用できません")
+            return None
+        if not _feature_cache_files_match(files, meta.get("source_files")):
+            logging.warning("C++ 特徴量キャッシュの入力ファイル構成が一致しません")
+            return None
+        try:
+            arr = np.load(cache_path, mmap_mode="r", allow_pickle=False)
+        except (OSError, ValueError) as exc:
+            logging.warning("C++ 特徴量キャッシュの読み込みに失敗しました: %s", exc)
+            return None
+        if arr.ndim != 2 or arr.shape[0] != expected_records or arr.shape[1] != expected_dim:
+            logging.warning("C++ 特徴量キャッシュの形状が不正です (shape=%s)", arr.shape)
+            return None
+        logging.info("C++ 特徴量キャッシュを利用します: %s (shape=%d×%d)", cache_path, arr.shape[0], arr.shape[1])
+        return arr
 
     try:
         version = int(meta.get("version", 0))
@@ -1227,11 +1584,12 @@ def _build_feature_cache(
     total: int,
     expected_dim: int,
     chunk_size: int,
+    meta_path: Optional[Path] = None,
 ) -> np.memmap:
     """特徴量キャッシュを新規作成して mmap を返す。"""
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path = _feature_cache_meta_path(cache_path)
+    meta_target = meta_path or _feature_cache_meta_path(cache_path)
     feature_source: object
     if cond_specs:
         feature_source = AugmentedFeatures(base_features, cond_arrays, cond_specs, encoding=cond_encoding)
@@ -1279,7 +1637,7 @@ def _build_feature_cache(
             for ref in files
         ],
     }
-    with meta_path.open("w", encoding="utf-8") as fp:
+    with meta_target.open("w", encoding="utf-8") as fp:
         json.dump(meta, fp)
 
     del mm  # mmap を明示的にクローズする
@@ -1300,6 +1658,7 @@ def load_or_build_feature_cache(
     total: int,
     expected_dim: int,
     chunk_size: int = 65536,
+    meta_path: Optional[Path] = None,
 ) -> np.memmap:
     """特徴量キャッシュをロードまたは構築して mmap を返す。"""
 
@@ -1310,6 +1669,7 @@ def load_or_build_feature_cache(
         expected_dim=expected_dim,
         cond_heads=cond_heads,
         cond_encoding=cond_encoding,
+        meta_path=meta_path,
     )
     if cache is not None:
         return cache
@@ -1330,6 +1690,7 @@ def load_or_build_feature_cache(
         total=total,
         expected_dim=expected_dim,
         chunk_size=max(1, int(chunk_size)),
+        meta_path=meta_path,
     )
 
 
@@ -2317,11 +2678,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--feature-cache",
         type=Path,
-        default=None,
+        default=Path(".cache/ranker.features.npy"),
         help="JSONL から抽出した特徴量をキャッシュする NPY ファイルへのパス",
+    )
+    parser.add_argument(
+        "--feature-meta",
+        type=Path,
+        default=None,
+        help="特徴量キャッシュのメタデータパス (未指定時は <feature-cache>.meta.json)",
     )
     parser.add_argument("--labels-meta", type=Path, default=Path(".cache/labels.meta.json"), help="ラベルキャッシュのメタデータパス")
     parser.add_argument("--labels-bin", type=Path, default=Path(".cache/labels.bin"), help="ラベルキャッシュのバイナリパス")
+    parser.add_argument(
+        "--labels-topk",
+        type=Path,
+        default=None,
+        help="C++ ラベルキャッシュが出力する topK バイナリのパス (未指定時は labels-bin から派生)",
+    )
     parser.add_argument("--build-label-cache", action="store_true", help="キャッシュ不整合時に事前抽出を自動実行")
     parser.add_argument("--no-label-cache", action="store_true", help="JSONL からのラベル読み出しを強制")
     parser.add_argument(
@@ -2333,7 +2706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--scaler",
         type=Path,
-        default=None,
+        default=Path(".cache/ranker.scaler.npz"),
         help="特徴量スケーラー (.npz) のパス。既存ファイルを読み込み、無効なら再計算して上書き",
     )
     parser.add_argument(
@@ -2381,9 +2754,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="評価ロジットを NPZ として保存するディレクトリ (明示指定時のみ CPU 転送)",
     )
+    parser.add_argument(
+        "--fast-preproc",
+        dest="fast_preproc",
+        action="store_true",
+        default=True,
+        help="C++ 製の高速前処理パイプラインを利用する",
+    )
+    parser.add_argument("--no-fast-preproc", dest="fast_preproc", action="store_false", help="C++ 前処理を無効化")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    if args.feature_meta is None and args.feature_cache is not None:
+        args.feature_meta = _feature_cache_meta_path(Path(args.feature_cache))
+    if args.labels_topk is None:
+        labels_bin_path = Path(args.labels_bin)
+        if labels_bin_path.suffix:
+            args.labels_topk = labels_bin_path.with_suffix(labels_bin_path.suffix + ".topk.bin")
+        else:
+            args.labels_topk = labels_bin_path.parent / f"{labels_bin_path.name}.topk.bin"
 
     try:
         head_loss_dict = parse_head_loss_weights(args.head_loss_weights)
@@ -2525,7 +2915,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cache_path = Path(args.index_cache) if args.index_cache else None
     file_refs, index = build_jsonl_index(input_paths, cache_path, bool(args.progress))
 
-    fast_label_store: Optional[FastLabelStore] = None
+    fast_label_store: Optional[object] = None
     if not args.no_label_cache:
         fast_label_store = try_load_label_cache(
             args.labels_meta,
@@ -2534,6 +2924,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             index.shape[0],
             show_progress=bool(args.progress),
         )
+        if fast_label_store is None and args.fast_preproc:
+            try:
+                ensure_ranker_label_cache_cpp(
+                    FAST_LABELCACHE_TOOL,
+                    input_paths,
+                    meta_path=args.labels_meta,
+                    bin_path=args.labels_bin,
+                    topk_path=args.labels_topk,
+                    heads=RANKER_DEFAULT_HEADS,
+                    topk=RANKER_DEFAULT_TOPK,
+                )
+            except FileNotFoundError as exc:
+                logging.warning("C++ ラベルキャッシュツールが見つかりません: %s", exc)
+            except Exception as exc:
+                logging.warning("C++ ラベルキャッシュ生成に失敗しました: %s", exc)
+            else:
+                fast_label_store = try_load_label_cache(
+                    args.labels_meta,
+                    args.labels_bin,
+                    file_refs,
+                    index.shape[0],
+                    show_progress=bool(args.progress),
+                )
         if fast_label_store is None and args.build_label_cache:
             rc = invoke_preextractor(
                 args.inputs,
@@ -2575,22 +2988,69 @@ def main(argv: Sequence[str] | None = None) -> int:
     expected_feature_dim = feature_dim + conditioned_extra_dim(cond_heads, args.condition_encoding)
 
     feature_cache_array: Optional[np.memmap] = None
-    if args.feature_cache is not None:
+    feature_cache_preloaded: Optional[np.memmap] = None
+    feature_cache_path = Path(args.feature_cache) if args.feature_cache is not None else None
+    feature_meta_path = Path(args.feature_meta) if args.feature_meta is not None else None
+    if feature_cache_path is not None and feature_meta_path is None:
+        feature_meta_path = _feature_cache_meta_path(feature_cache_path)
+    if (
+        feature_cache_path is not None
+        and feature_meta_path is not None
+        and args.fast_preproc
+        and not cond_heads
+    ):
+        feature_cache_preloaded = _try_load_feature_cache(
+            feature_cache_path,
+            file_refs,
+            expected_records=total,
+            expected_dim=expected_feature_dim,
+            cond_heads=cond_heads,
+            cond_encoding=args.condition_encoding,
+            meta_path=feature_meta_path,
+        )
+        if feature_cache_preloaded is None:
+            try:
+                ensure_ranker_feature_cache_cpp(
+                    FAST_FEATCACHE_TOOL,
+                    input_paths,
+                    out_npy=feature_cache_path,
+                    out_scaler=Path(args.scaler),
+                    out_meta=feature_meta_path,
+                )
+            except FileNotFoundError as exc:
+                logging.warning("C++ 特徴量キャッシュツールが見つかりません: %s", exc)
+            except Exception as exc:
+                logging.warning("C++ 特徴量キャッシュ生成に失敗しました: %s", exc)
+            else:
+                feature_cache_preloaded = _try_load_feature_cache(
+                    feature_cache_path,
+                    file_refs,
+                    expected_records=total,
+                    expected_dim=expected_feature_dim,
+                    cond_heads=cond_heads,
+                    cond_encoding=args.condition_encoding,
+                    meta_path=feature_meta_path,
+                )
+    if feature_cache_path is not None:
         cond_arrays_full: Dict[str, np.ndarray] = {}
         for name in cond_heads:
             cond_arrays_full[name] = np.asarray(cond_best_sources[name][:], dtype=np.int16)
-        feature_cache_array = load_or_build_feature_cache(
-            args.feature_cache,
-            file_refs,
-            features,
-            cond_arrays=cond_arrays_full,
-            cond_specs=cond_specs,
-            cond_encoding=args.condition_encoding,
-            cond_heads=cond_heads,
-            total=total,
-            expected_dim=expected_feature_dim,
-            chunk_size=max(args.batch_size, args.max_batch),
-        )
+        if feature_cache_preloaded is not None:
+            feature_cache_array = feature_cache_preloaded
+        else:
+            feature_cache_array = load_or_build_feature_cache(
+                feature_cache_path,
+                file_refs,
+                features,
+                cond_arrays=cond_arrays_full,
+                cond_specs=cond_specs,
+                cond_encoding=args.condition_encoding,
+                cond_heads=cond_heads,
+                total=total,
+                expected_dim=expected_feature_dim,
+                chunk_size=max(args.batch_size, args.max_batch),
+                meta_path=feature_meta_path,
+            )
         train_features = LazyFeatureSubset(feature_cache_array, train_idx)
         val_features = LazyFeatureSubset(feature_cache_array, val_idx)
         final_feature_dim = int(feature_cache_array.shape[1])

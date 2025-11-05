@@ -55,6 +55,8 @@ find_package(PNG REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_subdirectory(cpp)
+
 add_executable(tlgconv
     src/main.cpp
     src/png_io.cpp
