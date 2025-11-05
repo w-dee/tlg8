@@ -189,9 +189,9 @@ class FastpathParityTest(unittest.TestCase):
             jsonl_path = tmp_path / "sample.jsonl"
             _write_jsonl(jsonl_path, _sample_records())
 
-            feat_npy = tmp_path / "ranker.features.npy"
+            feat_npy = tmp_path / "ranker.features.v2.npy"
             feat_scaler = tmp_path / "ranker.scaler.npz"
-            feat_meta = tmp_path / "ranker.features.meta.json"
+            feat_meta = tmp_path / "ranker.features.v2.meta.json"
             feat_idx = tmp_path / "ranker.idx"
             subprocess.run(
                 [

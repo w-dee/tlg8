@@ -30,6 +30,46 @@ except Exception:  # pragma: no cover - PyTorch 非導入環境でのフォー�
 if TYPE_CHECKING:  # 型チェック時のみ使用
     import torch  # noqa: F401
 
+
+class CosineLinear(nn.Module if nn is not None else object):
+    """特徴ベクトルと重みベクトルの余弦類似度を線形層風に計算する。"""
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False) -> None:
+        torch_mod = _ensure_torch()
+        if bias:
+            raise ValueError("CosineLinear では bias を利用できません")
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.weight = nn.Parameter(torch_mod.empty(self.out_features, self.in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        torch_mod = _ensure_torch()
+        x_norm = torch_mod.nn.functional.normalize(x, dim=1)
+        w_norm = torch_mod.nn.functional.normalize(self.weight, dim=1)
+        return torch_mod.matmul(x_norm, w_norm.t())
+
+
+class ArcMarginProduct(nn.Module if nn is not None else object):
+    """ArcFace の余弦マージン写像を実装する。"""
+
+    def __init__(self, s: float = 30.0, m: float = 0.25) -> None:
+        super().__init__()
+        self.scale = float(s)
+        self.margin = float(m)
+
+    def forward(self, cosine: "torch.Tensor", target: "torch.Tensor") -> "torch.Tensor":
+        torch_mod = _ensure_torch()
+        clipped = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        theta = torch_mod.acos(clipped)
+        target_logits = torch_mod.cos(theta + self.margin)
+        one_hot = torch_mod.zeros_like(cosine)
+        one_hot.scatter_(1, target.view(-1, 1), 1.0)
+        output = clipped * (1.0 - one_hot) + target_logits * one_hot
+        return output * self.scale
+
+
 # 各ヘッドのクラス数定義
 HEAD_SPECS: Dict[str, int] = {
     "predictor": 8,
@@ -155,6 +195,7 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         *,
         dropout: float = 0.1,
         disabled_heads: Sequence[str] = (),
+        reorder_head_config: Mapping[str, object] | None = None,
     ) -> None:
         torch_mod = _ensure_torch()
         super().__init__()
@@ -189,10 +230,22 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self._base_active_heads: Tuple[str, ...] = tuple(
             name for name in HEAD_ORDER if name not in disabled_set
         )
+        cfg = dict(reorder_head_config or {})
+        self.reorder_use_cosine: bool = bool(cfg.get("use_cosine", False))
+        self.reorder_scale: float = float(cfg.get("scale", 30.0)) if self.reorder_use_cosine else 1.0
+        self.reorder_arcface_margin: float = (
+            float(cfg.get("arcface_m", 0.0)) if self.reorder_use_cosine else 0.0
+        )
         heads: Dict[str, nn.Module] = {}
         for name in self._base_active_heads:
-            heads[name] = nn.Linear(self.hidden_dim, HEAD_SPECS[name])
+            if name == "reorder" and self.reorder_use_cosine:
+                heads[name] = CosineLinear(self.hidden_dim, HEAD_SPECS[name], bias=False)
+            else:
+                heads[name] = nn.Linear(self.hidden_dim, HEAD_SPECS[name])
         self.heads = nn.ModuleDict(heads)
+        self.reorder_arcface: ArcMarginProduct | None = None
+        if self.reorder_use_cosine and "reorder" in self.heads and self.reorder_arcface_margin > 0.0:
+            self.reorder_arcface = ArcMarginProduct(s=self.reorder_scale, m=self.reorder_arcface_margin)
         self._condition_heads: Tuple[str, ...] = ()
         self._update_active_heads()
         self.inference_temperature: float = 1.0
@@ -232,8 +285,26 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         h = F.gelu(self.fc3(h))
         outputs: Dict[str, torch.Tensor] = {}
         for name in self.active_heads:
-            outputs[name] = self.heads[name](h)
+            head = self.heads[name]
+            logits = head(h)
+            if name == "reorder" and self.reorder_use_cosine:
+                logits = logits * self.reorder_scale
+            outputs[name] = logits
         return outputs
+
+    def trunk_parameters(self):
+        """トランク層のパラメータイテレータ。"""
+
+        for layer in (self.fc1, self.fc2, self.fc3):
+            yield from layer.parameters()
+
+    def head_parameters(self):
+        """ヘッド層のパラメータイテレータ。"""
+
+        for module in self.heads.values():
+            yield from module.parameters()
+        if self.reorder_arcface is not None:
+            yield from self.reorder_arcface.parameters()
 
     def load_from_npz(self, npz_path: str) -> None:
         """既存 NPZ 形式の重みを PyTorch モデルへ読み込む。"""
@@ -284,7 +355,8 @@ class TorchMultiTask(nn.Module if nn is not None else object):
                 bias = np.asarray(state[bias_key], dtype=np.float32)
                 head = self.heads[name]
                 head.weight.data.copy_(torch_mod.from_numpy(weight.T))
-                head.bias.data.copy_(torch_mod.from_numpy(bias))
+                if hasattr(head, "bias") and head.bias is not None:
+                    head.bias.data.copy_(torch_mod.from_numpy(bias))
                 active_loaded.append(name)
             self.active_heads = tuple(active_loaded)
 
@@ -301,6 +373,9 @@ class TorchMultiTask(nn.Module if nn is not None else object):
             "dropout": float(self.dropout_rate),
             "disabled_heads": list(self.disabled_heads),
             "inference_temperature": float(self.inference_temperature),
+            "reorder_use_cosine": bool(getattr(self, "reorder_use_cosine", False)),
+            "reorder_scale": float(getattr(self, "reorder_scale", 1.0)),
+            "reorder_arcface_margin": float(getattr(self, "reorder_arcface_margin", 0.0)),
             "state_dict": state_dict,
         }
         torch_mod.save(payload, path)  # type: ignore[union-attr]
@@ -334,6 +409,9 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         inference_temperature = 1.0
         train_mean_raw: object | None = None
         train_std_raw: object | None = None
+        reorder_use_cosine = False
+        reorder_scale = 30.0
+        reorder_margin = 0.0
 
         if isinstance(payload, Mapping):
             state_candidate = payload.get("state_dict")
@@ -347,6 +425,9 @@ class TorchMultiTask(nn.Module if nn is not None else object):
             dropout = float(dropout_value) if dropout_value is not None else 0.1
             disabled_heads = tuple(str(name) for name in payload.get("disabled_heads", ()))  # type: ignore[arg-type]
             inference_temperature = float(payload.get("inference_temperature", 1.0))
+            reorder_use_cosine = bool(payload.get("reorder_use_cosine", False))
+            reorder_scale = float(payload.get("reorder_scale", 30.0))
+            reorder_margin = float(payload.get("reorder_arcface_margin", 0.0))
         else:
             state = payload  # type: ignore[assignment]
 
@@ -373,11 +454,19 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         if not isinstance(state, Mapping):
             raise TypeError("state_dict 形式が不正です")
 
+        if not reorder_use_cosine and "heads.reorder.bias" not in state:
+            reorder_use_cosine = True
+
         model = TorchMultiTask(
             train_mean,
             train_std,
             dropout=dropout,
             disabled_heads=disabled_heads,
+            reorder_head_config={
+                "use_cosine": reorder_use_cosine,
+                "scale": reorder_scale,
+                "arcface_m": reorder_margin,
+            },
         )
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:

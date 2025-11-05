@@ -26,6 +26,8 @@ except ImportError as exc:  # pragma: no cover - 実行環境の依存性確認
     )
     raise SystemExit(1) from exc
 
+from features import compute_orientation_features
+
 # TLG8 固有の定数
 K_PREDICTOR_CLASSES = 8
 K_FILTER_CLASSES = 96
@@ -34,7 +36,7 @@ K_INTERLEAVE_CLASSES = 2
 K_ENTROPY_CLASSES = 2
 MAX_BLOCK_PIXELS = 64
 MAX_COMPONENTS = 4
-EXTRA_FEATURES = 3  # block_w, block_h, components の正規化値
+EXTRA_FEATURES = 16  # block_w, block_h, components + 方位統計 13 次元
 BLOCK_EDGE = 8
 
 
@@ -110,16 +112,14 @@ def load_dataset(paths: Sequence[Path]) -> Dict[str, np.ndarray]:
                         )
                         continue
 
-                    padded = np.zeros((MAX_COMPONENTS, MAX_BLOCK_PIXELS), dtype=np.float32)
-                    offset = 0
-                    for by in range(block_h):
-                        for bx in range(block_w):
-                            dest_index = by * BLOCK_EDGE + bx  # 8x8 の行優先インデックス
-                            for comp in range(components):
-                                padded[comp, dest_index] = pixels[offset] / 255.0
-                                offset += 1
+                    padded = np.zeros((MAX_COMPONENTS, BLOCK_EDGE, BLOCK_EDGE), dtype=np.float32)
+                    arr = np.asarray(pixels, dtype=np.uint8, order="C")
+                    arr = arr.reshape(block_h, block_w, components).transpose(2, 0, 1)
+                    normalized = arr.astype(np.float32) / 255.0
+                    padded[:components, :block_h, :block_w] = normalized
+                    orientation = compute_orientation_features(padded[:components, :block_h, :block_w])
                     extra = np.array([block_w / 8.0, block_h / 8.0, components / 4.0], dtype=np.float32)
-                    feature = np.concatenate([padded.reshape(-1), extra])
+                    feature = np.concatenate([padded.reshape(-1), extra, orientation])
                     features.append(feature)
 
                     predictor_labels.append(int(best.get("predictor", 0)))

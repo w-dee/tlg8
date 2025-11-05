@@ -1,6 +1,7 @@
 #include "common.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -24,7 +26,11 @@ namespace {
 
 constexpr int kMaxComponents = 4;
 constexpr int kBlockEdge = 8;
-constexpr int kFeatureDim = kMaxComponents * kBlockEdge * kBlockEdge + 3;
+constexpr int kOrientationBins = 8;
+constexpr int kOrientationStats = 5;
+constexpr int kOrientationDim = kOrientationBins + kOrientationStats;
+constexpr int kFeatureDim = kMaxComponents * kBlockEdge * kBlockEdge + 3 + kOrientationDim;
+constexpr float kPi = 3.14159265358979323846f;
 
 struct Options {
     std::vector<fs::path> jsonl_paths;
@@ -267,6 +273,107 @@ bool write_npz(const fs::path& path, const std::vector<std::uint8_t>& mean_buf, 
     return static_cast<bool>(out);
 }
 
+void compute_orientation_features(
+    const std::vector<float>& mean_plane,
+    int width,
+    int height,
+    std::array<float, kOrientationDim>& out
+) {
+    static constexpr float kSobelX[3][3] = {
+        {1.0f, 0.0f, -1.0f},
+        {2.0f, 0.0f, -2.0f},
+        {1.0f, 0.0f, -1.0f},
+    };
+    static constexpr float kSobelY[3][3] = {
+        {1.0f, 2.0f, 1.0f},
+        {0.0f, 0.0f, 0.0f},
+        {-1.0f, -2.0f, -1.0f},
+    };
+    std::array<float, kOrientationBins> hist{};
+    std::vector<float> magnitudes;
+    magnitudes.reserve(static_cast<std::size_t>(width * height));
+    float sum_mag = 0.0f;
+    float sum_abs_gx = 0.0f;
+    float sum_abs_gy = 0.0f;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float gx = 0.0f;
+            float gy = 0.0f;
+            for (int ky = -1; ky <= 1; ++ky) {
+                const int yy = std::clamp(y + ky, 0, height - 1);
+                for (int kx = -1; kx <= 1; ++kx) {
+                    const int xx = std::clamp(x + kx, 0, width - 1);
+                    const float val = mean_plane[static_cast<std::size_t>(yy) * width + xx];
+                    gx += kSobelX[ky + 1][kx + 1] * val;
+                    gy += kSobelY[ky + 1][kx + 1] * val;
+                }
+            }
+            const float mag = std::hypot(gx, gy);
+            const float theta = std::atan2(gy, gx);
+            int bin = static_cast<int>(std::floor((theta + kPi) * (kOrientationBins / (2.0f * kPi))));
+            if (bin < 0) {
+                bin = 0;
+            } else if (bin >= kOrientationBins) {
+                bin = kOrientationBins - 1;
+            }
+            hist[static_cast<std::size_t>(bin)] += mag;
+            magnitudes.push_back(mag);
+            sum_mag += mag;
+            sum_abs_gx += std::fabs(gx);
+            sum_abs_gy += std::fabs(gy);
+        }
+    }
+    const float hist_total = std::accumulate(hist.begin(), hist.end(), 0.0f);
+    if (hist_total > 0.0f) {
+        for (float& value : hist) {
+            value /= hist_total;
+        }
+    }
+    float mean_mag = 0.0f;
+    float p95 = 0.0f;
+    float edge_ratio = 0.0f;
+    float low_high_ratio = 0.0f;
+    if (!magnitudes.empty()) {
+        mean_mag = sum_mag / static_cast<float>(magnitudes.size());
+        std::vector<float> sorted = magnitudes;
+        std::sort(sorted.begin(), sorted.end());
+        const std::size_t max_index = sorted.size() - 1;
+        const std::size_t idx = static_cast<std::size_t>(std::floor(0.95f * static_cast<float>(max_index)));
+        p95 = sorted[std::min(idx, max_index)];
+        if (mean_mag > 0.0f) {
+            const float threshold = mean_mag * 1.5f;
+            std::size_t count = 0;
+            for (float mag : magnitudes) {
+                if (mag > threshold) {
+                    ++count;
+                }
+            }
+            edge_ratio = static_cast<float>(count) / static_cast<float>(magnitudes.size());
+        }
+        const std::size_t quart = std::max<std::size_t>(1, magnitudes.size() / 4);
+        if (quart > 0) {
+            float low_sum = 0.0f;
+            float high_sum = 0.0f;
+            for (std::size_t i = 0; i < quart; ++i) {
+                low_sum += sorted[i];
+                high_sum += sorted[sorted.size() - 1 - i];
+            }
+            const float low_mean = low_sum / static_cast<float>(quart);
+            const float high_mean = high_sum / static_cast<float>(quart);
+            low_high_ratio = low_mean / (high_mean + 1e-6f);
+        }
+    }
+    const float hv_balance = (sum_abs_gx - sum_abs_gy) / (sum_abs_gx + sum_abs_gy + 1e-6f);
+    for (std::size_t i = 0; i < kOrientationBins; ++i) {
+        out[i] = hist[i];
+    }
+    out[kOrientationBins + 0] = mean_mag;
+    out[kOrientationBins + 1] = p95;
+    out[kOrientationBins + 2] = edge_ratio;
+    out[kOrientationBins + 3] = hv_balance;
+    out[kOrientationBins + 4] = low_high_ratio;
+}
+
 bool build_feature(const json& record, std::vector<float>& out) {
     out.assign(kFeatureDim, 0.0f);
     if (!record.contains("pixels") || !record.contains("block_size") || !record.contains("components")) {
@@ -293,6 +400,7 @@ bool build_feature(const json& record, std::vector<float>& out) {
     }
     const std::size_t plane_stride = static_cast<std::size_t>(kBlockEdge * kBlockEdge);
     const std::size_t base_offset = plane_stride * kMaxComponents;
+    std::vector<float> mean_plane(static_cast<std::size_t>(block_w * block_h), 0.0f);
     for (int c = 0; c < components; ++c) {
         for (int y = 0; y < block_h; ++y) {
             for (int x = 0; x < block_w; ++x) {
@@ -301,12 +409,27 @@ bool build_feature(const json& record, std::vector<float>& out) {
                 const float normalized = static_cast<float>(std::clamp(raw, 0, 255)) / 255.0f;
                 const std::size_t dst_index = static_cast<std::size_t>(c) * plane_stride + static_cast<std::size_t>(y) * kBlockEdge + x;
                 out[dst_index] = normalized;
+                const std::size_t pix_index = static_cast<std::size_t>(y) * block_w + x;
+                mean_plane[pix_index] += normalized;
             }
         }
+    }
+    if (components > 0) {
+        const float inv_comp = 1.0f / static_cast<float>(components);
+        for (float& value : mean_plane) {
+            value *= inv_comp;
+        }
+    }
+    std::array<float, kOrientationDim> orientation{};
+    if (block_w > 0 && block_h > 0) {
+        compute_orientation_features(mean_plane, block_w, block_h, orientation);
     }
     out[base_offset + 0] = static_cast<float>(block_w) / 8.0f;
     out[base_offset + 1] = static_cast<float>(block_h) / 8.0f;
     out[base_offset + 2] = static_cast<float>(components) / 4.0f;
+    for (int i = 0; i < kOrientationDim; ++i) {
+        out[base_offset + 3 + i] = orientation[static_cast<std::size_t>(i)];
+    }
     return true;
 }
 

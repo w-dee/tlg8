@@ -74,6 +74,8 @@ except Exception:  # pragma: no cover - PyTorch 非導入環境
     torch = None  # type: ignore[assignment]
     torch_F = None  # type: ignore[assignment]
 
+from features import compute_orientation_features
+from losses import FocalLoss
 from multitask_model import (
     HEAD_ORDER,
     HEAD_SPECS,
@@ -291,6 +293,69 @@ def parse_head_loss_weights(raw: str) -> Dict[str, float]:
         except ValueError as exc:
             raise ValueError(f"ヘッド損失重みの数値が不正です: {entry}") from exc
     return weights
+
+
+def parse_head_list(raw: str, *, allow_default: bool = False) -> Tuple[str, ...]:
+    """ヘッド名のカンマ区切り文字列を正規化する。"""
+
+    if not raw:
+        return ()
+    entries = [item.strip() for item in raw.split(",") if item.strip()]
+    if not entries:
+        return ()
+    allowed = set(HEAD_ORDER)
+    result: List[str] = []
+    seen: set[str] = set()
+    for name in entries:
+        if allow_default and name == "default":
+            if name not in seen:
+                result.append(name)
+                seen.add(name)
+            continue
+        if name not in allowed:
+            raise ValueError(f"未知のヘッド名が指定されました: {name}")
+        if name in seen:
+            continue
+        result.append(name)
+        seen.add(name)
+    return tuple(result)
+
+
+def parse_head_value_map(raw: str, *, allow_default: bool = False) -> Dict[str, float]:
+    """ヘッド別の浮動小数点指定を辞書化する。"""
+
+    if not raw:
+        return {}
+    entries = [item.strip() for item in raw.split(",") if item.strip()]
+    if not entries:
+        return {}
+    allowed = set(HEAD_ORDER)
+    values: Dict[str, float] = {}
+    for entry in entries:
+        if "=" not in entry:
+            raise ValueError(f"不正なヘッド指定です: {entry}")
+        key, value = entry.split("=", 1)
+        key = key.strip()
+        if allow_default and key == "default":
+            values[key] = float(value)
+            continue
+        if key not in allowed:
+            raise ValueError(f"未知のヘッド名が指定されました: {key}")
+        values[key] = float(value)
+    return values
+
+
+def parse_optional_float(value: object) -> float | None:
+    """None 指定を許容する float 変換。"""
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().lower()
+    if text in ("none", "null", ""):
+        return None
+    return float(text)
 
 
 def effective_class_weights(counts: np.ndarray, beta: float) -> "torch.Tensor":
@@ -828,9 +893,11 @@ def record_to_feature(record: Dict[str, object]) -> np.ndarray:
     padded = np.zeros((MAX_COMPONENTS, BLOCK_EDGE, BLOCK_EDGE), dtype=np.float32)
     arr = np.asarray(pixels, dtype=np.uint8, order="C")
     arr = arr.reshape(block_h, block_w, components).transpose(2, 0, 1)
-    padded[:components, :block_h, :block_w] = arr / 255.0
+    normalized = arr.astype(np.float32) / 255.0
+    padded[:components, :block_h, :block_w] = normalized
+    orientation = compute_orientation_features(padded[:components, :block_h, :block_w])
     extra = np.array([block_w / 8.0, block_h / 8.0, components / 4.0], dtype=np.float32)
-    feature = np.concatenate([padded.reshape(-1), extra])
+    feature = np.concatenate([padded.reshape(-1), extra, orientation])
     return feature
 
 
@@ -2216,7 +2283,18 @@ def train_with_torch_backend(
         train_std = _np.asarray(std, dtype=_np.float32)
         logger.info("既存 mean/std を利用して train_mean/std を初期化 (dims=%d)", train_mean.shape[0])
 
-    model = TorchMultiTask(train_mean, train_std, dropout=args.dropout, disabled_heads=disabled_heads).to(device)
+    reorder_head_config = {
+        "use_cosine": bool(args.reorder_cosine),
+        "scale": float(max(1e-6, args.reorder_arcface_s)),
+        "arcface_m": float(max(0.0, args.reorder_arcface_m)),
+    }
+    model = TorchMultiTask(
+        train_mean,
+        train_std,
+        dropout=args.dropout,
+        disabled_heads=disabled_heads,
+        reorder_head_config=reorder_head_config,
+    ).to(device)
     if hasattr(model, "set_condition_heads"):
         model.set_condition_heads(condition_heads)
     cond_extra_dim = conditioned_extra_dim(condition_heads, args.condition_encoding)
@@ -2306,7 +2384,26 @@ def train_with_torch_backend(
         else:
             logging.warning("この PyTorch では torch.compile が利用できないため通常モードで実行します")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    freeze_trunk = bool(getattr(args, "freeze_trunk", False))
+    if freeze_trunk and hasattr(model, "trunk_parameters"):
+        for param in model.trunk_parameters():
+            param.requires_grad_(False)
+    param_groups: List[Dict[str, object]] = []
+    if hasattr(model, "trunk_parameters"):
+        trunk_params = [p for p in model.trunk_parameters() if p.requires_grad]
+    else:
+        trunk_params = []
+    if trunk_params:
+        param_groups.append({"params": trunk_params, "name": "trunk"})
+    if hasattr(model, "head_parameters"):
+        head_params = [p for p in model.head_parameters() if p.requires_grad]
+    else:
+        head_params = [p for p in model.parameters() if p.requires_grad]
+    if head_params:
+        param_groups.append({"params": head_params, "name": "heads"})
+    if not param_groups:
+        raise ValueError("学習可能なパラメータが存在しません")
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
     scheduler_kwargs = dict(
         optimizer=optimizer,
         mode="max",
@@ -2340,12 +2437,15 @@ def train_with_torch_backend(
     val_second_np = {name: np.ascontiguousarray(val_second[name], dtype=np.int64) for name in active_heads}
 
     train_targets: Dict[str, np.ndarray] = {}
+    epsilon_map = dict(getattr(args, "epsilon_soft_map", {}))
+    epsilon_default = float(epsilon_map.get("default", args.epsilon_soft))
     for name in active_heads:
+        epsilon_head = float(epsilon_map.get(name, epsilon_default))
         train_targets[name] = build_soft_targets(
             train_best_np[name],
             train_second_np[name],
             HEAD_SPECS[name],
-            args.epsilon_soft,
+            epsilon_head,
         ).astype(np.float32)
         train_targets[name] = np.ascontiguousarray(train_targets[name], dtype=np.float32)
 
@@ -2380,6 +2480,41 @@ def train_with_torch_backend(
     if perm_weights_tensor is not None:
         perm_weight_device = perm_weights_tensor.to(device=device)
 
+    class_balance_heads = set(getattr(args, "class_balance_heads", set()))
+    head_class_weight_cpu: Dict[str, torch.Tensor] = {}
+    if class_balance_heads:
+        for name in active_heads:
+            if name not in class_balance_heads:
+                continue
+            classes = HEAD_SPECS.get(name)
+            if classes is None:
+                logging.warning("%s のクラス数が未定義のためクラス重みは適用されません", name)
+                continue
+            labels_arr = np.asarray(train_best_np[name], dtype=np.int64)
+            valid = labels_arr[labels_arr >= 0]
+            if valid.size == 0:
+                logging.warning("%s の有効ラベルが不足しているためクラス重みは適用されません", name)
+                continue
+            counts = np.bincount(valid, minlength=int(classes))
+            if counts.size == 0:
+                logging.warning("%s のクラス頻度が取得できませんでした", name)
+                continue
+            try:
+                weight_tensor = effective_class_weights(counts, args.class_balance_beta)
+            except Exception as exc:
+                logging.warning("%s のクラス重み算出に失敗したため無効化します: %s", name, exc)
+                continue
+            head_class_weight_cpu[name] = weight_tensor
+            logging.info(
+                "%s に有効サンプル数ベースのクラス重みを適用します (beta=%.4f)",
+                name,
+                float(args.class_balance_beta),
+            )
+
+    head_class_weight_device: Dict[str, torch.Tensor] = {
+        name: tensor.to(device=device) for name, tensor in head_class_weight_cpu.items()
+    }
+
     eval_batch_raw = getattr(args, "eval_batch_size", None)
     if eval_batch_raw is None or int(eval_batch_raw) <= 0:
         eval_batch_raw = args.batch_size
@@ -2399,6 +2534,17 @@ def train_with_torch_backend(
 
     non_blocking = device.type == "cuda"
 
+    focal_heads = set(getattr(args, "loss_focal_heads", set()))
+    focal_losses: Dict[str, FocalLoss] = {}
+    for name in active_heads:
+        if name in focal_heads:
+            focal_module = FocalLoss(
+                gamma=float(args.focal_gamma),
+                alpha=args.focal_alpha,
+                reduction="none",
+            ).to(device)
+            focal_losses[name] = focal_module
+
     best_state: Optional[Dict[str, torch.Tensor]] = None
     best_train_metrics: Dict[str, Dict[str, float]] = {}
     best_val_metrics: Dict[str, Dict[str, float]] = {}
@@ -2407,6 +2553,12 @@ def train_with_torch_backend(
     train_count = len(train_features)
     rng = np.random.default_rng(args.seed)
     total_batches = max(1, (train_count + args.batch_size - 1) // args.batch_size)
+
+    hard_ratio = float(np.clip(getattr(args, "reorder_hardratio", 0.0), 0.0, 1.0))
+    hard_mult = float(max(1.0, getattr(args, "reorder_hardmult", 1.0)))
+    use_hard_mining = "reorder" in active_heads and hard_ratio > 0.0 and hard_mult > 1.0
+    hard_loss_buffer = np.zeros((train_count,), dtype=np.float32) if use_hard_mining else None
+    hard_sample_weights = np.ones((train_count,), dtype=np.float32) if use_hard_mining else None
 
     for epoch in range(args.epochs):
         indices = rng.permutation(train_count)
@@ -2451,19 +2603,69 @@ def train_with_torch_backend(
                     weight = float(head_loss_w.get(name, 1.0))
                     if weight <= 0.0:
                         continue
-                    log_probs = torch_F.log_softmax(_logits, dim=1)
                     targets_h = target_tensors[name]
-                    if (
-                        name == "filter_perm"
-                        and args.perm_class_balance == "effective"
-                        and perm_weight_device is not None
-                    ):
-                        kl_elem = torch_F.kl_div(log_probs, targets_h, reduction="none").sum(dim=1)
-                        true_ids = torch.argmax(targets_h, dim=1)
-                        cls_weight = perm_weight_device[true_ids]
-                        loss_h = (cls_weight * kl_elem).mean()
+                    class_weight = head_class_weight_device.get(name)
+                    if name in focal_losses:
+                        hard_np = np.asarray(train_best_np[name][batch_idx], dtype=np.int64)
+                        hard_cpu = torch.from_numpy(hard_np)
+                        if non_blocking:
+                            hard_cpu = hard_cpu.pin_memory()
+                        hard_labels = hard_cpu.to(device=device, dtype=torch.long, non_blocking=non_blocking)
+                        logits_for_loss = _logits
+                        if (
+                            name == "reorder"
+                            and getattr(model, "reorder_use_cosine", False)
+                        ):
+                            scale = float(getattr(model, "reorder_scale", 1.0))
+                            arcface_module = getattr(model, "reorder_arcface", None)
+                            if arcface_module is not None and scale > 0.0:
+                                cosine = torch.clamp(_logits / scale, -1.0 + 1e-7, 1.0 - 1e-7)
+                                logits_for_loss = arcface_module(cosine, hard_labels)
+                        loss_vec = focal_losses[name](logits_for_loss, hard_labels, weight=class_weight)
+                        if use_hard_mining and name == "reorder" and hard_loss_buffer is not None:
+                            hard_loss_buffer[batch_idx] = loss_vec.detach().cpu().numpy()
+                        if (
+                            use_hard_mining
+                            and name == "reorder"
+                            and epoch >= 1
+                            and hard_sample_weights is not None
+                        ):
+                            weights_np = hard_sample_weights[batch_idx]
+                            weights_cpu = torch.from_numpy(weights_np.astype(np.float32, copy=False))
+                            if non_blocking:
+                                weights_cpu = weights_cpu.pin_memory()
+                            weights_dev = weights_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+                            loss_vec = loss_vec * weights_dev
+                        loss_h = loss_vec.mean()
                     else:
-                        loss_h = torch_F.kl_div(log_probs, targets_h, reduction="batchmean")
+                        log_probs = torch_F.log_softmax(_logits, dim=1)
+                        loss_vec = torch_F.kl_div(log_probs, targets_h, reduction="none").sum(dim=1)
+                        if (
+                            name == "filter_perm"
+                            and args.perm_class_balance == "effective"
+                            and perm_weight_device is not None
+                        ):
+                            true_ids = torch.argmax(targets_h, dim=1)
+                            cls_weight = perm_weight_device[true_ids]
+                            loss_vec = loss_vec * cls_weight
+                        elif class_weight is not None:
+                            true_ids = torch.argmax(targets_h, dim=1)
+                            loss_vec = loss_vec * class_weight[true_ids]
+                        if use_hard_mining and name == "reorder" and hard_loss_buffer is not None:
+                            hard_loss_buffer[batch_idx] = loss_vec.detach().cpu().numpy()
+                        if (
+                            use_hard_mining
+                            and name == "reorder"
+                            and epoch >= 1
+                            and hard_sample_weights is not None
+                        ):
+                            weights_np = hard_sample_weights[batch_idx]
+                            weights_cpu = torch.from_numpy(weights_np.astype(np.float32, copy=False))
+                            if non_blocking:
+                                weights_cpu = weights_cpu.pin_memory()
+                            weights_dev = weights_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+                            loss_vec = loss_vec * weights_dev
+                        loss_h = loss_vec.mean()
                     loss_tensor += weight * loss_h
 
             loss_tensor.backward()
@@ -2553,6 +2755,29 @@ def train_with_torch_backend(
         except Exception:
             pass  # スケジューラ更新で例外が発生した場合は学習を継続する
 
+        if use_hard_mining and hard_loss_buffer is not None and hard_sample_weights is not None:
+            valid_mask = np.isfinite(hard_loss_buffer)
+            valid_indices = np.nonzero(valid_mask)[0]
+            if valid_indices.size == 0:
+                hard_sample_weights.fill(1.0)
+            else:
+                valid_losses = hard_loss_buffer[valid_mask]
+                select_count = max(1, int(round(valid_losses.size * hard_ratio)))
+                select_count = min(select_count, valid_losses.size)
+                if select_count <= 0:
+                    hard_sample_weights.fill(1.0)
+                else:
+                    order = np.argpartition(valid_losses, -select_count)[-select_count:]
+                    hard_indices = valid_indices[order]
+                    hard_sample_weights.fill(1.0)
+                    hard_sample_weights[hard_indices] = hard_mult
+                    logging.info(
+                        "ハードマイニング: 上位 %.2f%% の %d 件を倍率 %.2f で再重み付け", 
+                        hard_ratio * 100.0,
+                        int(select_count),
+                        hard_mult,
+                    )
+
         if mean_top3 > best_metric + 1e-4:
             best_metric = mean_top3
             state_source = (
@@ -2640,6 +2865,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=0.2,
         help="ソフトターゲットを一様分布と混合する割合 (0.0-0.5 程度)",
     )
+    parser.add_argument(
+        "--epsilon-soft-by-head",
+        type=str,
+        default="",
+        help="ヘッド別の epsilon 指定 (例: reorder=0.02,default=0.05)",
+    )
     parser.add_argument("--test-ratio", type=float, default=0.2, help="評価データ比率")
     parser.add_argument("--patience", type=int, default=20, help="早期終了の待機エポック数")
     parser.add_argument(
@@ -2656,6 +2887,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="ヘッド別の損失重み (例: predictor=1.0,filter_primary=1.0)",
     )
     parser.add_argument(
+        "--loss-focal-heads",
+        type=str,
+        default="",
+        help="Focal Loss を適用するヘッド名 (例: reorder)",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=1.8,
+        help="Focal Loss の gamma 値",
+    )
+    parser.add_argument(
+        "--focal-alpha",
+        type=str,
+        default="0.25",
+        help="Focal Loss の alpha 値 (none で無効)",
+    )
+    parser.add_argument(
         "--perm-class-balance",
         choices=["none", "effective"],
         default="none",
@@ -2668,6 +2917,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="有効サンプル数ベースのクラス重みに用いる beta 値",
     )
     parser.add_argument(
+        "--class-balance-heads",
+        type=str,
+        default="",
+        help="有効サンプル数によるクラス重みを適用するヘッド名",
+    )
+    parser.add_argument(
+        "--class-balance-beta",
+        type=float,
+        default=0.999,
+        help="クラス重み算出時の beta 値",
+    )
+    parser.add_argument(
         "--ranker-mode",
         action="store_true",
         help="filter_perm の予測/損失を無効化し、ランカー系ヘッドのみ学習する",
@@ -2678,7 +2939,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--feature-cache",
         type=Path,
-        default=Path(".cache/ranker.features.npy"),
+        default=Path(".cache/ranker.features.v2.npy"),
         help="JSONL から抽出した特徴量をキャッシュする NPY ファイルへのパス",
     )
     parser.add_argument(
@@ -2762,6 +3023,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="C++ 製の高速前処理パイプラインを利用する",
     )
     parser.add_argument("--no-fast-preproc", dest="fast_preproc", action="store_false", help="C++ 前処理を無効化")
+    parser.add_argument(
+        "--reorder-cosine",
+        action="store_true",
+        help="reorder ヘッドで CosineLinear を利用する",
+    )
+    parser.add_argument(
+        "--reorder-arcface-m",
+        type=float,
+        default=0.0,
+        help="ArcFace のマージン m (0 で無効)",
+    )
+    parser.add_argument(
+        "--reorder-arcface-s",
+        type=float,
+        default=30.0,
+        help="Cosine 出力に掛けるスケール s",
+    )
+    parser.add_argument(
+        "--reorder-hardratio",
+        type=float,
+        default=0.0,
+        help="損失上位サンプルを再重み付けする割合",
+    )
+    parser.add_argument(
+        "--reorder-hardmult",
+        type=float,
+        default=1.0,
+        help="ハードサンプルに掛ける損失倍率",
+    )
+    parser.add_argument(
+        "--freeze-trunk",
+        action="store_true",
+        help="トランク層を凍結してヘッドのみ更新する",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -2785,6 +3080,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in head_loss_dict:
         if name not in known_heads:
             logging.warning("--head-loss-weights に未知のヘッド名が指定されています: %s", name)
+
+    try:
+        focal_heads = parse_head_list(args.loss_focal_heads)
+    except ValueError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 1
+    args.loss_focal_heads = set(focal_heads)
+
+    try:
+        epsilon_map = parse_head_value_map(args.epsilon_soft_by_head, allow_default=True)
+    except ValueError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 1
+    args.epsilon_soft_map = epsilon_map
+
+    try:
+        class_balance_heads = parse_head_list(args.class_balance_heads)
+    except ValueError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 1
+    args.class_balance_heads = set(class_balance_heads)
+
+    try:
+        args.focal_alpha = parse_optional_float(args.focal_alpha)
+    except ValueError as exc:
+        print(f"エラー: Focal alpha の解析に失敗しました: {exc}", file=sys.stderr)
+        return 1
 
     if args.ranker_mode:
         logging.info("ランカーモードを有効化: filter_perm ヘッドを無効化します")
