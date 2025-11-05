@@ -12,6 +12,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Sequence, Tuple, TYPE_CHECKING, Mapping
 
+import math
+
 import sys
 
 import logging
@@ -196,6 +198,10 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         dropout: float = 0.1,
         disabled_heads: Sequence[str] = (),
         reorder_head_config: Mapping[str, object] | None = None,
+        base_dim: int | None = None,
+        condition_dim: int = 0,
+        standardize_conditions: bool = True,
+        logger: logging.Logger | None = None,
     ) -> None:
         torch_mod = _ensure_torch()
         super().__init__()
@@ -206,15 +212,35 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         input_dim = int(feature_mean.shape[0])
         if input_dim <= 0:
             raise ValueError("入力特徴量次元が正の値ではありません")
-        self.input_dim = input_dim
+        raw_condition_dim = max(0, int(condition_dim))
+        inferred_base = input_dim - raw_condition_dim
+        if base_dim is None:
+            base_val = inferred_base
+        else:
+            base_val = max(0, int(base_dim))
+        if base_val + raw_condition_dim != input_dim:
+            raw_condition_dim = max(0, input_dim - base_val)
+        self.base_dim = max(0, base_val)
+        self.condition_dim = max(0, raw_condition_dim)
+        self.input_dim = int(self.base_dim + self.condition_dim)
         self.hidden_dim = 384
         self.dropout_rate = float(np.clip(dropout, 0.0, 0.9))
+        self.standardize_conditions = bool(standardize_conditions)
+        self.logger = logger if logger is not None else logging.getLogger(__name__)
+        self._last_scaler_warning_dim: int | None = None
+        self._last_scaler_trunc_warning_dim: int | None = None
+        self._last_fc1_warning_dim: int | None = None
         safe_std = feature_std.astype(np.float32).copy()
         safe_std[safe_std < 1e-6] = 1.0
         mean32 = feature_mean.astype(np.float32)
         # 標準化統計は学習対象外なので buffer として保持する
         self.register_buffer("feature_mean", torch_mod.from_numpy(mean32))
         self.register_buffer("feature_std", torch_mod.from_numpy(safe_std))
+        self.input_dim = int(self.feature_mean.shape[0])
+        # ベース次元が入力次元を越えた場合でも破綻しないよう補正する
+        if self.base_dim > self.input_dim:
+            self.base_dim = self.input_dim
+        self.condition_dim = max(0, self.input_dim - self.base_dim)
         self.fc1 = nn.Linear(self.input_dim, 2048)
         self.fc2 = nn.Linear(2048, 1536)
         self.fc3 = nn.Linear(1536, self.hidden_dim)
@@ -270,6 +296,41 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self._condition_heads = tuple(unique)
         self._update_active_heads()
 
+    def _expand_fc1_in_features_(self, new_in: int) -> None:
+        """fc1 の入力次元が不足している場合に列を拡張する。"""
+
+        cur_in = int(self.fc1.in_features)
+        if new_in == cur_in:
+            return
+        assert new_in > cur_in, f"fc1.in_features が想定より大きい入力です: {new_in} < {cur_in}"
+        old_w = self.fc1.weight.data
+        old_b = self.fc1.bias.data if self.fc1.bias is not None else None
+        out_dim, _ = old_w.shape
+        torch_mod = _ensure_torch()
+        new_fc = nn.Linear(
+            new_in,
+            out_dim,
+            bias=self.fc1.bias is not None,
+            device=old_w.device,
+            dtype=old_w.dtype,
+        )
+        nn.init.kaiming_uniform_(new_fc.weight, a=math.sqrt(5.0))
+        if new_fc.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(new_fc.weight)
+            bound = 1.0 / math.sqrt(float(fan_in))
+            nn.init.uniform_(new_fc.bias, -bound, bound)
+        with torch_mod.no_grad():
+            new_fc.weight[:, :cur_in].copy_(old_w)
+            if new_fc.bias is not None and old_b is not None:
+                new_fc.bias.copy_(old_b)
+        self.fc1 = new_fc
+        self.input_dim = new_in
+        if self.logger is not None and self._last_fc1_warning_dim != new_in:
+            self.logger.warning("fc1 を動的拡張しました: in_features %d -> %d", cur_in, new_in)
+            self._last_fc1_warning_dim = new_in
+        if new_in > self.base_dim:
+            self.condition_dim = max(0, new_in - self.base_dim)
+
     def _align_scaler(self, x_dim: int) -> None:
         """mean/std の次元を入力 x_dim に合わせる。"""
 
@@ -287,13 +348,23 @@ class TorchMultiTask(nn.Module if nn is not None else object):
             pad = x_dim - current_mean
             mean_pad = torch_mod.zeros(pad, device=device, dtype=mean_dtype)
             std_pad = torch_mod.ones(pad, device=device, dtype=std_dtype)
-            self.feature_mean = torch_mod.cat([self.feature_mean, mean_pad], dim=0)
-            self.feature_std = torch_mod.cat([self.feature_std, std_pad], dim=0)
-            logging.warning("特徴量スケーラをパディングしました: %d -> %d", current_mean, x_dim)
+            with torch_mod.no_grad():
+                self.feature_mean = torch_mod.cat([self.feature_mean, mean_pad], dim=0)
+                self.feature_std = torch_mod.cat([self.feature_std, std_pad], dim=0)
+            if self.logger is not None and self._last_scaler_warning_dim != x_dim:
+                self.logger.warning("特徴量スケーラをパディングしました: %d -> %d (末尾は平均0/分散1)", current_mean, x_dim)
+                self._last_scaler_warning_dim = x_dim
         else:
-            self.feature_mean = self.feature_mean[:x_dim].clone()
-            self.feature_std = self.feature_std[:x_dim].clone()
-            logging.warning("特徴量スケーラを切り詰めました: %d -> %d", current_mean, x_dim)
+            with torch_mod.no_grad():
+                self.feature_mean = self.feature_mean[:x_dim].clone()
+                self.feature_std = self.feature_std[:x_dim].clone()
+            if self.logger is not None and self._last_scaler_trunc_warning_dim != x_dim:
+                self.logger.warning("特徴量スケーラを切り詰めました: %d -> %d", current_mean, x_dim)
+                self._last_scaler_trunc_warning_dim = x_dim
+        self.input_dim = int(self.feature_mean.shape[0])
+        if self.base_dim > self.input_dim:
+            self.base_dim = self.input_dim
+        self.condition_dim = max(0, self.input_dim - self.base_dim)
 
     def forward(self, x: "torch.Tensor") -> Dict[str, "torch.Tensor"]:
         """標準化後にトランクとヘッドを順伝播する。"""
@@ -305,10 +376,23 @@ class TorchMultiTask(nn.Module if nn is not None else object):
             x = x.to(dtype=torch_mod.float32)
         # 条件付与などで入力次元が揺らいでも安全に正規化する
         self._align_scaler(x.shape[-1])
-        # ブロードキャストを明示して数値的な安定性も確保する
-        mean_vec = self.feature_mean.unsqueeze(0)
-        std_vec = self.feature_std.unsqueeze(0) + 1e-12
-        standardized = (x - mean_vec) / std_vec
+        if self.standardize_conditions or self.condition_dim <= 0:
+            # ブロードキャストを明示して数値的な安定性も確保する
+            mean_vec = self.feature_mean.unsqueeze(0)
+            std_vec = self.feature_std.unsqueeze(0) + 1e-12
+            standardized = (x - mean_vec) / std_vec
+        else:
+            base_dim = min(self.base_dim, int(self.feature_mean.shape[0]))
+            mean_vec = self.feature_mean[:base_dim].unsqueeze(0)
+            std_vec = self.feature_std[:base_dim].unsqueeze(0) + 1e-12
+            base_standardized = (x[..., :base_dim] - mean_vec) / std_vec
+            if base_dim < x.shape[-1]:
+                cond_slice = x[..., base_dim:]
+                standardized = torch_mod.cat([base_standardized, cond_slice], dim=-1)
+            else:
+                standardized = base_standardized
+        in_dim = int(standardized.shape[-1])
+        self._expand_fc1_in_features_(in_dim)
         h = F.gelu(self.fc1(standardized))
         h = self.dropout1(h)
         h = F.gelu(self.fc2(h))
@@ -322,6 +406,35 @@ class TorchMultiTask(nn.Module if nn is not None else object):
                 logits = logits * self.reorder_scale
             outputs[name] = logits
         return outputs
+
+    def apply_feature_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
+        """最新のスケーラ統計をバッファに反映する。"""
+
+        torch_mod = _ensure_torch()
+        mean_arr = np.asarray(mean, dtype=np.float32).reshape(-1)
+        std_arr = np.asarray(std, dtype=np.float32).reshape(-1)
+        safe_std = std_arr.copy()
+        safe_std[safe_std < 1e-6] = 1.0
+        device = self.feature_mean.device
+        with torch_mod.no_grad():
+            self.feature_mean = torch_mod.from_numpy(mean_arr).to(device=device)
+            self.feature_std = torch_mod.from_numpy(safe_std).to(device=device)
+        self.input_dim = int(self.feature_mean.shape[0])
+        if self.base_dim > self.input_dim:
+            self.base_dim = self.input_dim
+        self.condition_dim = max(0, self.input_dim - self.base_dim)
+        self._last_scaler_warning_dim = None
+        self._last_scaler_trunc_warning_dim = None
+
+    def input_shape_summary(self) -> str:
+        """ログ向けに入力次元情報を単一行で返す。"""
+
+        cond_flag = "true" if self.standardize_conditions else "false"
+        return (
+            f"dims base={self.base_dim} cond={self.condition_dim} "
+            f"in={self.input_dim} scaler={int(self.feature_mean.numel())} "
+            f"fc1_in={int(self.fc1.in_features)} standardize_conditions={cond_flag}"
+        )
 
     def trunk_parameters(self):
         """トランク層のパラメータイテレータ。"""
@@ -407,6 +520,10 @@ class TorchMultiTask(nn.Module if nn is not None else object):
             "reorder_use_cosine": bool(getattr(self, "reorder_use_cosine", False)),
             "reorder_scale": float(getattr(self, "reorder_scale", 1.0)),
             "reorder_arcface_margin": float(getattr(self, "reorder_arcface_margin", 0.0)),
+            "base_dim": int(self.base_dim),
+            "condition_dim": int(self.condition_dim),
+            "input_dim": int(self.input_dim),
+            "standardize_conditions": bool(self.standardize_conditions),
             "state_dict": state_dict,
         }
         torch_mod.save(payload, path)  # type: ignore[union-attr]
@@ -443,6 +560,9 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         reorder_use_cosine = False
         reorder_scale = 30.0
         reorder_margin = 0.0
+        base_dim_meta: int | None = None
+        condition_dim_meta: int = 0
+        standardize_conditions_meta = True
 
         if isinstance(payload, Mapping):
             state_candidate = payload.get("state_dict")
@@ -459,6 +579,19 @@ class TorchMultiTask(nn.Module if nn is not None else object):
             reorder_use_cosine = bool(payload.get("reorder_use_cosine", False))
             reorder_scale = float(payload.get("reorder_scale", 30.0))
             reorder_margin = float(payload.get("reorder_arcface_margin", 0.0))
+            base_dim_raw = payload.get("base_dim")
+            if base_dim_raw is not None:
+                try:
+                    base_dim_meta = int(base_dim_raw)
+                except (TypeError, ValueError):
+                    base_dim_meta = None
+            cond_dim_raw = payload.get("condition_dim")
+            if cond_dim_raw is not None:
+                try:
+                    condition_dim_meta = int(cond_dim_raw)
+                except (TypeError, ValueError):
+                    condition_dim_meta = 0
+            standardize_conditions_meta = bool(payload.get("standardize_conditions", standardize_conditions_meta))
         else:
             state = payload  # type: ignore[assignment]
 
@@ -498,6 +631,9 @@ class TorchMultiTask(nn.Module if nn is not None else object):
                 "scale": reorder_scale,
                 "arcface_m": reorder_margin,
             },
+            base_dim=base_dim_meta,
+            condition_dim=condition_dim_meta,
+            standardize_conditions=standardize_conditions_meta,
         )
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:

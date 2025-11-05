@@ -63,11 +63,11 @@ try:  # PyTorch を利用する場合にのみ必要
 
     # Ampere 以降の TF32 制御を明示し、高速な行列演算を常時有効化する
     try:
-        torch.backends.cuda.matmul.fp32_precision = "high"
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
     except Exception:
         pass
     try:
-        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
     except Exception:
         pass
 except Exception:  # pragma: no cover - PyTorch 非導入環境
@@ -2337,16 +2337,21 @@ def train_with_torch_backend(
         "scale": float(max(1e-6, args.reorder_arcface_s)),
         "arcface_m": float(max(0.0, args.reorder_arcface_m)),
     }
+    cond_extra_dim = conditioned_extra_dim(condition_heads, args.condition_encoding)
+    final_input_dim = int(train_mean.shape[0])
+    base_dim = max(0, final_input_dim - cond_extra_dim)
     model = TorchMultiTask(
         train_mean,
         train_std,
         dropout=args.dropout,
         disabled_heads=disabled_heads,
         reorder_head_config=reorder_head_config,
+        base_dim=base_dim,
+        condition_dim=cond_extra_dim,
+        logger=logger,
     ).to(device)
     if hasattr(model, "set_condition_heads"):
         model.set_condition_heads(condition_heads)
-    cond_extra_dim = conditioned_extra_dim(condition_heads, args.condition_encoding)
     # 既存モデルから初期化（保存形式を自動判別）
     if args.init_from is not None:
         import torch as _torch
@@ -2396,25 +2401,6 @@ def train_with_torch_backend(
                 tensor = torch.as_tensor(arr, dtype=reference.dtype)
                 return tensor.to(device=reference.device)
 
-            def _partial_vector(key: str, fill: float) -> None:
-                if key not in state or key not in model_state:
-                    return
-                src_tensor = state[key]
-                tgt_tensor = model_state[key]
-                if not hasattr(src_tensor, "shape") or not hasattr(tgt_tensor, "shape"):
-                    return
-                if tuple(src_tensor.shape) == tuple(tgt_tensor.shape):
-                    return
-                src_aligned = _coerce_like(src_tensor, tgt_tensor)
-                new_tensor = tgt_tensor.clone()
-                overlap = min(src_aligned.shape[0], new_tensor.shape[0])
-                if overlap > 0:
-                    new_tensor[:overlap] = src_aligned[:overlap]
-                if overlap < new_tensor.shape[0]:
-                    new_tensor[overlap:] = float(fill)
-                state[key] = new_tensor
-                partial_msgs.append(f"{key}:{overlap}/{new_tensor.shape[0]}")
-
             def _partial_fc1_weight() -> None:
                 key = "fc1.weight"
                 if key not in state or key not in model_state:
@@ -2433,8 +2419,13 @@ def train_with_torch_backend(
                 state[key] = new_tensor
                 partial_msgs.append(f"fc1.weight:{overlap}/{new_tensor.shape[1]}")
 
-            _partial_vector("feature_mean", 0.0)
-            _partial_vector("feature_std", 1.0)
+            dropped_scaler = []
+            for scaler_key in ("feature_mean", "feature_std"):
+                if scaler_key in state:
+                    state.pop(scaler_key)
+                    dropped_scaler.append(scaler_key)
+            if dropped_scaler:
+                partial_msgs.append(f"scaler_replaced:{','.join(dropped_scaler)}")
             _partial_fc1_weight()
 
             for key in list(state.keys()):
@@ -2457,8 +2448,9 @@ def train_with_torch_backend(
                 )
 
         missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing:
-            logger.warning(f"[init-from] missing keys: {len(missing)} e.g. {missing[:8]}")
+        missing_filtered = [key for key in missing if key not in {"feature_mean", "feature_std"}]
+        if missing_filtered:
+            logger.warning(f"[init-from] missing keys: {len(missing_filtered)} e.g. {missing_filtered[:8]}")
         if unexpected:
             logger.warning(f"[init-from] unexpected keys: {len(unexpected)} e.g. {unexpected[:8]}")
         if partial_msgs:
@@ -2469,6 +2461,12 @@ def train_with_torch_backend(
 
     else:
         model.inference_temperature = max(float(args.temperature), 1e-6)
+    model.apply_feature_stats(train_mean, train_std)
+    # 試運転で動的拡張の整合性を確認する
+    with torch.no_grad():
+        health = torch.zeros((1, model.input_dim), device=device, dtype=torch.float32)
+        _ = model(health)
+    logger.info(model.input_shape_summary())
     if device.type == "cuda":
         first_param = next(model.parameters(), None)
         if first_param is not None:
@@ -3485,7 +3483,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
     cond_best_sources = {name: best_labels[name] for name in cond_heads}
-    expected_feature_dim = feature_dim + conditioned_extra_dim(cond_heads, args.condition_encoding)
+    cond_extra_dim = conditioned_extra_dim(cond_heads, args.condition_encoding)
+    expected_feature_dim = feature_dim + cond_extra_dim
 
     feature_cache_array: Optional[np.memmap] = None
     feature_cache_preloaded: Optional[np.memmap] = None
@@ -3711,10 +3710,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     features_path_str = str(features_path_resolved) if features_path_resolved is not None else ""
     features_checksum_str = features_checksum
     scaler_path_str = str(scaler_path) if scaler_path is not None else ""
+    base_feature_dim = max(0, final_feature_dim - cond_extra_dim)
     export_meta = {
         "features_path": features_path_str,
         "features_count": total,
         "features_dim": final_feature_dim,
+        "features_base_dim": base_feature_dim,
+        "features_condition_dim": int(cond_extra_dim),
         "features_checksum": features_checksum_str,
         "features_version": int(args.features_version),
         "features_autodetect": bool(args.features_autodetect),
@@ -3729,6 +3731,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "features_path": features_path_str,
         "features_count": total,
         "features_dim": final_feature_dim,
+        "features_base_dim": base_feature_dim,
+        "features_condition_dim": int(cond_extra_dim),
         "features_version": int(args.features_version),
         "features_autodetect": bool(args.features_autodetect),
         "features_cache_key": args.features_cache_key,
