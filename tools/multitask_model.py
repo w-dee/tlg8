@@ -212,6 +212,7 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         safe_std = feature_std.astype(np.float32).copy()
         safe_std[safe_std < 1e-6] = 1.0
         mean32 = feature_mean.astype(np.float32)
+        # 標準化統計は学習対象外なので buffer として保持する
         self.register_buffer("feature_mean", torch_mod.from_numpy(mean32))
         self.register_buffer("feature_std", torch_mod.from_numpy(safe_std))
         self.fc1 = nn.Linear(self.input_dim, 2048)
@@ -269,6 +270,31 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self._condition_heads = tuple(unique)
         self._update_active_heads()
 
+    def _align_scaler(self, x_dim: int) -> None:
+        """mean/std の次元を入力 x_dim に合わせる。"""
+
+        current_mean = int(self.feature_mean.shape[0])
+        current_std = int(self.feature_std.shape[0])
+        if current_mean != current_std:
+            raise RuntimeError(f"feature_mean/std の長さが一致しません: {current_mean} vs {current_std}")
+        if x_dim == current_mean:
+            return
+        torch_mod = _ensure_torch()
+        device = self.feature_mean.device
+        mean_dtype = self.feature_mean.dtype
+        std_dtype = self.feature_std.dtype
+        if x_dim > current_mean:
+            pad = x_dim - current_mean
+            mean_pad = torch_mod.zeros(pad, device=device, dtype=mean_dtype)
+            std_pad = torch_mod.ones(pad, device=device, dtype=std_dtype)
+            self.feature_mean = torch_mod.cat([self.feature_mean, mean_pad], dim=0)
+            self.feature_std = torch_mod.cat([self.feature_std, std_pad], dim=0)
+            logging.warning("特徴量スケーラをパディングしました: %d -> %d", current_mean, x_dim)
+        else:
+            self.feature_mean = self.feature_mean[:x_dim].clone()
+            self.feature_std = self.feature_std[:x_dim].clone()
+            logging.warning("特徴量スケーラを切り詰めました: %d -> %d", current_mean, x_dim)
+
     def forward(self, x: "torch.Tensor") -> Dict[str, "torch.Tensor"]:
         """標準化後にトランクとヘッドを順伝播する。"""
 
@@ -277,7 +303,12 @@ class TorchMultiTask(nn.Module if nn is not None else object):
             x = x.unsqueeze(0)
         if x.dtype not in (torch_mod.float16, torch_mod.float32, torch_mod.bfloat16):
             x = x.to(dtype=torch_mod.float32)
-        standardized = (x - self.feature_mean) / self.feature_std
+        # 条件付与などで入力次元が揺らいでも安全に正規化する
+        self._align_scaler(x.shape[-1])
+        # ブロードキャストを明示して数値的な安定性も確保する
+        mean_vec = self.feature_mean.unsqueeze(0)
+        std_vec = self.feature_std.unsqueeze(0) + 1e-12
+        standardized = (x - mean_vec) / std_vec
         h = F.gelu(self.fc1(standardized))
         h = self.dropout1(h)
         h = F.gelu(self.fc2(h))
