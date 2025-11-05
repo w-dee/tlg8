@@ -75,7 +75,9 @@ except Exception:  # pragma: no cover - PyTorch 非導入環境
     torch_F = None  # type: ignore[assignment]
 
 from features import compute_orientation_features
+from io_utils import find_features_path, sha256_file
 from losses import FocalLoss
+from make_feature_stats import compute_feature_mean_std, load_feature_matrix
 from multitask_model import (
     HEAD_ORDER,
     HEAD_SPECS,
@@ -94,6 +96,17 @@ from multitask_model import (
 MAX_COMPONENTS = 4
 BLOCK_EDGE = 8
 MAX_BLOCK_PIXELS = BLOCK_EDGE * BLOCK_EDGE
+
+
+def _str_to_bool(raw: str) -> bool:
+    """CLI 文字列を真偽値へ変換する。"""
+
+    lowered = str(raw).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"真偽値に変換できない文字列です: {raw}")
 
 # ラベルキャッシュのレコード定義
 LABEL_MAGIC = 0x4C424C38  # 'LBL8'
@@ -1351,6 +1364,30 @@ class LazyLabels:
         return out
 
 
+class _ArrayFeatureSource:
+    """事前計算済み特徴量行列を遅延読み出し可能な形で扱う簡易ラッパー。"""
+
+    def __init__(self, array: np.ndarray) -> None:
+        if array.ndim != 2:
+            raise ValueError("特徴量行列は 2 次元である必要があります")
+        self._array = array
+        self._shape = (int(array.shape[0]), int(array.shape[1]))
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self._shape
+
+    def __len__(self) -> int:
+        return self._shape[0]
+
+    def __getitem__(self, idx: object) -> np.ndarray:
+        rows, scalar = _normalize_indices(idx, len(self))
+        batch = np.asarray(self._array[rows], dtype=np.float32)
+        if scalar and batch.ndim == 2 and batch.shape[0] == 1:
+            return batch[0]
+        return batch
+
+
 class LazyFeatureSubset:
     """LazyFeatures の部分集合ビュー。"""
 
@@ -1505,6 +1542,18 @@ class AugmentedFeatures:
 
 
 FEATURE_CACHE_META_VERSION = 1
+
+
+def _write_export_metadata(export_dir: Path, meta: Dict[str, object], config: Dict[str, object]) -> None:
+    """学習結果の補助メタデータを書き出す。"""
+
+    export_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = export_dir / "meta.json"
+    with meta_path.open('w', encoding='utf-8') as fp:
+        json.dump(meta, fp, ensure_ascii=False, indent=2, sort_keys=True)
+    config_path = export_dir / "config.json"
+    with config_path.open('w', encoding='utf-8') as fp:
+        json.dump(config, fp, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 def _feature_cache_meta_path(cache_path: Path) -> Path:
@@ -2330,6 +2379,7 @@ def train_with_torch_backend(
             # 純 state_dict とみなす
             state = payload
 
+        partial_msgs: List[str] = []
         if isinstance(state, Mapping):
             # 形状不一致パラメータは strict=False でも例外になるため事前に間引く
             model_state = model.state_dict()
@@ -2338,6 +2388,55 @@ def train_with_torch_backend(
                 state = state.copy()  # type: ignore[assignment]
             except AttributeError:
                 state = dict(state)  # type: ignore[assignment]
+
+            def _coerce_like(value: object, reference: torch.Tensor) -> torch.Tensor:
+                if isinstance(value, torch.Tensor):
+                    return value.detach().to(device=reference.device, dtype=reference.dtype)
+                arr = np.asarray(value)
+                tensor = torch.as_tensor(arr, dtype=reference.dtype)
+                return tensor.to(device=reference.device)
+
+            def _partial_vector(key: str, fill: float) -> None:
+                if key not in state or key not in model_state:
+                    return
+                src_tensor = state[key]
+                tgt_tensor = model_state[key]
+                if not hasattr(src_tensor, "shape") or not hasattr(tgt_tensor, "shape"):
+                    return
+                if tuple(src_tensor.shape) == tuple(tgt_tensor.shape):
+                    return
+                src_aligned = _coerce_like(src_tensor, tgt_tensor)
+                new_tensor = tgt_tensor.clone()
+                overlap = min(src_aligned.shape[0], new_tensor.shape[0])
+                if overlap > 0:
+                    new_tensor[:overlap] = src_aligned[:overlap]
+                if overlap < new_tensor.shape[0]:
+                    new_tensor[overlap:] = float(fill)
+                state[key] = new_tensor
+                partial_msgs.append(f"{key}:{overlap}/{new_tensor.shape[0]}")
+
+            def _partial_fc1_weight() -> None:
+                key = "fc1.weight"
+                if key not in state or key not in model_state:
+                    return
+                src_tensor = state[key]
+                tgt_tensor = model_state[key]
+                if not hasattr(src_tensor, "shape") or not hasattr(tgt_tensor, "shape"):
+                    return
+                if tuple(src_tensor.shape) == tuple(tgt_tensor.shape):
+                    return
+                src_aligned = _coerce_like(src_tensor, tgt_tensor)
+                new_tensor = tgt_tensor.clone()
+                overlap = min(src_aligned.shape[1], new_tensor.shape[1])
+                if overlap > 0:
+                    new_tensor[:, :overlap] = src_aligned[:, :overlap]
+                state[key] = new_tensor
+                partial_msgs.append(f"fc1.weight:{overlap}/{new_tensor.shape[1]}")
+
+            _partial_vector("feature_mean", 0.0)
+            _partial_vector("feature_std", 1.0)
+            _partial_fc1_weight()
+
             for key in list(state.keys()):
                 if key not in model_state:
                     continue
@@ -2362,6 +2461,11 @@ def train_with_torch_backend(
             logger.warning(f"[init-from] missing keys: {len(missing)} e.g. {missing[:8]}")
         if unexpected:
             logger.warning(f"[init-from] unexpected keys: {len(unexpected)} e.g. {unexpected[:8]}")
+        if partial_msgs:
+            sample = ", ".join(partial_msgs[:4])
+            if len(partial_msgs) > 4:
+                sample += " ..."
+            logger.warning("[init-from] 入力次元差異のため部分的に再初期化したテンソル: %s", sample)
 
     else:
         model.inference_temperature = max(float(args.temperature), 1e-6)
@@ -2937,6 +3041,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--temperature", type=float, default=1.0, help="推論時の温度パラメータ")
     parser.add_argument("--index-cache", type=str, default=None, help="(file_id, offset) を格納する NPY キャッシュパス")
     parser.add_argument(
+        "--features-npy",
+        type=str,
+        default=None,
+        help="事前計算済み特徴量行列 (.npy) のパス",
+    )
+    parser.add_argument(
+        "--features-version",
+        type=int,
+        default=0,
+        help="優先的に利用する特徴量バージョン番号 (0 で自動)",
+    )
+    parser.add_argument(
+        "--features-autodetect",
+        type=_str_to_bool,
+        default=True,
+        help="--features-npy 未指定時に既定パスから自動検出するか",
+    )
+    parser.add_argument(
+        "--features-cache-key",
+        type=str,
+        default="",
+        help="同一特徴量で複数実験を区別する任意のキー",
+    )
+    parser.add_argument(
         "--feature-cache",
         type=Path,
         default=Path(".cache/ranker.features.v2.npy"),
@@ -2963,6 +3091,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=None,
         help="事前計算した特徴量統計バイナリのパス",
+    )
+    parser.add_argument(
+        "--recompute",
+        action="store_true",
+        help="特徴量スケーラーを再計算して --scaler を上書き保存",
     )
     parser.add_argument(
         "--scaler",
@@ -3108,6 +3241,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"エラー: Focal alpha の解析に失敗しました: {exc}", file=sys.stderr)
         return 1
 
+    if args.features_version < 0:
+        print("エラー: --features-version には 0 以上を指定してください", file=sys.stderr)
+        return 1
+    features_npy_arg = (args.features_npy or "").strip()
+    args.features_npy = features_npy_arg or None
+    args.features_cache_key = (args.features_cache_key or "").strip()
+
     if args.ranker_mode:
         logging.info("ランカーモードを有効化: filter_perm ヘッドを無効化します")
         args.head_loss_weights["filter_perm"] = 0.0
@@ -3203,6 +3343,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         threads = max(1, min(8, os.cpu_count() or 1))
     MAX_DECODE_THREADS = max(1, threads)
 
+    force_recompute = bool(args.recompute)
+
     # 代表的な数値演算ライブラリ向けにスレッド数を環境変数で制御する。
     for var in (
         "OMP_NUM_THREADS",
@@ -3292,9 +3434,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 logging.warning("ラベルキャッシュ生成に失敗しました (exit=%d)", rc)
 
     reader = JsonlReader(file_refs)
-    sample = reader.read_line(int(index[0, 0]), int(index[0, 1]))
-    feature_dim = record_to_feature(sample).shape[0]
-    features = LazyFeatures(reader, index, feature_dim, max_workers=MAX_DECODE_THREADS)
+    total = int(index.shape[0])
+    features_path_resolved: Optional[Path] = None
+    features_checksum = ""
+    precomputed_features: Optional[np.ndarray] = None
+    feature_dim = 0
+    if args.features_npy is not None or args.features_version > 0 or bool(args.features_autodetect):
+        try:
+            resolved_path = find_features_path(args.features_npy, args.features_version, bool(args.features_autodetect))
+        except FileNotFoundError as exc:
+            if args.features_npy is not None:
+                print(f"エラー: 特徴量 NPY が見つかりません: {exc}", file=sys.stderr)
+                return 1
+            logging.info("特徴量 NPY を自動検出できなかったため JSON から復元します")
+        else:
+            features_path_resolved = Path(resolved_path)
+            try:
+                precomputed_features = load_feature_matrix(features_path_resolved, mmap=True)
+            except ValueError as exc:
+                print(f"エラー: 特徴量 NPY の読み込みに失敗しました: {exc}", file=sys.stderr)
+                return 1
+            if precomputed_features.shape[0] != total:
+                print(
+                    f"エラー: 特徴量 NPY の行数 {precomputed_features.shape[0]} がデータセット {total} と一致しません",
+                    file=sys.stderr,
+                )
+                return 1
+            feature_dim = int(precomputed_features.shape[1])
+            features_checksum = sha256_file(features_path_resolved)
+            logging.info("NPY 特徴量を使用します: %s (shape=%d×%d)", features_path_resolved, total, feature_dim)
+    if feature_dim <= 0:
+        sample = reader.read_line(int(index[0, 0]), int(index[0, 1]))
+        feature_dim = record_to_feature(sample).shape[0]
+        logging.info("特徴量を JSON から動的に再計算します (dim=%d)", feature_dim)
+        features = LazyFeatures(reader, index, feature_dim, max_workers=MAX_DECODE_THREADS)
+    else:
+        assert precomputed_features is not None
+        features = _ArrayFeatureSource(precomputed_features)
+        if args.feature_cache is not None:
+            logging.info("事前計算済み特徴量を利用するため --feature-cache 指定を無効化します")
+            args.feature_cache = None
+            args.feature_meta = None
 
     if fast_label_store is not None:
         best_labels = {name: fast_label_store.make(name, use_second=False) for name in HEAD_ORDER}
@@ -3302,8 +3482,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         best_labels = {name: LazyLabels(reader, index, name, use_second=False) for name in HEAD_ORDER}
         second_labels = {name: LazyLabels(reader, index, name, use_second=True) for name in HEAD_ORDER}
-
-    total = int(index.shape[0])
     train_idx, val_idx = split_dataset(total, args.test_ratio, args.seed)
 
     cond_best_sources = {name: best_labels[name] for name in cond_heads}
@@ -3489,16 +3667,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                     total,
                 )
 
+    if force_recompute:
+        if mean_std_loaded:
+            logging.info("--recompute 指定によりスケーラーを再計算します")
+        mean_std_loaded = False
+        scaler_export_required = True
+
     if not mean_std_loaded:
-        scaler_indices = np.arange(len(train_features), dtype=np.int64)
-        mean, std = compute_feature_scaler_streaming(
-            train_features,
-            scaler_indices,
-            batch_size=int(args.scaler_batch),
-            show_progress=ENABLE_PROGRESS,
-        )
-        mean_std_loaded = True
-        scaler_source = "streaming"
+        if precomputed_features is not None:
+            mean, std, stats_count = compute_feature_mean_std(precomputed_features)
+            mean_std_loaded = True
+            scaler_export_required = True
+            if features_path_resolved is not None:
+                scaler_source = f"features-npy:{features_path_resolved}"
+            else:
+                scaler_source = "features-npy"
+            logging.info(
+                "特徴量スケーラーを NPY から再計算しました (records=%d, dim=%d)",
+                stats_count,
+                final_feature_dim,
+            )
+        else:
+            scaler_indices = np.arange(len(train_features), dtype=np.int64)
+            mean, std = compute_feature_scaler_streaming(
+                train_features,
+                scaler_indices,
+                batch_size=int(args.scaler_batch),
+                show_progress=ENABLE_PROGRESS,
+            )
+            mean_std_loaded = True
+            scaler_source = "streaming"
 
     if scaler_export_required and scaler_path is not None:
         scaler_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3506,6 +3704,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.info("特徴量スケーラーを %s に書き出しました (次元=%d)", scaler_path, final_feature_dim)
 
     logging.info("特徴量スケーラーの利用ソース: %s (次元=%d)", scaler_source or "unknown", final_feature_dim)
+
+    scaler_recomputed_flag = bool(
+        force_recompute or scaler_export_required or scaler_source in ("streaming", "features-npy")
+    )
+    features_path_str = str(features_path_resolved) if features_path_resolved is not None else ""
+    features_checksum_str = features_checksum
+    scaler_path_str = str(scaler_path) if scaler_path is not None else ""
+    export_meta = {
+        "features_path": features_path_str,
+        "features_count": total,
+        "features_dim": final_feature_dim,
+        "features_checksum": features_checksum_str,
+        "features_version": int(args.features_version),
+        "features_autodetect": bool(args.features_autodetect),
+        "features_cache_key": args.features_cache_key,
+        "features_arg": args.features_npy or "",
+        "scaler_path": scaler_path_str,
+        "scaler_source": scaler_source or "unknown",
+        "scaler_recomputed": scaler_recomputed_flag,
+    }
+    export_config = {
+        "cli_args": sys.argv[1:],
+        "features_path": features_path_str,
+        "features_count": total,
+        "features_dim": final_feature_dim,
+        "features_version": int(args.features_version),
+        "features_autodetect": bool(args.features_autodetect),
+        "features_cache_key": args.features_cache_key,
+        "features_arg": args.features_npy or "",
+        "scaler_path": scaler_path_str,
+        "recompute": force_recompute,
+        "scaler_source": scaler_source or "unknown",
+        "scaler_recomputed": scaler_recomputed_flag,
+    }
+    if features_checksum_str:
+        export_config["features_checksum"] = features_checksum_str
+    else:
+        export_meta.pop("features_checksum", None)
 
     active_best_labels = {name: best_labels[name] for name in active_heads}
     active_second_labels = {name: second_labels[name] for name in active_heads}
@@ -3575,6 +3811,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_path = args.export_dir / "multitask_model.npz"
             model.save(str(out_path))
             print(f"\nモデルを {out_path} に保存しました。")
+            _write_export_metadata(args.export_dir, export_meta, export_config)
     else:
         try:
             torch_model, train_metrics, val_metrics = train_with_torch_backend(
@@ -3622,6 +3859,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_path = args.export_dir / "multitask_best.pt"
             torch_model.save_torch(str(out_path))
             print(f"\nPyTorch モデルを {out_path} に保存しました。")
+            _write_export_metadata(args.export_dir, export_meta, export_config)
 
     return 0
 

@@ -7,7 +7,7 @@ import os
 import shutil
 import struct
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 RECORD_SIZE = 128
 MAGIC = 0x4C424C38
@@ -85,3 +85,39 @@ def dataset_hash(inputs: List[dict]) -> str:
         hasher.update(int(size).to_bytes(8, "little", signed=False))
         hasher.update(os.fsencode(os.path.abspath(path)))
     return hasher.hexdigest()
+
+
+_DEF_FEATURE_VERSIONS = (2, 1)
+
+
+def find_features_path(
+    features_npy: Optional[str],
+    features_version: int = 0,
+    autodetect: bool = True,
+) -> str:
+    """特徴量 NPY ファイルの探索と解決を行う。"""
+
+    candidates: List[str] = []
+    if features_npy:
+        path = os.fspath(os.path.expanduser(features_npy))
+        return path
+    if features_version > 0:
+        candidates.append(f".cache/ranker.features.v{int(features_version)}.npy")
+        if features_version == 1:
+            candidates.append(".cache/ranker.features.npy")
+    if autodetect:
+        for ver in _DEF_FEATURE_VERSIONS:
+            candidate = f".cache/ranker.features.v{ver}.npy"
+            if candidate not in candidates:
+                candidates.append(candidate)
+        if ".cache/ranker.features.npy" not in candidates:
+            candidates.append(".cache/ranker.features.npy")
+    else:
+        candidates.append(".cache/ranker.features.npy")
+    tried: List[str] = []
+    for candidate in candidates:
+        resolved = os.path.abspath(candidate)
+        tried.append(resolved)
+        if os.path.exists(resolved):
+            return resolved
+    raise FileNotFoundError("探索した特徴量ファイルが見つかりません: " + ", ".join(tried))
