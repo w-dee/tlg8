@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -60,19 +61,6 @@ else:
 try:  # PyTorch を利用する場合にのみ必要
     import torch
     from torch.nn import functional as torch_F
-
-    torch.backends.cuda.matmul.fp32_precision = "tf32"  # or "ieee"
-    torch.backends.cudnn.conv.fp32_precision  = "tf32"  # or "ieee"
-
-    # Ampere 以降の TF32 制御を明示し、高速な行列演算を常時有効化する
-    try:
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-    except Exception:
-        pass
-    try:
-        torch.backends.cudnn.conv.fp32_precision = "tf32"
-    except Exception:
-        pass
 except Exception:  # pragma: no cover - PyTorch 非導入環境
     torch = None  # type: ignore[assignment]
     torch_F = None  # type: ignore[assignment]
@@ -3142,6 +3130,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="auto",
         help="PyTorch バックエンドで利用する自動混合精度",
     )
+    parser.add_argument(
+        "--tf32",
+        choices=["tf32", "ieee"],
+        default="tf32",
+        help="CUDA の FP32 行列積/畳み込み精度 (tf32 か ieee)",
+    )
     parser.add_argument("--compile", action="store_true", help="torch.compile を試行する")
     parser.add_argument(
         "--dump-logits",
@@ -3194,6 +3188,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    warnings.filterwarnings(
+        "ignore",
+        message=r"^Please use the new API settings to control TF32 behavior",
+    )
+
+    if torch is not None and getattr(args, "tf32", None) in {"tf32", "ieee"}:
+        try:
+            torch.backends.cuda.matmul.fp32_precision = args.tf32
+            torch.backends.cudnn.conv.fp32_precision = args.tf32
+        except Exception:
+            logging.debug("TF32 設定の適用に失敗しました", exc_info=True)
 
     if args.feature_meta is None and args.feature_cache is not None:
         args.feature_meta = _feature_cache_meta_path(Path(args.feature_cache))

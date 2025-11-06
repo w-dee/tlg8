@@ -230,6 +230,7 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         self._last_scaler_warning_dim: int | None = None
         self._last_scaler_trunc_warning_dim: int | None = None
         self._last_fc1_warning_dim: int | None = None
+        self._input_summary_logged: bool = False
         safe_std = feature_std.astype(np.float32).copy()
         safe_std[safe_std < 1e-6] = 1.0
         mean32 = feature_mean.astype(np.float32)
@@ -325,8 +326,9 @@ class TorchMultiTask(nn.Module if nn is not None else object):
                 new_fc.bias.copy_(old_b)
         self.fc1 = new_fc
         self.input_dim = new_in
+        self._input_summary_logged = False
         if self.logger is not None and self._last_fc1_warning_dim != new_in:
-            self.logger.warning("fc1 を動的拡張しました: in_features %d -> %d", cur_in, new_in)
+            self.logger.warning("Expanded fc1: in_features %d -> %d", cur_in, new_in)
             self._last_fc1_warning_dim = new_in
         if new_in > self.base_dim:
             self.condition_dim = max(0, new_in - self.base_dim)
@@ -352,15 +354,17 @@ class TorchMultiTask(nn.Module if nn is not None else object):
                 self.feature_mean = torch_mod.cat([self.feature_mean, mean_pad], dim=0)
                 self.feature_std = torch_mod.cat([self.feature_std, std_pad], dim=0)
             if self.logger is not None and self._last_scaler_warning_dim != x_dim:
-                self.logger.warning("特徴量スケーラをパディングしました: %d -> %d (末尾は平均0/分散1)", current_mean, x_dim)
+                self.logger.warning("Scaler padded: mean/std %d -> %d (tail 0/1)", current_mean, x_dim)
                 self._last_scaler_warning_dim = x_dim
+            self._input_summary_logged = False
         else:
             with torch_mod.no_grad():
                 self.feature_mean = self.feature_mean[:x_dim].clone()
                 self.feature_std = self.feature_std[:x_dim].clone()
             if self.logger is not None and self._last_scaler_trunc_warning_dim != x_dim:
-                self.logger.warning("特徴量スケーラを切り詰めました: %d -> %d", current_mean, x_dim)
+                self.logger.warning("Scaler truncated: mean/std %d -> %d", current_mean, x_dim)
                 self._last_scaler_trunc_warning_dim = x_dim
+            self._input_summary_logged = False
         self.input_dim = int(self.feature_mean.shape[0])
         if self.base_dim > self.input_dim:
             self.base_dim = self.input_dim
@@ -393,6 +397,13 @@ class TorchMultiTask(nn.Module if nn is not None else object):
                 standardized = base_standardized
         in_dim = int(standardized.shape[-1])
         self._expand_fc1_in_features_(in_dim)
+        if not self._input_summary_logged and self.logger is not None:
+            self.logger.info(
+                f"dims base={self.base_dim} cond={self.condition_dim} "
+                f"in={in_dim} scaler={int(self.feature_mean.numel())} "
+                f"fc1_in={int(self.fc1.in_features)} standardize_conditions={self.standardize_conditions}"
+            )
+            self._input_summary_logged = True
         h = F.gelu(self.fc1(standardized))
         h = self.dropout1(h)
         h = F.gelu(self.fc2(h))
@@ -417,8 +428,17 @@ class TorchMultiTask(nn.Module if nn is not None else object):
         safe_std[safe_std < 1e-6] = 1.0
         device = self.feature_mean.device
         with torch_mod.no_grad():
-            self.feature_mean = torch_mod.from_numpy(mean_arr).to(device=device)
-            self.feature_std = torch_mod.from_numpy(safe_std).to(device=device)
+            mean_tensor = torch_mod.from_numpy(mean_arr).to(device=device)
+            std_tensor = torch_mod.from_numpy(safe_std).to(device=device)
+            if self.feature_mean.shape == mean_tensor.shape:
+                self.feature_mean.copy_(mean_tensor)
+            else:
+                self.feature_mean = mean_tensor
+            if self.feature_std.shape == std_tensor.shape:
+                self.feature_std.copy_(std_tensor)
+            else:
+                self.feature_std = std_tensor
+        self._input_summary_logged = False
         self.input_dim = int(self.feature_mean.shape[0])
         if self.base_dim > self.input_dim:
             self.base_dim = self.input_dim
