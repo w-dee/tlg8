@@ -61,6 +61,9 @@ try:  # PyTorch を利用する場合にのみ必要
     import torch
     from torch.nn import functional as torch_F
 
+    torch.backends.cuda.matmul.fp32_precision = "tf32"  # or "ieee"
+    torch.backends.cudnn.conv.fp32_precision  = "tf32"  # or "ieee"
+
     # Ampere 以降の TF32 制御を明示し、高速な行列演算を常時有効化する
     try:
         torch.backends.cuda.matmul.fp32_precision = "tf32"
