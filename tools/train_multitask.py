@@ -3385,6 +3385,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     backend = args.backend.lower()
     if backend == "torch" and torch is not None:
         args.device_resolved = pick_device(args.device)
+        requested = (args.device or "").strip().lower()
+        resolved = args.device_resolved.type if args.device_resolved is not None else None
+        if requested.startswith("cuda") and resolved != "cuda":
+            logging.error("CUDA デバイスが要求されましたが利用できません (--device=%s)", args.device)
+            return 1
     eval_batch_display = args.eval_batch_size or args.batch_size
     print(
         f"INFO: Backend={args.backend}, Device={args.device}, AMP={args.amp}, "

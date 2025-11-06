@@ -11,11 +11,13 @@ import re
 import subprocess
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from multiprocessing import Semaphore
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 # スイープ対象のハイパーパラメータグリッド (v2)
 GRID: Dict[str, List[Any]] = {
@@ -90,6 +92,11 @@ CSV_COLUMNS = [
 
 # resume 時にスキップ対象とするステータス
 COMPLETED_STATUSES = {"ok", "oom"}
+
+CUDA_SEMAPHORE: Optional[Semaphore] = None
+GPU_IDS: List[str] = []
+GPU_CYCLE: Optional[Iterator[str]] = None
+GPU_CYCLE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -181,6 +188,17 @@ def parse_args() -> argparse.Namespace:
         help="同時実行するジョブ数 (GPU メモリと相談して設定)",
     )
     parser.add_argument(
+        "--gpus",
+        default="0",
+        help="CUDA デバイス ID をカンマ区切りで指定 (例: '0' または '0,1')",
+    )
+    parser.add_argument(
+        "--gpu-slots",
+        type=int,
+        default=None,
+        help="GPU セマフォのスロット数 (省略時は --gpus の ID 数)",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="既存結果を読み込み、完了済みジョブをスキップする",
@@ -195,9 +213,82 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         metavar="ID",
-        help="CUDA_VISIBLE_DEVICES に指定するデバイス ID 群 (省略時は未設定)",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
+
+
+def resolve_gpu_ids(args: argparse.Namespace) -> List[str]:
+    """GPU 引数を解析して正規化した ID リストを返す。"""
+
+    raw = (args.gpus or "").strip()
+    legacy = getattr(args, "cuda_devices", None)
+    if legacy:
+        legacy_ids = [str(item).strip() for item in legacy if str(item).strip()]
+        if legacy_ids:
+            print("[WARN] --cuda-devices は非推奨です (--gpus を利用してください)")
+            raw = ",".join(legacy_ids)
+    ids = [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
+    return ids
+
+
+def initialise_gpu_context(args: argparse.Namespace) -> None:
+    """GPU セマフォと割り当てサイクルを初期化する。"""
+
+    global CUDA_SEMAPHORE, GPU_IDS, GPU_CYCLE
+    gpu_ids = resolve_gpu_ids(args)
+    args.gpu_ids = gpu_ids  # type: ignore[attr-defined]
+    if not gpu_ids:
+        CUDA_SEMAPHORE = None
+        GPU_IDS = []
+        GPU_CYCLE = None
+        args.gpu_slots_resolved = 0  # type: ignore[attr-defined]
+        return
+
+    slots = args.gpu_slots if args.gpu_slots is not None else len(gpu_ids)
+    if slots < 1:
+        raise ValueError("--gpu-slots は 1 以上を指定してください")
+
+    CUDA_SEMAPHORE = Semaphore(slots)
+    GPU_IDS = gpu_ids
+    GPU_CYCLE = itertools.cycle(GPU_IDS)
+    args.gpu_slots_resolved = slots  # type: ignore[attr-defined]
+
+
+def acquire_gpu_slot(tag: str) -> Tuple[Optional[str], Callable[[], None]]:
+    """CUDA 実行前にセマフォを確保し、割り当てデバイスと解放関数を返す。"""
+
+    if CUDA_SEMAPHORE is None:
+        return None, lambda: None
+
+    CUDA_SEMAPHORE.acquire()
+    device = None
+    if GPU_CYCLE is not None:
+        with GPU_CYCLE_LOCK:
+            device = next(GPU_CYCLE)
+    print(f"[GPU-LOCK] acquired: run={tag} device={device}")
+
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        print(f"[GPU-LOCK] released: run={tag} device={device}")
+        CUDA_SEMAPHORE.release()
+
+    return device, release
+
+
+def command_requests_cuda(cmd: Sequence[str]) -> bool:
+    """コマンドラインが CUDA 実行を要求しているか検出する。"""
+
+    for index, token in enumerate(cmd):
+        if token == "--device" and index + 1 < len(cmd):
+            target = cmd[index + 1]
+            return target.startswith("cuda")
+    return False
 
 
 def apply_grid_overrides(grid: Dict[str, List[Any]], overrides: Sequence[str]) -> None:
@@ -385,7 +476,6 @@ def run_attempt(
     attempt_index: int,
     export_dir: Path,
     log_dir: Path,
-    cuda_device: Optional[str],
 ) -> Tuple[str, Dict[str, Optional[float]], float]:
     """単一試行を実行し、ステータス・指標・経過時間を返す。"""
 
@@ -393,6 +483,7 @@ def run_attempt(
     log_path = log_dir / f"{attempt_id}.log"
     export_dir.mkdir(parents=True, exist_ok=True)
     cmd = build_command(args, params, export_dir)
+    use_cuda = command_requests_cuda(cmd)
 
     if args.dry_run:
         print(f"[DRY-RUN] {attempt_id}\n  " + " ".join(cmd))
@@ -403,20 +494,29 @@ def run_attempt(
             "best_epoch": None,
         }, 0.0
 
+    device: Optional[str] = None
+    release_slot: Optional[Callable[[], None]] = None
+    if use_cuda:
+        device, release_slot = acquire_gpu_slot(attempt_id)
+
     env = os.environ.copy()
-    if cuda_device is not None:
-        env["CUDA_VISIBLE_DEVICES"] = cuda_device
+    if use_cuda:
+        env["CUDA_VISIBLE_DEVICES"] = device if device is not None else ""
 
     print(f"[RUN] {attempt_id}: batch={params.batch}")
     start = time.monotonic()
     with log_path.open("w", encoding="utf-8") as log_file:
-        proc = subprocess.run(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            env=env,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=False,
+            )
+        finally:
+            if release_slot is not None:
+                release_slot()
     wall_time = time.monotonic() - start
     metrics, saw_oom = parse_log(log_path)
 
@@ -437,7 +537,6 @@ def run_with_retries(
     export_root: Path,
     log_dir: Path,
     batch_candidates: Sequence[int],
-    cuda_device: Optional[str],
 ) -> Dict[str, Any]:
     """OOM 時の再試行を含めた一件分のスイープ結果を返す。"""
 
@@ -461,7 +560,6 @@ def run_with_retries(
             attempt,
             export_dir,
             log_dir,
-            cuda_device,
         )
         wall_total += wall
         if status == "oom":
@@ -718,20 +816,18 @@ def write_markdown(
         fp.write("\n".join(lines) + "\n")
 
 
-def select_cuda_device(args: argparse.Namespace, submission_index: int) -> Optional[str]:
-    """並列実行時に割り当てる CUDA デバイス ID を決定する。"""
-
-    if args.cuda_devices:
-        return args.cuda_devices[submission_index % len(args.cuda_devices)]
-    if args.concurrency > 1:
-        return str(submission_index % args.concurrency)
-    return None
-
-
 def main() -> None:
     """スイープのエントリーポイント。"""
 
     args = parse_args()
+    initialise_gpu_context(args)
+    if getattr(args, "gpu_ids", None):
+        print(
+            f"[INFO] GPU セマフォ: devices={','.join(args.gpu_ids)} "
+            f"slots={getattr(args, 'gpu_slots_resolved', 0)}"
+        )
+    else:
+        print("[INFO] GPU セマフォ: 無効 (CUDA を使用しません)")
     if args.concurrency < 1:
         raise ValueError("--concurrency は 1 以上を指定してください")
 
@@ -767,22 +863,19 @@ def main() -> None:
     new_rows: List[Dict[str, Any]] = []
 
     if args.concurrency == 1 or args.dry_run:
-        for idx, params in enumerate(params_list):
-            cuda_device = select_cuda_device(args, idx)
+        for params in params_list:
             row = run_with_retries(
                 args,
                 params,
                 base_dir,
                 log_dir,
                 batch_candidates,
-                cuda_device,
             )
             new_rows.append(row)
     else:
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             futures = []
-            for idx, params in enumerate(params_list):
-                cuda_device = select_cuda_device(args, idx)
+            for params in params_list:
                 futures.append(
                     executor.submit(
                         run_with_retries,
@@ -791,7 +884,6 @@ def main() -> None:
                         base_dir,
                         log_dir,
                         batch_candidates,
-                        cuda_device,
                     )
                 )
             for future in as_completed(futures):
