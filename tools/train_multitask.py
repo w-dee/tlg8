@@ -218,6 +218,76 @@ class ProgressReporter:
             self._simple.close()
 
 
+class _CosineWarmupScheduler:
+    """Cosine アニーリングと線形ウォームアップを組み合わせた簡易スケジューラ。"""
+
+    def __init__(
+        self,
+        optimizer: "torch.optim.Optimizer",
+        total_epochs: int,
+        warmup_epochs: int,
+        *,
+        min_lr: float = 1e-5,
+    ) -> None:
+        self._optimizer = optimizer
+        self._base_lrs = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+        self._total_epochs = max(1, int(total_epochs))
+        self._warmup_epochs = max(0, int(warmup_epochs))
+        self._min_lr = float(min_lr)
+        self._step_index = 0
+
+    def _calc_lr(self, base_lr: float, step_index: int) -> float:
+        """現在のステップに応じた学習率を算出する。"""
+
+        if self._warmup_epochs > 0 and step_index < self._warmup_epochs:
+            scale = (step_index + 1) / float(self._warmup_epochs)
+            return max(self._min_lr, base_lr * scale)
+        cosine_window = max(1, self._total_epochs - self._warmup_epochs)
+        if cosine_window <= 1:
+            return max(self._min_lr, base_lr)
+        cosine_index = min(step_index - self._warmup_epochs, cosine_window - 1)
+        if cosine_window == 1:
+            progress = 1.0
+        else:
+            progress = float(cosine_index) / float(cosine_window - 1)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(self._min_lr, self._min_lr + (base_lr - self._min_lr) * cosine)
+
+    def step(self) -> None:
+        """1 エポック分進めて学習率を更新する。"""
+
+        for idx, group in enumerate(self._optimizer.param_groups):
+            base_lr = self._base_lrs[idx if idx < len(self._base_lrs) else -1]
+            group["lr"] = float(self._calc_lr(base_lr, self._step_index))
+        self._step_index += 1
+
+    def get_last_lr(self) -> List[float]:
+        """直近で設定した学習率一覧を返す。"""
+
+        return [float(group.get("lr", 0.0)) for group in self._optimizer.param_groups]
+
+    def state_dict(self) -> Dict[str, object]:
+        """スケジューラ状態をチェックポイント化する。"""
+
+        return {
+            "base_lrs": list(self._base_lrs),
+            "total_epochs": int(self._total_epochs),
+            "warmup_epochs": int(self._warmup_epochs),
+            "min_lr": float(self._min_lr),
+            "step_index": int(self._step_index),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, object]) -> None:
+        """チェックポイントから状態を復元する。"""
+
+        self._base_lrs = [float(value) for value in state_dict.get("base_lrs", self._base_lrs)]
+        self._total_epochs = max(1, int(state_dict.get("total_epochs", self._total_epochs)))
+        self._warmup_epochs = max(0, int(state_dict.get("warmup_epochs", self._warmup_epochs)))
+        self._min_lr = float(state_dict.get("min_lr", self._min_lr))
+        self._step_index = max(0, int(state_dict.get("step_index", self._step_index)))
+
+
 # 進捗表示の有効 / 無効を CLI から切り替えるためのフラグ。
 ENABLE_PROGRESS = True
 
@@ -2497,22 +2567,48 @@ def train_with_torch_backend(
     if not param_groups:
         raise ValueError("学習可能なパラメータが存在しません")
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-    scheduler_kwargs = dict(
-        optimizer=optimizer,
-        mode="max",
-        factor=0.5,
-        patience=8,
-        threshold=1e-4,
-        min_lr=1e-5,
+    lr_schedule_mode = str(getattr(args, "lr_schedule", "plateau")).lower()
+    warmup_epochs = int(getattr(args, "warmup_epochs", 0))
+    min_lr_value = 1e-5
+    scheduler: Optional[object]
+    scheduler_requires_metric = False
+    scheduler_step_at_epoch_start = False
+    if lr_schedule_mode == "plateau":
+        scheduler_kwargs = dict(
+            optimizer=optimizer,
+            mode="max",
+            factor=0.5,
+            patience=8,
+            threshold=1e-4,
+            min_lr=min_lr_value,
+        )
+        # 古い PyTorch では verbose 引数が存在しないため動的に判定する
+        try:
+            signature = inspect.signature(torch.optim.lr_scheduler.ReduceLROnPlateau)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None and "verbose" in signature.parameters:
+            scheduler_kwargs["verbose"] = True
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(**scheduler_kwargs)
+        scheduler_requires_metric = True
+    elif lr_schedule_mode == "cosine":
+        scheduler = _CosineWarmupScheduler(
+            optimizer,
+            total_epochs=args.epochs,
+            warmup_epochs=warmup_epochs,
+            min_lr=min_lr_value,
+        )
+        scheduler_step_at_epoch_start = True
+    elif lr_schedule_mode == "constant":
+        scheduler = None
+    else:
+        raise ValueError(f"未知の lr スケジュールが指定されました: {args.lr_schedule}")
+    logging.info(
+        "LR スケジュール: %s (warmup=%d, min_lr=%.2e)",
+        lr_schedule_mode,
+        warmup_epochs if lr_schedule_mode == "cosine" else 0,
+        min_lr_value,
     )
-    # 古い PyTorch では verbose 引数が存在しないため動的に判定する
-    try:
-        signature = inspect.signature(torch.optim.lr_scheduler.ReduceLROnPlateau)
-    except (TypeError, ValueError):
-        signature = None
-    if signature is not None and "verbose" in signature.parameters:
-        scheduler_kwargs["verbose"] = True
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(**scheduler_kwargs)
 
     active_heads = tuple(getattr(model, "active_heads", HEAD_ORDER))
     if not active_heads:
@@ -2661,6 +2757,12 @@ def train_with_torch_backend(
             unit="バッチ",
             enable=ENABLE_PROGRESS,
         )
+
+        if scheduler is not None and scheduler_step_at_epoch_start:
+            try:
+                scheduler.step()
+            except Exception:
+                logging.debug("エポック開始時の学習率更新に失敗しました", exc_info=True)
 
         model.train()
         model_forward.train()
@@ -2843,10 +2945,14 @@ def train_with_torch_backend(
             )
         )
 
-        try:
-            scheduler.step(mean_top3)
-        except Exception:
-            pass  # スケジューラ更新で例外が発生した場合は学習を継続する
+        if scheduler is not None:
+            try:
+                if scheduler_requires_metric:
+                    scheduler.step(mean_top3)
+                elif not scheduler_step_at_epoch_start:
+                    scheduler.step()
+            except Exception:
+                logging.debug("エポック終了時の学習率更新に失敗しました", exc_info=True)
 
         if use_hard_mining and hard_loss_buffer is not None and hard_sample_weights is not None:
             valid_mask = np.isfinite(hard_loss_buffer)
@@ -2929,6 +3035,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--backend", choices=["numpy", "torch"], default="torch", help="学習バックエンド")
     parser.add_argument("--epochs", type=int, default=200, help="学習エポック数")
     parser.add_argument("--lr", type=float, default=1e-3, help="学習率")
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["plateau", "cosine", "constant"],
+        default="plateau",
+        help="学習率スケジュール種別 (plateau/cosine/constant)",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=0,
+        help="cosine スケジュール使用時のウォームアップ期間 (エポック)",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="L2 正則化係数")
     parser.add_argument("--batch-size", type=int, default=512, help="ミニバッチサイズ")
     parser.add_argument(
@@ -3240,6 +3358,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
     args.class_balance_heads = set(class_balance_heads)
+
+    if args.warmup_epochs < 0:
+        print("エラー: --warmup-epochs には 0 以上を指定してください", file=sys.stderr)
+        return 1
+    if args.lr_schedule != "cosine" and args.warmup_epochs > 0:
+        logging.warning("cosine 以外のスケジュールでは --warmup-epochs は無視されます")
 
     try:
         args.focal_alpha = parse_optional_float(args.focal_alpha)
