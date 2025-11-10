@@ -11,13 +11,11 @@ import re
 import subprocess
 import sys
 import time
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from multiprocessing import Semaphore
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # スイープ対象のハイパーパラメータグリッド (v2)
 GRID: Dict[str, List[Any]] = {
@@ -92,12 +90,6 @@ CSV_COLUMNS = [
 
 # resume 時にスキップ対象とするステータス
 COMPLETED_STATUSES = {"ok", "oom"}
-
-CUDA_SEMAPHORE: Optional[Semaphore] = None
-GPU_IDS: List[str] = []
-GPU_CYCLE: Optional[Iterator[str]] = None
-GPU_CYCLE_LOCK = threading.Lock()
-
 
 @dataclass(frozen=True)
 class SweepParams:
@@ -232,53 +224,23 @@ def resolve_gpu_ids(args: argparse.Namespace) -> List[str]:
     return ids
 
 
-def initialise_gpu_context(args: argparse.Namespace) -> None:
-    """GPU セマフォと割り当てサイクルを初期化する。"""
+def initialise_gpu_context(args: argparse.Namespace, lock_dir: Path) -> None:
+    """GPU ロック設定を初期化する。"""
 
-    global CUDA_SEMAPHORE, GPU_IDS, GPU_CYCLE
     gpu_ids = resolve_gpu_ids(args)
     args.gpu_ids = gpu_ids  # type: ignore[attr-defined]
     if not gpu_ids:
-        CUDA_SEMAPHORE = None
-        GPU_IDS = []
-        GPU_CYCLE = None
         args.gpu_slots_resolved = 0  # type: ignore[attr-defined]
+        args.gpu_lock_dir = None  # type: ignore[attr-defined]
         return
 
     slots = args.gpu_slots if args.gpu_slots is not None else len(gpu_ids)
     if slots < 1:
         raise ValueError("--gpu-slots は 1 以上を指定してください")
 
-    CUDA_SEMAPHORE = Semaphore(slots)
-    GPU_IDS = gpu_ids
-    GPU_CYCLE = itertools.cycle(GPU_IDS)
+    lock_dir.mkdir(parents=True, exist_ok=True)
     args.gpu_slots_resolved = slots  # type: ignore[attr-defined]
-
-
-def acquire_gpu_slot(tag: str) -> Tuple[Optional[str], Callable[[], None]]:
-    """CUDA 実行前にセマフォを確保し、割り当てデバイスと解放関数を返す。"""
-
-    if CUDA_SEMAPHORE is None:
-        return None, lambda: None
-
-    CUDA_SEMAPHORE.acquire()
-    device = None
-    if GPU_CYCLE is not None:
-        with GPU_CYCLE_LOCK:
-            device = next(GPU_CYCLE)
-    print(f"[GPU-LOCK] acquired: run={tag} device={device}")
-
-    released = False
-
-    def release() -> None:
-        nonlocal released
-        if released:
-            return
-        released = True
-        print(f"[GPU-LOCK] released: run={tag} device={device}")
-        CUDA_SEMAPHORE.release()
-
-    return device, release
+    args.gpu_lock_dir = lock_dir  # type: ignore[attr-defined]
 
 
 def command_requests_cuda(cmd: Sequence[str]) -> bool:
@@ -494,29 +456,32 @@ def run_attempt(
             "best_epoch": None,
         }, 0.0
 
-    device: Optional[str] = None
-    release_slot: Optional[Callable[[], None]] = None
-    if use_cuda:
-        device, release_slot = acquire_gpu_slot(attempt_id)
-
     env = os.environ.copy()
-    if use_cuda:
-        env["CUDA_VISIBLE_DEVICES"] = device if device is not None else ""
+    if use_cuda and getattr(args, "gpu_ids", None):
+        env["TLG_SWEEP_USE_CUDA"] = "1"
+        env["TLG_SWEEP_RUN_ID"] = attempt_id
+        env["TLG_SWEEP_GPU_IDS"] = ",".join(args.gpu_ids)
+        env["TLG_SWEEP_GPU_SLOTS"] = str(getattr(args, "gpu_slots_resolved", 0))
+        lock_dir = getattr(args, "gpu_lock_dir", None)
+        if lock_dir is not None:
+            env["TLG_SWEEP_GPU_LOCK"] = str(lock_dir)
+    else:
+        env["TLG_SWEEP_USE_CUDA"] = "0"
+        env.pop("TLG_SWEEP_RUN_ID", None)
+        env.pop("TLG_SWEEP_GPU_IDS", None)
+        env.pop("TLG_SWEEP_GPU_SLOTS", None)
+        env.pop("TLG_SWEEP_GPU_LOCK", None)
 
     print(f"[RUN] {attempt_id}: batch={params.batch}")
     start = time.monotonic()
     with log_path.open("w", encoding="utf-8") as log_file:
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=env,
-                check=False,
-            )
-        finally:
-            if release_slot is not None:
-                release_slot()
+        proc = subprocess.run(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            check=False,
+        )
     wall_time = time.monotonic() - start
     metrics, saw_oom = parse_log(log_path)
 
@@ -820,14 +785,6 @@ def main() -> None:
     """スイープのエントリーポイント。"""
 
     args = parse_args()
-    initialise_gpu_context(args)
-    if getattr(args, "gpu_ids", None):
-        print(
-            f"[INFO] GPU セマフォ: devices={','.join(args.gpu_ids)} "
-            f"slots={getattr(args, 'gpu_slots_resolved', 0)}"
-        )
-    else:
-        print("[INFO] GPU セマフォ: 無効 (CUDA を使用しません)")
     if args.concurrency < 1:
         raise ValueError("--concurrency は 1 以上を指定してください")
 
@@ -841,6 +798,16 @@ def main() -> None:
     base_dir = Path("runs") / "sweeps" / f"reorder_{args.tag}"
     log_dir = base_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir = base_dir / "gpu_lock"
+
+    initialise_gpu_context(args, lock_dir)
+    if getattr(args, "gpu_ids", None):
+        print(
+            f"[INFO] GPU ロック: devices={','.join(args.gpu_ids)} "
+            f"slots={getattr(args, 'gpu_slots_resolved', 0)}"
+        )
+    else:
+        print("[INFO] GPU ロック: 無効 (CUDA を使用しません)")
 
     csv_path = base_dir / "results_v2.csv"
     md_path = base_dir / "results_v2.md"

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import atexit
 import hashlib
 import io
@@ -20,8 +19,11 @@ import subprocess
 import sys
 import threading
 import warnings
+import errno
+import time
+import inspect
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from collections import Counter
@@ -88,6 +90,201 @@ MAX_COMPONENTS = 4
 BLOCK_EDGE = 8
 MAX_BLOCK_PIXELS = BLOCK_EDGE * BLOCK_EDGE
 
+GPU_LOCK_ENV_USE = "TLG_SWEEP_USE_CUDA"
+GPU_LOCK_ENV_IDS = "TLG_SWEEP_GPU_IDS"
+GPU_LOCK_ENV_SLOTS = "TLG_SWEEP_GPU_SLOTS"
+GPU_LOCK_ENV_DIR = "TLG_SWEEP_GPU_LOCK"
+GPU_LOCK_ENV_RUN = "TLG_SWEEP_RUN_ID"
+
+
+def ensure_numpy_array(value: object) -> np.ndarray:
+    """入力を NumPy 配列へ強制変換する。"""
+
+    if isinstance(value, np.ndarray):
+        return value
+    if torch is not None and isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+@dataclass
+class _GPULockConfig:
+    lock_dir: Path
+    slots: int
+    gpu_ids: Tuple[str, ...]
+    run_id: str
+
+
+@dataclass
+class _GPUSlotTicket:
+    slot_index: int
+    device_id: str
+    path: Path
+
+
+_GPU_ACTIVE_TICKET: Optional[_GPUSlotTicket] = None
+_GPU_ACTIVE_CONFIG: Optional[_GPULockConfig] = None
+_GPU_ATEXIT_REGISTERED = False
+
+
+def _pid_alive(pid: int) -> bool:
+    """指定 PID のプロセスが稼働中かを判定する。"""
+
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ESRCH:
+            return False
+        return True
+    else:
+        return True
+
+
+def _cleanup_stale_slot(path: Path) -> bool:
+    """終了済みプロセスが残したロックファイルを削除する。"""
+
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            pid_line = fp.readline().strip()
+    except FileNotFoundError:
+        return True
+    except Exception:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+
+    try:
+        pid = int(pid_line or "-1")
+    except ValueError:
+        pid = -1
+
+    if not _pid_alive(pid):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    return False
+
+
+def _load_gpu_lock_config() -> Optional[_GPULockConfig]:
+    """環境変数から GPU ロック設定を読み取る。"""
+
+    use_flag = os.environ.get(GPU_LOCK_ENV_USE)
+    if use_flag not in ("1", "true", "yes"):
+        return None
+
+    lock_dir_raw = os.environ.get(GPU_LOCK_ENV_DIR)
+    slots_raw = os.environ.get(GPU_LOCK_ENV_SLOTS)
+    gpu_ids_raw = os.environ.get(GPU_LOCK_ENV_IDS, "")
+    if not lock_dir_raw or not slots_raw:
+        return None
+
+    try:
+        slots = int(slots_raw)
+    except ValueError:
+        return None
+    if slots <= 0:
+        return None
+
+    gpu_ids = tuple(item.strip() for item in gpu_ids_raw.split(",") if item.strip())
+    if not gpu_ids:
+        return None
+
+    run_id = os.environ.get(GPU_LOCK_ENV_RUN, f"pid{os.getpid()}")
+    lock_dir = Path(lock_dir_raw)
+    return _GPULockConfig(lock_dir=lock_dir, slots=slots, gpu_ids=gpu_ids, run_id=run_id)
+
+
+def _register_gpu_atexit() -> None:
+    """異常終了時にロックを解放するためのフックを登録する。"""
+
+    global _GPU_ATEXIT_REGISTERED
+    if _GPU_ATEXIT_REGISTERED:
+        return
+
+    def _release_on_exit() -> None:
+        if _GPU_ACTIVE_TICKET is not None and _GPU_ACTIVE_CONFIG is not None:
+            try:
+                _release_gpu_slot(_GPU_ACTIVE_CONFIG, _GPU_ACTIVE_TICKET)
+            except Exception:
+                logging.debug("GPU ロック解放中に例外が発生しました", exc_info=True)
+
+    atexit.register(_release_on_exit)
+    _GPU_ATEXIT_REGISTERED = True
+
+
+def _acquire_gpu_slot(config: _GPULockConfig) -> _GPUSlotTicket:
+    """GPU ロックディレクトリから空きスロットを確保する。"""
+
+    config.lock_dir.mkdir(parents=True, exist_ok=True)
+    backoff = 0.2
+    while True:
+        for slot_index in range(config.slots):
+            token_path = config.lock_dir / f"slot_{slot_index}.lock"
+            try:
+                fd = os.open(str(token_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                if _cleanup_stale_slot(token_path):
+                    continue
+                continue
+
+            with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                fp.write(f"{os.getpid()}\n{config.run_id}\n{time.time():.6f}\n")
+            device_id = config.gpu_ids[slot_index % len(config.gpu_ids)]
+            print(f"[GPU-LOCK] acquired: run={config.run_id} slot={slot_index} device={device_id}")
+            return _GPUSlotTicket(slot_index=slot_index, device_id=device_id, path=token_path)
+        time.sleep(backoff)
+
+
+def _release_gpu_slot(config: _GPULockConfig, ticket: _GPUSlotTicket) -> None:
+    """確保済みスロットを解放する。"""
+
+    try:
+        ticket.path.unlink()
+    except FileNotFoundError:
+        pass
+    print(f"[GPU-LOCK] released: run={config.run_id} slot={ticket.slot_index} device={ticket.device_id}")
+
+
+@contextmanager
+def gpu_compute_lock(require_cuda: bool) -> Iterator[Optional[str]]:
+    """GPU 計算区間で共有セマフォを取得するコンテキスト。"""
+
+    config = _load_gpu_lock_config()
+    if not require_cuda or config is None:
+        yield None
+        return
+
+    _register_gpu_atexit()
+    ticket = _acquire_gpu_slot(config)
+    prev_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if ticket.device_id:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ticket.device_id
+    else:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    global _GPU_ACTIVE_TICKET, _GPU_ACTIVE_CONFIG
+    _GPU_ACTIVE_TICKET = ticket
+    _GPU_ACTIVE_CONFIG = config
+    try:
+        yield ticket.device_id
+    finally:
+        if prev_visible is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_visible
+        _release_gpu_slot(config, ticket)
+        _GPU_ACTIVE_TICKET = None
+        _GPU_ACTIVE_CONFIG = None
 
 def _str_to_bool(raw: str) -> bool:
     """CLI 文字列を真偽値へ変換する。"""
@@ -2339,30 +2536,6 @@ def train_with_torch_backend(
         except Exception:
             pass
 
-    device = getattr(args, "device_resolved", None)
-    if device is None:
-        device = pick_device(args.device)
-    logging.info("PyTorch デバイス: %s", device)
-    amp_arg = (args.amp or "auto").lower()
-    if amp_arg == "auto":
-        amp_mode = "bf16" if device.type == "xpu" else "none"
-    else:
-        amp_mode = amp_arg
-    if amp_mode not in ("none", "bf16", "fp16"):
-        logging.warning("未知の AMP 指定 %s のため無効化します", amp_mode)
-        amp_mode = "none"
-    if device.type == "cpu" and amp_mode in ("bf16", "fp16"):
-        logging.warning("CPU では指定された AMP モード %s を利用できないため無効化します", amp_mode)
-        amp_mode = "none"
-    if device.type == "cuda" and amp_mode == "bf16":
-        is_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-        if not is_supported:
-            logging.warning("この CUDA デバイスは bfloat16 をサポートしていないため AMP を無効化します")
-            amp_mode = "none"
-    if device.type == "xpu" and amp_mode == "fp16":
-        logging.warning("XPU では fp16 AMP をサポートしていないため無効化します")
-        amp_mode = "none"
-
     import numpy as _np
 
     train_mean = None
@@ -2401,632 +2574,685 @@ def train_with_torch_backend(
     cond_extra_dim = conditioned_extra_dim(condition_heads, args.condition_encoding)
     final_input_dim = int(train_mean.shape[0])
     base_dim = max(0, final_input_dim - cond_extra_dim)
-    model = TorchMultiTask(
-        train_mean,
-        train_std,
-        dropout=args.dropout,
-        disabled_heads=disabled_heads,
-        reorder_head_config=reorder_head_config,
-        base_dim=base_dim,
-        condition_dim=cond_extra_dim,
-        logger=logger,
-    ).to(device)
-    if hasattr(model, "set_condition_heads"):
-        model.set_condition_heads(condition_heads)
-    # 既存モデルから初期化（保存形式を自動判別）
-    if args.init_from is not None:
-        import torch as _torch
-        import torch.serialization as _ser
-        from collections.abc import Mapping
+    train_features = ensure_numpy_array(train_features)
+    val_features = ensure_numpy_array(val_features)
+    train_best_np = {key: np.asarray(train_best[key], dtype=np.int64) for key in train_best}
+    train_second_np = {key: np.asarray(train_second[key], dtype=np.int64) for key in train_second}
+    val_best_np = {key: np.asarray(val_best[key], dtype=np.int64) for key in val_best}
+    val_second_np = {key: np.asarray(val_second[key], dtype=np.int64) for key in val_second}
 
-        def _safe_load_any(path, map_location):
-            # (A) safe_globals を追加して weights_only=True を試す
-            try:
-                import numpy as _np
-                _ser.add_safe_globals([_np._core.multiarray._reconstruct])
-                return _torch.load(path, map_location=map_location, weights_only=True)
-            except Exception:
-                # (B) フォールバック（信頼済みファイル前提）
-                return _torch.load(path, map_location=map_location, weights_only=False)
+    prefer_raw = (args.device or "").strip().lower()
+    env_flag = os.environ.get(GPU_LOCK_ENV_USE)
+    if env_flag is not None:
+        request_cuda = env_flag in ("1", "true", "yes")
+    else:
+        prefer_norm = prefer_raw or "auto"
+        request_cuda = prefer_norm in ("auto", "cuda") or prefer_norm.startswith("cuda")
 
-        payload = _safe_load_any(str(args.init_from), map_location=device)
-
-        # 3 形式に対応：
-        # (1) TorchMultiTask オブジェクト
-        # (2) {"state_dict": ..., <meta...>} の辞書
-        # (3) 純 state_dict（= そのまま key->Tensor）
-        if isinstance(payload, TorchMultiTask):
-            state = payload.state_dict()
-            model.inference_temperature = getattr(payload, "inference_temperature", 1.0)
-        elif isinstance(payload, Mapping) and "state_dict" in payload:
-            state = payload["state_dict"]
-            model.inference_temperature = payload.get("inference_temperature", getattr(model, "inference_temperature", 1.0))
+    gpu_lock_cm = gpu_compute_lock(request_cuda)
+    gpu_lock_cm.__enter__()
+    try:
+        device = getattr(args, "device_resolved", None)
+        if device is None:
+            device = pick_device(args.device)
+            args.device_resolved = device
+        logging.info("PyTorch デバイス: %s", device)
+        amp_arg = (args.amp or "auto").lower()
+        if amp_arg == "auto":
+            amp_mode = "bf16" if device.type == "xpu" else "none"
         else:
-            # 純 state_dict とみなす
-            state = payload
+            amp_mode = amp_arg
+        if amp_mode not in ("none", "bf16", "fp16"):
+            logging.warning("未知の AMP 指定 %s のため無効化します", amp_mode)
+            amp_mode = "none"
+        if device.type == "cpu" and amp_mode in ("bf16", "fp16"):
+            logging.warning("CPU では指定された AMP モード %s を利用できないため無効化します", amp_mode)
+            amp_mode = "none"
+        if device.type == "cuda" and amp_mode == "bf16":
+            is_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            if not is_supported:
+                logging.warning("この CUDA デバイスは bfloat16 をサポートしていないため AMP を無効化します")
+                amp_mode = "none"
+        if device.type == "xpu" and amp_mode == "fp16":
+            logging.warning("XPU では fp16 AMP をサポートしていないため無効化します")
+            amp_mode = "none"
 
-        partial_msgs: List[str] = []
-        if isinstance(state, Mapping):
-            # 形状不一致パラメータは strict=False でも例外になるため事前に間引く
-            model_state = model.state_dict()
-            pruned_keys: List[str] = []
-            try:
-                state = state.copy()  # type: ignore[assignment]
-            except AttributeError:
-                state = dict(state)  # type: ignore[assignment]
+        model = TorchMultiTask(
+            train_mean,
+            train_std,
+            dropout=args.dropout,
+            disabled_heads=disabled_heads,
+            reorder_head_config=reorder_head_config,
+            base_dim=base_dim,
+            condition_dim=cond_extra_dim,
+            logger=logger,
+        ).to(device)
+        if hasattr(model, "set_condition_heads"):
+            model.set_condition_heads(condition_heads)
+        # 既存モデルから初期化（保存形式を自動判別）
+        if args.init_from is not None:
+            import torch as _torch
+            import torch.serialization as _ser
+            from collections.abc import Mapping
 
-            def _coerce_like(value: object, reference: torch.Tensor) -> torch.Tensor:
-                if isinstance(value, torch.Tensor):
-                    return value.detach().to(device=reference.device, dtype=reference.dtype)
-                arr = np.asarray(value)
-                tensor = torch.as_tensor(arr, dtype=reference.dtype)
-                return tensor.to(device=reference.device)
-
-            def _partial_fc1_weight() -> None:
-                key = "fc1.weight"
-                if key not in state or key not in model_state:
-                    return
-                src_tensor = state[key]
-                tgt_tensor = model_state[key]
-                if not hasattr(src_tensor, "shape") or not hasattr(tgt_tensor, "shape"):
-                    return
-                if tuple(src_tensor.shape) == tuple(tgt_tensor.shape):
-                    return
-                src_aligned = _coerce_like(src_tensor, tgt_tensor)
-                new_tensor = tgt_tensor.clone()
-                overlap = min(src_aligned.shape[1], new_tensor.shape[1])
-                if overlap > 0:
-                    new_tensor[:, :overlap] = src_aligned[:, :overlap]
-                state[key] = new_tensor
-                partial_msgs.append(f"fc1.weight:{overlap}/{new_tensor.shape[1]}")
-
-            dropped_scaler = []
-            for scaler_key in ("feature_mean", "feature_std"):
-                if scaler_key in state:
-                    state.pop(scaler_key)
-                    dropped_scaler.append(scaler_key)
-            if dropped_scaler:
-                partial_msgs.append(f"scaler_replaced:{','.join(dropped_scaler)}")
-            _partial_fc1_weight()
-
-            for key in list(state.keys()):
-                if key not in model_state:
-                    continue
-                src_tensor = state[key]
-                tgt_tensor = model_state[key]
-                src_shape = tuple(src_tensor.shape) if hasattr(src_tensor, "shape") else None  # type: ignore[attr-defined]
-                tgt_shape = tuple(tgt_tensor.shape) if hasattr(tgt_tensor, "shape") else None  # type: ignore[attr-defined]
-                if src_shape is None or tgt_shape is None:
-                    continue
-                if src_shape != tgt_shape:
-                    pruned_keys.append(f"{key}: {src_shape}->{tgt_shape}")
-                    state.pop(key)
-            if pruned_keys:
-                logger.warning(
-                    "[init-from] 形状不一致のため %d 個のパラメータを読み込み対象から除外しました (例: %s)",
-                    len(pruned_keys),
-                    ", ".join(pruned_keys[:4]),
-                )
-
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        missing_filtered = [key for key in missing if key not in {"feature_mean", "feature_std"}]
-        if missing_filtered:
-            logger.warning(f"[init-from] missing keys: {len(missing_filtered)} e.g. {missing_filtered[:8]}")
-        if unexpected:
-            logger.warning(f"[init-from] unexpected keys: {len(unexpected)} e.g. {unexpected[:8]}")
-        if partial_msgs:
-            sample = ", ".join(partial_msgs[:4])
-            if len(partial_msgs) > 4:
-                sample += " ..."
-            logger.warning("[init-from] 入力次元差異のため部分的に再初期化したテンソル: %s", sample)
-
-    else:
-        model.inference_temperature = max(float(args.temperature), 1e-6)
-    model.apply_feature_stats(train_mean, train_std)
-    # 試運転で動的拡張の整合性を確認する
-    with torch.no_grad():
-        health = torch.zeros((1, model.input_dim), device=device, dtype=torch.float32)
-        _ = model(health)
-    logger.info(model.input_shape_summary())
-    if device.type == "cuda":
-        first_param = next(model.parameters(), None)
-        if first_param is not None:
-            assert first_param.is_cuda, "Model is not on CUDA"
-
-    if device.type == "cuda" and hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")  # type: ignore[attr-defined]
-
-    model_forward = model
-    if args.compile:
-        if hasattr(torch, "compile"):
-            try:
-                model_forward = torch.compile(model)  # type: ignore[assignment]
-            except Exception as exc:
-                logging.warning("torch.compile に失敗したため未コンパイルで継続します: %s", exc)
-                model_forward = model
-        else:
-            logging.warning("この PyTorch では torch.compile が利用できないため通常モードで実行します")
-
-    freeze_trunk = bool(getattr(args, "freeze_trunk", False))
-    if freeze_trunk and hasattr(model, "trunk_parameters"):
-        for param in model.trunk_parameters():
-            param.requires_grad_(False)
-    param_groups: List[Dict[str, object]] = []
-    if hasattr(model, "trunk_parameters"):
-        trunk_params = [p for p in model.trunk_parameters() if p.requires_grad]
-    else:
-        trunk_params = []
-    if trunk_params:
-        param_groups.append({"params": trunk_params, "name": "trunk"})
-    if hasattr(model, "head_parameters"):
-        head_params = [p for p in model.head_parameters() if p.requires_grad]
-    else:
-        head_params = [p for p in model.parameters() if p.requires_grad]
-    if head_params:
-        param_groups.append({"params": head_params, "name": "heads"})
-    if not param_groups:
-        raise ValueError("学習可能なパラメータが存在しません")
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-    lr_schedule_mode = str(getattr(args, "lr_schedule", "plateau")).lower()
-    warmup_epochs = int(getattr(args, "warmup_epochs", 0))
-    min_lr_value = 1e-5
-    scheduler: Optional[object]
-    scheduler_requires_metric = False
-    scheduler_step_at_epoch_start = False
-    if lr_schedule_mode == "plateau":
-        scheduler_kwargs = dict(
-            optimizer=optimizer,
-            mode="max",
-            factor=0.5,
-            patience=8,
-            threshold=1e-4,
-            min_lr=min_lr_value,
-        )
-        # 古い PyTorch では verbose 引数が存在しないため動的に判定する
-        try:
-            signature = inspect.signature(torch.optim.lr_scheduler.ReduceLROnPlateau)
-        except (TypeError, ValueError):
-            signature = None
-        if signature is not None and "verbose" in signature.parameters:
-            scheduler_kwargs["verbose"] = True
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(**scheduler_kwargs)
-        scheduler_requires_metric = True
-    elif lr_schedule_mode == "cosine":
-        scheduler = _CosineWarmupScheduler(
-            optimizer,
-            total_epochs=args.epochs,
-            warmup_epochs=warmup_epochs,
-            min_lr=min_lr_value,
-        )
-        scheduler_step_at_epoch_start = True
-    elif lr_schedule_mode == "constant":
-        scheduler = None
-    else:
-        raise ValueError(f"未知の lr スケジュールが指定されました: {args.lr_schedule}")
-    logging.info(
-        "LR スケジュール: %s (warmup=%d, min_lr=%.2e)",
-        lr_schedule_mode,
-        warmup_epochs if lr_schedule_mode == "cosine" else 0,
-        min_lr_value,
-    )
-
-    active_heads = tuple(getattr(model, "active_heads", HEAD_ORDER))
-    if not active_heads:
-        raise ValueError("学習対象ヘッドが存在しません")
-
-    head_list = list(active_heads)
-
-    # ヘッド別損失重み (指定が無いヘッドは 1.0)
-    weight_config = getattr(args, "head_loss_weights", {})
-    head_loss_w = {name: float(weight_config.get(name, 1.0)) for name in active_heads}
-
-    train_best_np = {name: np.ascontiguousarray(train_best[name], dtype=np.int64) for name in active_heads}
-    train_second_np = {name: np.ascontiguousarray(train_second[name], dtype=np.int64) for name in active_heads}
-    val_best_np = {name: np.ascontiguousarray(val_best[name], dtype=np.int64) for name in active_heads}
-    val_second_np = {name: np.ascontiguousarray(val_second[name], dtype=np.int64) for name in active_heads}
-
-    train_targets: Dict[str, np.ndarray] = {}
-    epsilon_map = dict(getattr(args, "epsilon_soft_map", {}))
-    epsilon_default = float(epsilon_map.get("default", args.epsilon_soft))
-    for name in active_heads:
-        epsilon_head = float(epsilon_map.get(name, epsilon_default))
-        train_targets[name] = build_soft_targets(
-            train_best_np[name],
-            train_second_np[name],
-            HEAD_SPECS[name],
-            epsilon_head,
-        ).astype(np.float32)
-        train_targets[name] = np.ascontiguousarray(train_targets[name], dtype=np.float32)
-
-    perm_weights_tensor: Optional["torch.Tensor"] = None
-    perm_weight_device: Optional["torch.Tensor"] = None
-    filter_perm_weight = float(weight_config.get("filter_perm", head_loss_w.get("filter_perm", 1.0)))
-    if (
-        args.perm_class_balance == "effective"
-        and filter_perm_weight > 0.0
-        and "filter_perm" in train_best_np
-    ):
-        num_classes_perm = HEAD_SPECS.get("filter_perm")
-        if num_classes_perm is None:
-            logging.warning("filter_perm のクラス数が未定義のためクラス重みは適用されません")
-        else:
-            labels_perm = np.asarray(train_best_np["filter_perm"], dtype=np.int64)
-            valid_perm = labels_perm[labels_perm >= 0]
-            counts = np.bincount(valid_perm, minlength=int(num_classes_perm))
-            if counts.size == 0 or valid_perm.size == 0:
-                logging.warning("filter_perm のクラス頻度が取得できなかったためクラス重みは適用されません")
-            else:
+            def _safe_load_any(path, map_location):
+                # (A) safe_globals を追加して weights_only=True を試す
                 try:
-                    perm_weights_tensor = effective_class_weights(counts, args.perm_class_beta)
-                except Exception as exc:
-                    logging.warning("filter_perm のクラス重み算出に失敗したため無効化します: %s", exc)
-                    perm_weights_tensor = None
-                else:
-                    logging.info(
-                        "filter_perm に有効サンプル数ベースのクラス重みを適用します (beta=%.4f)",
-                        float(args.perm_class_beta),
-                    )
-    if perm_weights_tensor is not None:
-        perm_weight_device = perm_weights_tensor.to(device=device)
+                    import numpy as _np
+                    _ser.add_safe_globals([_np._core.multiarray._reconstruct])
+                    return _torch.load(path, map_location=map_location, weights_only=True)
+                except Exception:
+                    # (B) フォールバック（信頼済みファイル前提）
+                    return _torch.load(path, map_location=map_location, weights_only=False)
 
-    class_balance_heads = set(getattr(args, "class_balance_heads", set()))
-    head_class_weight_cpu: Dict[str, torch.Tensor] = {}
-    if class_balance_heads:
-        for name in active_heads:
-            if name not in class_balance_heads:
-                continue
-            classes = HEAD_SPECS.get(name)
-            if classes is None:
-                logging.warning("%s のクラス数が未定義のためクラス重みは適用されません", name)
-                continue
-            labels_arr = np.asarray(train_best_np[name], dtype=np.int64)
-            valid = labels_arr[labels_arr >= 0]
-            if valid.size == 0:
-                logging.warning("%s の有効ラベルが不足しているためクラス重みは適用されません", name)
-                continue
-            counts = np.bincount(valid, minlength=int(classes))
-            if counts.size == 0:
-                logging.warning("%s のクラス頻度が取得できませんでした", name)
-                continue
-            try:
-                weight_tensor = effective_class_weights(counts, args.class_balance_beta)
-            except Exception as exc:
-                logging.warning("%s のクラス重み算出に失敗したため無効化します: %s", name, exc)
-                continue
-            head_class_weight_cpu[name] = weight_tensor
-            logging.info(
-                "%s に有効サンプル数ベースのクラス重みを適用します (beta=%.4f)",
-                name,
-                float(args.class_balance_beta),
-            )
+            payload = _safe_load_any(str(args.init_from), map_location=device)
 
-    head_class_weight_device: Dict[str, torch.Tensor] = {
-        name: tensor.to(device=device) for name, tensor in head_class_weight_cpu.items()
-    }
-
-    eval_batch_raw = getattr(args, "eval_batch_size", None)
-    if eval_batch_raw is None or int(eval_batch_raw) <= 0:
-        eval_batch_raw = args.batch_size
-    eval_batch = max(1, int(eval_batch_raw))
-    eval_batch = min(eval_batch, int(args.max_batch))
-
-    if device.type == "cuda" and args.batch_size < 8192:
-        logging.warning("WARNING: Small batch on CUDA; increase --batch-size to reduce host↔device overhead.")
-
-    logging.info(
-        "Training start: backend=torch device=%s amp=%s batch=%d eval_batch=%d metrics_on_gpu=yes",
-        device,
-        amp_mode,
-        args.batch_size,
-        eval_batch,
-    )
-
-    non_blocking = device.type == "cuda"
-
-    focal_heads = set(getattr(args, "loss_focal_heads", set()))
-    focal_losses: Dict[str, FocalLoss] = {}
-    for name in active_heads:
-        if name in focal_heads:
-            focal_module = FocalLoss(
-                gamma=float(args.focal_gamma),
-                alpha=args.focal_alpha,
-                reduction="none",
-            ).to(device)
-            focal_losses[name] = focal_module
-
-    best_state: Optional[Dict[str, torch.Tensor]] = None
-    best_train_metrics: Dict[str, Dict[str, float]] = {}
-    best_val_metrics: Dict[str, Dict[str, float]] = {}
-    best_metric = -np.inf
-    patience_counter = 0
-    train_count = len(train_features)
-    rng = np.random.default_rng(args.seed)
-    total_batches = max(1, (train_count + args.batch_size - 1) // args.batch_size)
-
-    hard_ratio = float(np.clip(getattr(args, "reorder_hardratio", 0.0), 0.0, 1.0))
-    hard_mult = float(max(1.0, getattr(args, "reorder_hardmult", 1.0)))
-    use_hard_mining = "reorder" in active_heads and hard_ratio > 0.0 and hard_mult > 1.0
-    hard_loss_buffer = np.zeros((train_count,), dtype=np.float32) if use_hard_mining else None
-    hard_sample_weights = np.ones((train_count,), dtype=np.float32) if use_hard_mining else None
-
-    for epoch in range(args.epochs):
-        indices = rng.permutation(train_count)
-        progress = ProgressReporter(
-            total_batches,
-            f"エポック {epoch + 1:03d}",
-            unit="バッチ",
-            enable=ENABLE_PROGRESS,
-        )
-
-        if scheduler is not None and scheduler_step_at_epoch_start:
-            try:
-                scheduler.step()
-            except Exception:
-                logging.debug("エポック開始時の学習率更新に失敗しました", exc_info=True)
-
-        model.train()
-        model_forward.train()
-        epoch_loss = 0.0
-        sample_seen = 0
-        batches = [
-            np.ascontiguousarray(indices[start : min(train_count, start + args.batch_size)], dtype=np.int64)
-            for start in range(0, train_count, args.batch_size)
-        ]
-        for batch_no, (batch_idx, features_np, targets_np) in enumerate(
-            _prefetch_training_batches(train_features, train_targets, active_heads, batches), start=1
-        ):
-            xb_cpu = torch.from_numpy(features_np)
-            if non_blocking:
-                xb_cpu = xb_cpu.pin_memory()
-            xb = xb_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
-            target_tensors: Dict[str, torch.Tensor] = {}
-            for name in active_heads:
-                target_cpu = torch.from_numpy(targets_np[name])
-                if non_blocking:
-                    target_cpu = target_cpu.pin_memory()
-                target_tensors[name] = target_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
-            if device.type == "cuda":
-                assert xb.is_cuda, "Input batch not on CUDA"
-                for tensor in target_tensors.values():
-                    assert tensor.is_cuda, "Target tensor not on CUDA"
-            optimizer.zero_grad(set_to_none=True)
-            with _amp_context(device, amp_mode):
-                logits = model_forward(xb)
-                loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
-                for name in active_heads:
-                    _logits = logits[name]
-                    weight = float(head_loss_w.get(name, 1.0))
-                    if weight <= 0.0:
-                        continue
-                    targets_h = target_tensors[name]
-                    class_weight = head_class_weight_device.get(name)
-                    if name in focal_losses:
-                        hard_np = np.asarray(train_best_np[name][batch_idx], dtype=np.int64)
-                        hard_cpu = torch.from_numpy(hard_np)
-                        if non_blocking:
-                            hard_cpu = hard_cpu.pin_memory()
-                        hard_labels = hard_cpu.to(device=device, dtype=torch.long, non_blocking=non_blocking)
-                        logits_for_loss = _logits
-                        if (
-                            name == "reorder"
-                            and getattr(model, "reorder_use_cosine", False)
-                        ):
-                            scale = float(getattr(model, "reorder_scale", 1.0))
-                            arcface_module = getattr(model, "reorder_arcface", None)
-                            if arcface_module is not None and scale > 0.0:
-                                cosine = torch.clamp(_logits / scale, -1.0 + 1e-7, 1.0 - 1e-7)
-                                logits_for_loss = arcface_module(cosine, hard_labels)
-                        loss_vec = focal_losses[name](logits_for_loss, hard_labels, weight=class_weight)
-                        if use_hard_mining and name == "reorder" and hard_loss_buffer is not None:
-                            hard_loss_buffer[batch_idx] = loss_vec.detach().cpu().numpy()
-                        if (
-                            use_hard_mining
-                            and name == "reorder"
-                            and epoch >= 1
-                            and hard_sample_weights is not None
-                        ):
-                            weights_np = hard_sample_weights[batch_idx]
-                            weights_cpu = torch.from_numpy(weights_np.astype(np.float32, copy=False))
-                            if non_blocking:
-                                weights_cpu = weights_cpu.pin_memory()
-                            weights_dev = weights_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
-                            loss_vec = loss_vec * weights_dev
-                        loss_h = loss_vec.mean()
-                    else:
-                        log_probs = torch_F.log_softmax(_logits, dim=1)
-                        loss_vec = torch_F.kl_div(log_probs, targets_h, reduction="none").sum(dim=1)
-                        if (
-                            name == "filter_perm"
-                            and args.perm_class_balance == "effective"
-                            and perm_weight_device is not None
-                        ):
-                            true_ids = torch.argmax(targets_h, dim=1)
-                            cls_weight = perm_weight_device[true_ids]
-                            loss_vec = loss_vec * cls_weight
-                        elif class_weight is not None:
-                            true_ids = torch.argmax(targets_h, dim=1)
-                            loss_vec = loss_vec * class_weight[true_ids]
-                        if use_hard_mining and name == "reorder" and hard_loss_buffer is not None:
-                            hard_loss_buffer[batch_idx] = loss_vec.detach().cpu().numpy()
-                        if (
-                            use_hard_mining
-                            and name == "reorder"
-                            and epoch >= 1
-                            and hard_sample_weights is not None
-                        ):
-                            weights_np = hard_sample_weights[batch_idx]
-                            weights_cpu = torch.from_numpy(weights_np.astype(np.float32, copy=False))
-                            if non_blocking:
-                                weights_cpu = weights_cpu.pin_memory()
-                            weights_dev = weights_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
-                            loss_vec = loss_vec * weights_dev
-                        loss_h = loss_vec.mean()
-                    loss_tensor += weight * loss_h
-
-            loss_tensor.backward()
-            optimizer.step()
-            batch_size_actual = batch_idx.shape[0]
-            loss_scalar = float(loss_tensor.detach().item())
-            epoch_loss += loss_scalar * batch_size_actual
-            sample_seen += batch_size_actual
-            progress.update(1)
-
-        progress.close()
-
-        mean_loss = epoch_loss / max(1, sample_seen)
-
-        logging.info(
-            "訓練ロジット算出開始: device=%s amp=%s batch=%d metrics_on_gpu=yes",
-            device,
-            amp_mode,
-            eval_batch,
-        )
-        train_metrics = compute_metrics_on_device_with_progress(
-            model_forward,
-            train_features,
-            device,
-            train_best_np,
-            train_second_np,
-            batch_size=eval_batch,
-            amp=amp_mode,
-            desc="訓練ロジット算出中",
-            condition_dim=cond_extra_dim,
-            scramble_cond=args.eval_scramble_cond,
-        )
-        for cond_name in condition_heads:
-            head_metrics = train_metrics.get(cond_name)
-            if head_metrics:
-                logging.info(
-                    "train %s: top1=%.2f%% top3=%.2f%%",
-                    cond_name,
-                    head_metrics.get("top1", float("nan")) * 100.0,
-                    head_metrics.get("top3", float("nan")) * 100.0,
-                )
-        logging.info(
-            "評価ロジット算出開始: device=%s amp=%s batch=%d metrics_on_gpu=yes",
-            device,
-            amp_mode,
-            eval_batch,
-        )
-        val_metrics = compute_metrics_on_device_with_progress(
-            model_forward,
-            val_features,
-            device,
-            val_best_np,
-            val_second_np,
-            batch_size=eval_batch,
-            amp=amp_mode,
-            desc="評価ロジット算出中",
-            condition_dim=cond_extra_dim,
-            scramble_cond=args.eval_scramble_cond,
-        )
-        for cond_name in condition_heads:
-            head_metrics = val_metrics.get(cond_name)
-            if head_metrics:
-                logging.info(
-                    "val %s: top1=%.2f%% top3=%.2f%%",
-                    cond_name,
-                    head_metrics.get("top1", float("nan")) * 100.0,
-                    head_metrics.get("top3", float("nan")) * 100.0,
-                )
-
-        mean_top3 = float(np.mean([val_metrics[name]["top3"] for name in head_list]))
-        mean_three_choice = float(np.mean([val_metrics[name]["three_choice"] for name in head_list]))
-        mean_top1 = float(np.mean([val_metrics[name]["top1"] for name in head_list]))
-        mean_top2 = float(np.mean([val_metrics[name]["top2"] for name in head_list]))
-        print(
-            "epoch {epoch:03d}: loss={loss:.4f} val_top3={top3:.2f}% val_three={three:.2f}% val_top1={top1:.2f}% val_top2={top2:.2f}%".format(
-                epoch=epoch + 1,
-                loss=mean_loss,
-                top3=mean_top3 * 100.0,
-                three=mean_three_choice * 100.0,
-                top1=mean_top1 * 100.0,
-                top2=mean_top2 * 100.0,
-            )
-        )
-
-        if scheduler is not None:
-            try:
-                if scheduler_requires_metric:
-                    scheduler.step(mean_top3)
-                elif not scheduler_step_at_epoch_start:
-                    scheduler.step()
-            except Exception:
-                logging.debug("エポック終了時の学習率更新に失敗しました", exc_info=True)
-
-        if use_hard_mining and hard_loss_buffer is not None and hard_sample_weights is not None:
-            valid_mask = np.isfinite(hard_loss_buffer)
-            valid_indices = np.nonzero(valid_mask)[0]
-            if valid_indices.size == 0:
-                hard_sample_weights.fill(1.0)
+            # 3 形式に対応：
+            # (1) TorchMultiTask オブジェクト
+            # (2) {"state_dict": ..., <meta...>} の辞書
+            # (3) 純 state_dict（= そのまま key->Tensor）
+            if isinstance(payload, TorchMultiTask):
+                state = payload.state_dict()
+                model.inference_temperature = getattr(payload, "inference_temperature", 1.0)
+            elif isinstance(payload, Mapping) and "state_dict" in payload:
+                state = payload["state_dict"]
+                model.inference_temperature = payload.get("inference_temperature", getattr(model, "inference_temperature", 1.0))
             else:
-                valid_losses = hard_loss_buffer[valid_mask]
-                select_count = max(1, int(round(valid_losses.size * hard_ratio)))
-                select_count = min(select_count, valid_losses.size)
-                if select_count <= 0:
-                    hard_sample_weights.fill(1.0)
-                else:
-                    order = np.argpartition(valid_losses, -select_count)[-select_count:]
-                    hard_indices = valid_indices[order]
-                    hard_sample_weights.fill(1.0)
-                    hard_sample_weights[hard_indices] = hard_mult
-                    logging.info(
-                        "ハードマイニング: 上位 %.2f%% の %d 件を倍率 %.2f で再重み付け", 
-                        hard_ratio * 100.0,
-                        int(select_count),
-                        hard_mult,
+                # 純 state_dict とみなす
+                state = payload
+
+            partial_msgs: List[str] = []
+            if isinstance(state, Mapping):
+                # 形状不一致パラメータは strict=False でも例外になるため事前に間引く
+                model_state = model.state_dict()
+                pruned_keys: List[str] = []
+                try:
+                    state = state.copy()  # type: ignore[assignment]
+                except AttributeError:
+                    state = dict(state)  # type: ignore[assignment]
+
+                def _coerce_like(value: object, reference: torch.Tensor) -> torch.Tensor:
+                    if isinstance(value, torch.Tensor):
+                        return value.detach().to(device=reference.device, dtype=reference.dtype)
+                    arr = np.asarray(value)
+                    tensor = torch.as_tensor(arr, dtype=reference.dtype)
+                    return tensor.to(device=reference.device)
+
+                def _partial_fc1_weight() -> None:
+                    key = "fc1.weight"
+                    if key not in state or key not in model_state:
+                        return
+                    src_tensor = state[key]
+                    tgt_tensor = model_state[key]
+                    if not hasattr(src_tensor, "shape") or not hasattr(tgt_tensor, "shape"):
+                        return
+                    if tuple(src_tensor.shape) == tuple(tgt_tensor.shape):
+                        return
+                    src_aligned = _coerce_like(src_tensor, tgt_tensor)
+                    new_tensor = tgt_tensor.clone()
+                    overlap = min(src_aligned.shape[1], new_tensor.shape[1])
+                    if overlap > 0:
+                        new_tensor[:, :overlap] = src_aligned[:, :overlap]
+                    state[key] = new_tensor
+                    partial_msgs.append(f"fc1.weight:{overlap}/{new_tensor.shape[1]}")
+
+                dropped_scaler = []
+                for scaler_key in ("feature_mean", "feature_std"):
+                    if scaler_key in state:
+                        state.pop(scaler_key)
+                        dropped_scaler.append(scaler_key)
+                if dropped_scaler:
+                    partial_msgs.append(f"scaler_replaced:{','.join(dropped_scaler)}")
+                _partial_fc1_weight()
+
+                for key in list(state.keys()):
+                    if key not in model_state:
+                        continue
+                    src_tensor = state[key]
+                    tgt_tensor = model_state[key]
+                    src_shape = tuple(src_tensor.shape) if hasattr(src_tensor, "shape") else None  # type: ignore[attr-defined]
+                    tgt_shape = tuple(tgt_tensor.shape) if hasattr(tgt_tensor, "shape") else None  # type: ignore[attr-defined]
+                    if src_shape is None or tgt_shape is None:
+                        continue
+                    if src_shape != tgt_shape:
+                        pruned_keys.append(f"{key}: {src_shape}->{tgt_shape}")
+                        state.pop(key)
+                if pruned_keys:
+                    logger.warning(
+                        "[init-from] 形状不一致のため %d 個のパラメータを読み込み対象から除外しました (例: %s)",
+                        len(pruned_keys),
+                        ", ".join(pruned_keys[:4]),
                     )
 
-        if mean_top3 > best_metric + 1e-4:
-            best_metric = mean_top3
-            state_source = (
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            missing_filtered = [key for key in missing if key not in {"feature_mean", "feature_std"}]
+            if missing_filtered:
+                logger.warning(f"[init-from] missing keys: {len(missing_filtered)} e.g. {missing_filtered[:8]}")
+            if unexpected:
+                logger.warning(f"[init-from] unexpected keys: {len(unexpected)} e.g. {unexpected[:8]}")
+            if partial_msgs:
+                sample = ", ".join(partial_msgs[:4])
+                if len(partial_msgs) > 4:
+                    sample += " ..."
+                logger.warning("[init-from] 入力次元差異のため部分的に再初期化したテンソル: %s", sample)
+
+        else:
+            model.inference_temperature = max(float(args.temperature), 1e-6)
+        model.apply_feature_stats(train_mean, train_std)
+        # 試運転で動的拡張の整合性を確認する
+        with torch.no_grad():
+            health = torch.zeros((1, model.input_dim), device=device, dtype=torch.float32)
+            _ = model(health)
+        logger.info(model.input_shape_summary())
+        if device.type == "cuda":
+            first_param = next(model.parameters(), None)
+            if first_param is not None:
+                assert first_param.is_cuda, "Model is not on CUDA"
+
+        if device.type == "cuda" and hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")  # type: ignore[attr-defined]
+
+        model_forward = model
+        if args.compile:
+            if hasattr(torch, "compile"):
+                try:
+                    model_forward = torch.compile(model)  # type: ignore[assignment]
+                except Exception as exc:
+                    logging.warning("torch.compile に失敗したため未コンパイルで継続します: %s", exc)
+                    model_forward = model
+            else:
+                logging.warning("この PyTorch では torch.compile が利用できないため通常モードで実行します")
+
+        freeze_trunk = bool(getattr(args, "freeze_trunk", False))
+        if freeze_trunk and hasattr(model, "trunk_parameters"):
+            for param in model.trunk_parameters():
+                param.requires_grad_(False)
+        param_groups: List[Dict[str, object]] = []
+        if hasattr(model, "trunk_parameters"):
+            trunk_params = [p for p in model.trunk_parameters() if p.requires_grad]
+        else:
+            trunk_params = []
+        if trunk_params:
+            param_groups.append({"params": trunk_params, "name": "trunk"})
+        if hasattr(model, "head_parameters"):
+            head_params = [p for p in model.head_parameters() if p.requires_grad]
+        else:
+            head_params = [p for p in model.parameters() if p.requires_grad]
+        if head_params:
+            param_groups.append({"params": head_params, "name": "heads"})
+        if not param_groups:
+            raise ValueError("学習可能なパラメータが存在しません")
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+        lr_schedule_mode = str(getattr(args, "lr_schedule", "plateau")).lower()
+        warmup_epochs = int(getattr(args, "warmup_epochs", 0))
+        min_lr_value = 1e-5
+        scheduler: Optional[object]
+        scheduler_requires_metric = False
+        scheduler_step_at_epoch_start = False
+        if lr_schedule_mode == "plateau":
+            scheduler_kwargs = dict(
+                optimizer=optimizer,
+                mode="max",
+                factor=0.5,
+                patience=8,
+                threshold=1e-4,
+                min_lr=min_lr_value,
+            )
+            # 古い PyTorch では verbose 引数が存在しないため動的に判定する
+            try:
+                signature = inspect.signature(torch.optim.lr_scheduler.ReduceLROnPlateau)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None and "verbose" in signature.parameters:
+                scheduler_kwargs["verbose"] = True
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(**scheduler_kwargs)
+            scheduler_requires_metric = True
+        elif lr_schedule_mode == "cosine":
+            scheduler = _CosineWarmupScheduler(
+                optimizer,
+                total_epochs=args.epochs,
+                warmup_epochs=warmup_epochs,
+                min_lr=min_lr_value,
+            )
+            scheduler_step_at_epoch_start = True
+        elif lr_schedule_mode == "constant":
+            scheduler = None
+        else:
+            raise ValueError(f"未知の lr スケジュールが指定されました: {args.lr_schedule}")
+        logging.info(
+            "LR スケジュール: %s (warmup=%d, min_lr=%.2e)",
+            lr_schedule_mode,
+            warmup_epochs if lr_schedule_mode == "cosine" else 0,
+            min_lr_value,
+        )
+
+        active_heads = tuple(getattr(model, "active_heads", HEAD_ORDER))
+        if not active_heads:
+            raise ValueError("学習対象ヘッドが存在しません")
+
+        head_list = list(active_heads)
+
+        # ヘッド別損失重み (指定が無いヘッドは 1.0)
+        weight_config = getattr(args, "head_loss_weights", {})
+        head_loss_w = {name: float(weight_config.get(name, 1.0)) for name in active_heads}
+
+        train_best_np = {name: np.ascontiguousarray(train_best[name], dtype=np.int64) for name in active_heads}
+        train_second_np = {name: np.ascontiguousarray(train_second[name], dtype=np.int64) for name in active_heads}
+        val_best_np = {name: np.ascontiguousarray(val_best[name], dtype=np.int64) for name in active_heads}
+        val_second_np = {name: np.ascontiguousarray(val_second[name], dtype=np.int64) for name in active_heads}
+
+        train_targets: Dict[str, np.ndarray] = {}
+        epsilon_map = dict(getattr(args, "epsilon_soft_map", {}))
+        epsilon_default = float(epsilon_map.get("default", args.epsilon_soft))
+        for name in active_heads:
+            epsilon_head = float(epsilon_map.get(name, epsilon_default))
+            train_targets[name] = build_soft_targets(
+                train_best_np[name],
+                train_second_np[name],
+                HEAD_SPECS[name],
+                epsilon_head,
+            ).astype(np.float32)
+            train_targets[name] = np.ascontiguousarray(train_targets[name], dtype=np.float32)
+
+        perm_weights_tensor: Optional["torch.Tensor"] = None
+        perm_weight_device: Optional["torch.Tensor"] = None
+        filter_perm_weight = float(weight_config.get("filter_perm", head_loss_w.get("filter_perm", 1.0)))
+        if (
+            args.perm_class_balance == "effective"
+            and filter_perm_weight > 0.0
+            and "filter_perm" in train_best_np
+        ):
+            num_classes_perm = HEAD_SPECS.get("filter_perm")
+            if num_classes_perm is None:
+                logging.warning("filter_perm のクラス数が未定義のためクラス重みは適用されません")
+            else:
+                labels_perm = np.asarray(train_best_np["filter_perm"], dtype=np.int64)
+                valid_perm = labels_perm[labels_perm >= 0]
+                counts = np.bincount(valid_perm, minlength=int(num_classes_perm))
+                if counts.size == 0 or valid_perm.size == 0:
+                    logging.warning("filter_perm のクラス頻度が取得できなかったためクラス重みは適用されません")
+                else:
+                    try:
+                        perm_weights_tensor = effective_class_weights(counts, args.perm_class_beta)
+                    except Exception as exc:
+                        logging.warning("filter_perm のクラス重み算出に失敗したため無効化します: %s", exc)
+                        perm_weights_tensor = None
+                    else:
+                        logging.info(
+                            "filter_perm に有効サンプル数ベースのクラス重みを適用します (beta=%.4f)",
+                            float(args.perm_class_beta),
+                        )
+        if perm_weights_tensor is not None:
+            perm_weight_device = perm_weights_tensor.to(device=device)
+
+        class_balance_heads = set(getattr(args, "class_balance_heads", set()))
+        head_class_weight_cpu: Dict[str, torch.Tensor] = {}
+        if class_balance_heads:
+            for name in active_heads:
+                if name not in class_balance_heads:
+                    continue
+                classes = HEAD_SPECS.get(name)
+                if classes is None:
+                    logging.warning("%s のクラス数が未定義のためクラス重みは適用されません", name)
+                    continue
+                labels_arr = np.asarray(train_best_np[name], dtype=np.int64)
+                valid = labels_arr[labels_arr >= 0]
+                if valid.size == 0:
+                    logging.warning("%s の有効ラベルが不足しているためクラス重みは適用されません", name)
+                    continue
+                counts = np.bincount(valid, minlength=int(classes))
+                if counts.size == 0:
+                    logging.warning("%s のクラス頻度が取得できませんでした", name)
+                    continue
+                try:
+                    weight_tensor = effective_class_weights(counts, args.class_balance_beta)
+                except Exception as exc:
+                    logging.warning("%s のクラス重み算出に失敗したため無効化します: %s", name, exc)
+                    continue
+                head_class_weight_cpu[name] = weight_tensor
+                logging.info(
+                    "%s に有効サンプル数ベースのクラス重みを適用します (beta=%.4f)",
+                    name,
+                    float(args.class_balance_beta),
+                )
+
+        head_class_weight_device: Dict[str, torch.Tensor] = {
+            name: tensor.to(device=device) for name, tensor in head_class_weight_cpu.items()
+        }
+
+        eval_batch_raw = getattr(args, "eval_batch_size", None)
+        if eval_batch_raw is None or int(eval_batch_raw) <= 0:
+            eval_batch_raw = args.batch_size
+        eval_batch = max(1, int(eval_batch_raw))
+        eval_batch = min(eval_batch, int(args.max_batch))
+
+        if device.type == "cuda" and args.batch_size < 8192:
+            logging.warning("WARNING: Small batch on CUDA; increase --batch-size to reduce host↔device overhead.")
+
+        logging.info(
+            "Training start: backend=torch device=%s amp=%s batch=%d eval_batch=%d metrics_on_gpu=yes",
+            device,
+            amp_mode,
+            args.batch_size,
+            eval_batch,
+        )
+
+        non_blocking = device.type == "cuda"
+
+        focal_heads = set(getattr(args, "loss_focal_heads", set()))
+        focal_losses: Dict[str, FocalLoss] = {}
+        for name in active_heads:
+            if name in focal_heads:
+                focal_module = FocalLoss(
+                    gamma=float(args.focal_gamma),
+                    alpha=args.focal_alpha,
+                    reduction="none",
+                ).to(device)
+                focal_losses[name] = focal_module
+
+        best_state: Optional[Dict[str, torch.Tensor]] = None
+        best_train_metrics: Dict[str, Dict[str, float]] = {}
+        best_val_metrics: Dict[str, Dict[str, float]] = {}
+        best_metric = -np.inf
+        patience_counter = 0
+        train_count = len(train_features)
+        rng = np.random.default_rng(args.seed)
+        total_batches = max(1, (train_count + args.batch_size - 1) // args.batch_size)
+
+        hard_ratio = float(np.clip(getattr(args, "reorder_hardratio", 0.0), 0.0, 1.0))
+        hard_mult = float(max(1.0, getattr(args, "reorder_hardmult", 1.0)))
+        use_hard_mining = "reorder" in active_heads and hard_ratio > 0.0 and hard_mult > 1.0
+        hard_loss_buffer = np.zeros((train_count,), dtype=np.float32) if use_hard_mining else None
+        hard_sample_weights = np.ones((train_count,), dtype=np.float32) if use_hard_mining else None
+
+        for epoch in range(args.epochs):
+            indices = rng.permutation(train_count)
+            progress = ProgressReporter(
+                total_batches,
+                f"エポック {epoch + 1:03d}",
+                unit="バッチ",
+                enable=ENABLE_PROGRESS,
+            )
+
+            if scheduler is not None and scheduler_step_at_epoch_start:
+                try:
+                    scheduler.step()
+                except Exception:
+                    logging.debug("エポック開始時の学習率更新に失敗しました", exc_info=True)
+
+            model.train()
+            model_forward.train()
+            epoch_loss = 0.0
+            sample_seen = 0
+            batches = [
+                np.ascontiguousarray(indices[start : min(train_count, start + args.batch_size)], dtype=np.int64)
+                for start in range(0, train_count, args.batch_size)
+            ]
+            for batch_no, (batch_idx, features_np, targets_np) in enumerate(
+                _prefetch_training_batches(train_features, train_targets, active_heads, batches), start=1
+            ):
+                xb_cpu = torch.from_numpy(features_np)
+                if non_blocking:
+                    xb_cpu = xb_cpu.pin_memory()
+                xb = xb_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+                target_tensors: Dict[str, torch.Tensor] = {}
+                for name in active_heads:
+                    target_cpu = torch.from_numpy(targets_np[name])
+                    if non_blocking:
+                        target_cpu = target_cpu.pin_memory()
+                    target_tensors[name] = target_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+                if device.type == "cuda":
+                    assert xb.is_cuda, "Input batch not on CUDA"
+                    for tensor in target_tensors.values():
+                        assert tensor.is_cuda, "Target tensor not on CUDA"
+                optimizer.zero_grad(set_to_none=True)
+                with _amp_context(device, amp_mode):
+                    logits = model_forward(xb)
+                    loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
+                    for name in active_heads:
+                        _logits = logits[name]
+                        weight = float(head_loss_w.get(name, 1.0))
+                        if weight <= 0.0:
+                            continue
+                        targets_h = target_tensors[name]
+                        class_weight = head_class_weight_device.get(name)
+                        if name in focal_losses:
+                            hard_np = np.asarray(train_best_np[name][batch_idx], dtype=np.int64)
+                            hard_cpu = torch.from_numpy(hard_np)
+                            if non_blocking:
+                                hard_cpu = hard_cpu.pin_memory()
+                            hard_labels = hard_cpu.to(device=device, dtype=torch.long, non_blocking=non_blocking)
+                            logits_for_loss = _logits
+                            if (
+                                name == "reorder"
+                                and getattr(model, "reorder_use_cosine", False)
+                            ):
+                                scale = float(getattr(model, "reorder_scale", 1.0))
+                                arcface_module = getattr(model, "reorder_arcface", None)
+                                if arcface_module is not None and scale > 0.0:
+                                    cosine = torch.clamp(_logits / scale, -1.0 + 1e-7, 1.0 - 1e-7)
+                                    logits_for_loss = arcface_module(cosine, hard_labels)
+                            loss_vec = focal_losses[name](logits_for_loss, hard_labels, weight=class_weight)
+                            if use_hard_mining and name == "reorder" and hard_loss_buffer is not None:
+                                hard_loss_buffer[batch_idx] = loss_vec.detach().cpu().numpy()
+                            if (
+                                use_hard_mining
+                                and name == "reorder"
+                                and epoch >= 1
+                                and hard_sample_weights is not None
+                            ):
+                                weights_np = hard_sample_weights[batch_idx]
+                                weights_cpu = torch.from_numpy(weights_np.astype(np.float32, copy=False))
+                                if non_blocking:
+                                    weights_cpu = weights_cpu.pin_memory()
+                                weights_dev = weights_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+                                loss_vec = loss_vec * weights_dev
+                            loss_h = loss_vec.mean()
+                        else:
+                            log_probs = torch_F.log_softmax(_logits, dim=1)
+                            loss_vec = torch_F.kl_div(log_probs, targets_h, reduction="none").sum(dim=1)
+                            if (
+                                name == "filter_perm"
+                                and args.perm_class_balance == "effective"
+                                and perm_weight_device is not None
+                            ):
+                                true_ids = torch.argmax(targets_h, dim=1)
+                                cls_weight = perm_weight_device[true_ids]
+                                loss_vec = loss_vec * cls_weight
+                            elif class_weight is not None:
+                                true_ids = torch.argmax(targets_h, dim=1)
+                                loss_vec = loss_vec * class_weight[true_ids]
+                            if use_hard_mining and name == "reorder" and hard_loss_buffer is not None:
+                                hard_loss_buffer[batch_idx] = loss_vec.detach().cpu().numpy()
+                            if (
+                                use_hard_mining
+                                and name == "reorder"
+                                and epoch >= 1
+                                and hard_sample_weights is not None
+                            ):
+                                weights_np = hard_sample_weights[batch_idx]
+                                weights_cpu = torch.from_numpy(weights_np.astype(np.float32, copy=False))
+                                if non_blocking:
+                                    weights_cpu = weights_cpu.pin_memory()
+                                weights_dev = weights_cpu.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+                                loss_vec = loss_vec * weights_dev
+                            loss_h = loss_vec.mean()
+                        loss_tensor += weight * loss_h
+
+                loss_tensor.backward()
+                optimizer.step()
+                batch_size_actual = batch_idx.shape[0]
+                loss_scalar = float(loss_tensor.detach().item())
+                epoch_loss += loss_scalar * batch_size_actual
+                sample_seen += batch_size_actual
+                progress.update(1)
+
+            progress.close()
+
+            mean_loss = epoch_loss / max(1, sample_seen)
+
+            logging.info(
+                "訓練ロジット算出開始: device=%s amp=%s batch=%d metrics_on_gpu=yes",
+                device,
+                amp_mode,
+                eval_batch,
+            )
+            train_metrics = compute_metrics_on_device_with_progress(
+                model_forward,
+                train_features,
+                device,
+                train_best_np,
+                train_second_np,
+                batch_size=eval_batch,
+                amp=amp_mode,
+                desc="訓練ロジット算出中",
+                condition_dim=cond_extra_dim,
+                scramble_cond=args.eval_scramble_cond,
+            )
+            for cond_name in condition_heads:
+                head_metrics = train_metrics.get(cond_name)
+                if head_metrics:
+                    logging.info(
+                        "train %s: top1=%.2f%% top3=%.2f%%",
+                        cond_name,
+                        head_metrics.get("top1", float("nan")) * 100.0,
+                        head_metrics.get("top3", float("nan")) * 100.0,
+                    )
+            logging.info(
+                "評価ロジット算出開始: device=%s amp=%s batch=%d metrics_on_gpu=yes",
+                device,
+                amp_mode,
+                eval_batch,
+            )
+            val_metrics = compute_metrics_on_device_with_progress(
+                model_forward,
+                val_features,
+                device,
+                val_best_np,
+                val_second_np,
+                batch_size=eval_batch,
+                amp=amp_mode,
+                desc="評価ロジット算出中",
+                condition_dim=cond_extra_dim,
+                scramble_cond=args.eval_scramble_cond,
+            )
+            for cond_name in condition_heads:
+                head_metrics = val_metrics.get(cond_name)
+                if head_metrics:
+                    logging.info(
+                        "val %s: top1=%.2f%% top3=%.2f%%",
+                        cond_name,
+                        head_metrics.get("top1", float("nan")) * 100.0,
+                        head_metrics.get("top3", float("nan")) * 100.0,
+                    )
+
+            mean_top3 = float(np.mean([val_metrics[name]["top3"] for name in head_list]))
+            mean_three_choice = float(np.mean([val_metrics[name]["three_choice"] for name in head_list]))
+            mean_top1 = float(np.mean([val_metrics[name]["top1"] for name in head_list]))
+            mean_top2 = float(np.mean([val_metrics[name]["top2"] for name in head_list]))
+            print(
+                "epoch {epoch:03d}: loss={loss:.4f} val_top3={top3:.2f}% val_three={three:.2f}% val_top1={top1:.2f}% val_top2={top2:.2f}%".format(
+                    epoch=epoch + 1,
+                    loss=mean_loss,
+                    top3=mean_top3 * 100.0,
+                    three=mean_three_choice * 100.0,
+                    top1=mean_top1 * 100.0,
+                    top2=mean_top2 * 100.0,
+                )
+            )
+
+            if scheduler is not None:
+                try:
+                    if scheduler_requires_metric:
+                        scheduler.step(mean_top3)
+                    elif not scheduler_step_at_epoch_start:
+                        scheduler.step()
+                except Exception:
+                    logging.debug("エポック終了時の学習率更新に失敗しました", exc_info=True)
+
+            if use_hard_mining and hard_loss_buffer is not None and hard_sample_weights is not None:
+                valid_mask = np.isfinite(hard_loss_buffer)
+                valid_indices = np.nonzero(valid_mask)[0]
+                if valid_indices.size == 0:
+                    hard_sample_weights.fill(1.0)
+                else:
+                    valid_losses = hard_loss_buffer[valid_mask]
+                    select_count = max(1, int(round(valid_losses.size * hard_ratio)))
+                    select_count = min(select_count, valid_losses.size)
+                    if select_count <= 0:
+                        hard_sample_weights.fill(1.0)
+                    else:
+                        order = np.argpartition(valid_losses, -select_count)[-select_count:]
+                        hard_indices = valid_indices[order]
+                        hard_sample_weights.fill(1.0)
+                        hard_sample_weights[hard_indices] = hard_mult
+                        logging.info(
+                            "ハードマイニング: 上位 %.2f%% の %d 件を倍率 %.2f で再重み付け", 
+                            hard_ratio * 100.0,
+                            int(select_count),
+                            hard_mult,
+                        )
+
+            if mean_top3 > best_metric + 1e-4:
+                best_metric = mean_top3
+                state_source = (
+                    model_forward._orig_mod if hasattr(model_forward, "_orig_mod") else model_forward
+                )
+                best_state = {
+                    key: tensor.detach().cpu().clone()
+                    for key, tensor in state_source.state_dict().items()
+                }
+                best_train_metrics = train_metrics
+                best_val_metrics = val_metrics
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= args.patience:
+                    print("早期終了: 改善が見られませんでした")
+                    break
+
+        if best_state is not None:
+            target_model = (
                 model_forward._orig_mod if hasattr(model_forward, "_orig_mod") else model_forward
             )
-            best_state = {
-                key: tensor.detach().cpu().clone()
-                for key, tensor in state_source.state_dict().items()
-            }
-            best_train_metrics = train_metrics
-            best_val_metrics = val_metrics
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= args.patience:
-                print("早期終了: 改善が見られませんでした")
-                break
+            target_model.load_state_dict(best_state)
+            if model is not target_model:
+                model.load_state_dict(best_state)
 
-    if best_state is not None:
-        target_model = (
-            model_forward._orig_mod if hasattr(model_forward, "_orig_mod") else model_forward
-        )
-        target_model.load_state_dict(best_state)
-        if model is not target_model:
-            model.load_state_dict(best_state)
+        dump_dir = getattr(args, "dump_logits", None)
+        if dump_dir is not None:
+            dump_path = Path(dump_dir)
+            dump_path.mkdir(parents=True, exist_ok=True)
+            dump_logits_to_npz(
+                model_forward,
+                train_features,
+                device,
+                batch_size=eval_batch,
+                amp=amp_mode,
+                desc="訓練ロジットダンプ中",
+                output_path=dump_path / "train_logits.npz",
+            )
+            dump_logits_to_npz(
+                model_forward,
+                val_features,
+                device,
+                batch_size=eval_batch,
+                amp=amp_mode,
+                desc="評価ロジットダンプ中",
+                output_path=dump_path / "val_logits.npz",
+            )
 
-    dump_dir = getattr(args, "dump_logits", None)
-    if dump_dir is not None:
-        dump_path = Path(dump_dir)
-        dump_path.mkdir(parents=True, exist_ok=True)
-        dump_logits_to_npz(
-            model_forward,
-            train_features,
-            device,
-            batch_size=eval_batch,
-            amp=amp_mode,
-            desc="訓練ロジットダンプ中",
-            output_path=dump_path / "train_logits.npz",
-        )
-        dump_logits_to_npz(
-            model_forward,
-            val_features,
-            device,
-            batch_size=eval_batch,
-            amp=amp_mode,
-            desc="評価ロジットダンプ中",
-            output_path=dump_path / "val_logits.npz",
-        )
 
-    return model, best_train_metrics, best_val_metrics
+        result_model = model
+        if hasattr(device, "type") and device.type == "cuda":
+            result_model = model.to("cpu")
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                logging.debug("torch.cuda.empty_cache の呼び出しに失敗しました", exc_info=True)
+        return result_model, best_train_metrics, best_val_metrics
+    finally:
+        gpu_lock_cm.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
