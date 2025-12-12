@@ -1,5 +1,6 @@
 # non-redistributable files
 /test/images/test*
+/test/copyrighted/
 
 # ML intermediate directory
 /data/
