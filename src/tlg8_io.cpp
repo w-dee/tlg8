@@ -828,12 +828,6 @@ namespace tlg::v8
       if (out_entropy_bits)
         *out_entropy_bits = 0;
 
-      if ((!label_cache_bin_path.empty() || !label_cache_meta_path.empty()) && training_dump_path.empty())
-      {
-        err = "tlg8: ラベルキャッシュを出力する場合は学習データのダンプ先を指定してください";
-        return false;
-      }
-
       struct FileCloser
       {
         void operator()(FILE *p) const noexcept
@@ -887,26 +881,36 @@ namespace tlg::v8
         return false;
       }
 
+      if ((label_cache_bin_path.empty() ^ label_cache_meta_path.empty()))
+      {
+        err = "tlg8: ラベルキャッシュの出力指定は bin と meta を同時に与えてください";
+        return false;
+      }
+
       std::unique_ptr<FILE, FileCloser> training_dump_file;
       std::unique_ptr<FILE, FileCloser> label_cache_file;
       TrainingDumpContext training_context;
-      const bool need_training_ctx = !training_dump_path.empty() || !training_stats_path.empty() ||
-                                     !label_cache_bin_path.empty() || !label_cache_meta_path.empty();
+      const bool enable_training_dump = !training_dump_path.empty();
+      const bool enable_feature_stats = !training_stats_path.empty();
+      const bool enable_label_cache = !label_cache_bin_path.empty() || !label_cache_meta_path.empty();
+      const bool need_training_ctx = enable_training_dump || enable_feature_stats || enable_label_cache;
       if (need_training_ctx)
       {
         training_context.image_tag = training_image_tag;
         training_context.image_width = src.width;
         training_context.image_height = src.height;
         training_context.components = static_cast<uint32_t>(desired_colors);
-        if (!training_stats_path.empty())
-        {
-          training_context.feature_stats.path = training_stats_path;
-          training_context.feature_stats.sum.assign(tlg::v8::kFeatureVectorSize, 0.0);
-          training_context.feature_stats.sumsq.assign(tlg::v8::kFeatureVectorSize, 0.0);
-          training_context.feature_stats.count = 0;
-        }
       }
-      if (!training_dump_path.empty())
+
+      if (enable_feature_stats)
+      {
+        training_context.feature_stats.path = training_stats_path;
+        training_context.feature_stats.sum.assign(tlg::v8::kFeatureVectorSize, 0.0);
+        training_context.feature_stats.sumsq.assign(tlg::v8::kFeatureVectorSize, 0.0);
+        training_context.feature_stats.count = 0;
+      }
+
+      if (enable_training_dump)
       {
         FILE *ml_fp = std::fopen(training_dump_path.c_str(), "ab");
         if (!ml_fp)
@@ -915,43 +919,38 @@ namespace tlg::v8
           return false;
         }
         training_dump_file.reset(ml_fp);
-        training_context.file = ml_fp;
-        training_context.image_tag = training_image_tag;
-        training_context.image_width = src.width;
-        training_context.image_height = src.height;
-        training_context.components = static_cast<uint32_t>(desired_colors);
-        if (!label_cache_bin_path.empty() || !label_cache_meta_path.empty())
-        {
-          if (label_cache_bin_path.empty() || label_cache_meta_path.empty())
-          {
-            err = "tlg8: ラベルキャッシュの出力指定は bin と meta を同時に与えてください";
-            return false;
-          }
-          std::filesystem::path bin_path = std::filesystem::u8path(label_cache_bin_path);
-          if (!bin_path.parent_path().empty())
-          {
-            std::error_code ec;
-            std::filesystem::create_directories(bin_path.parent_path(), ec);
-            if (ec)
-            {
-              err = "tlg8: ラベルキャッシュの出力ディレクトリを作成できません: " + bin_path.parent_path().u8string();
-              return false;
-            }
-          }
-          FILE *bin_fp = std::fopen(label_cache_bin_path.c_str(), "wb");
-          if (!bin_fp)
-          {
-            err = "tlg8: ラベルキャッシュを書き出すファイルを開けません: " + label_cache_bin_path;
-            return false;
-          }
-          label_cache_file.reset(bin_fp);
-          training_context.label_cache.file = bin_fp;
-          training_context.label_cache.bin_path = label_cache_bin_path;
-          training_context.label_cache.meta_path = label_cache_meta_path;
-          training_context.label_cache.input_paths.push_back(training_dump_path);
-          training_context.label_cache.record_count = 0;
-        }
+        training_context.training_dump.file = ml_fp;
+        training_context.training_dump.path = training_dump_path;
       }
+
+      if (enable_label_cache)
+      {
+        std::filesystem::path bin_path = std::filesystem::u8path(label_cache_bin_path);
+        if (!bin_path.parent_path().empty())
+        {
+          std::error_code ec;
+          std::filesystem::create_directories(bin_path.parent_path(), ec);
+          if (ec)
+          {
+            err = "tlg8: ラベルキャッシュの出力ディレクトリを作成できません: " + bin_path.parent_path().u8string();
+            return false;
+          }
+        }
+        FILE *bin_fp = std::fopen(label_cache_bin_path.c_str(), "wb");
+        if (!bin_fp)
+        {
+          err = "tlg8: ラベルキャッシュを書き出すファイルを開けません: " + label_cache_bin_path;
+          return false;
+        }
+        label_cache_file.reset(bin_fp);
+        training_context.label_cache.file = bin_fp;
+        training_context.label_cache.bin_path = label_cache_bin_path;
+        training_context.label_cache.meta_path = label_cache_meta_path;
+        if (enable_training_dump)
+          training_context.label_cache.input_paths.push_back(training_dump_path);
+        training_context.label_cache.record_count = 0;
+      }
+
       auto *training_ctx_ptr = need_training_ctx ? &training_context : nullptr;
 
       std::vector<uint8_t> packed;
@@ -1161,8 +1160,8 @@ namespace tlg::v8
         }
       }
 
-      if (training_ctx_ptr && training_ctx_ptr->file)
-        std::fflush(training_ctx_ptr->file);
+      if (training_ctx_ptr && training_ctx_ptr->training_dump.enabled())
+        std::fflush(training_ctx_ptr->training_dump.file);
 
       if (training_ctx_ptr && training_ctx_ptr->label_cache.file)
       {

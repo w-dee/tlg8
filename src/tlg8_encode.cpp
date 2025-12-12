@@ -862,7 +862,7 @@ namespace tlg::v8::enc
 
         std::vector<uint8_t> block_pixels;
         const bool need_pixels = training_ctx &&
-                                 (training_ctx->file != nullptr || training_ctx->feature_stats.enabled());
+                                 (training_ctx->training_dump.enabled() || training_ctx->feature_stats.enabled());
         if (need_pixels)
         {
           block_pixels.reserve(static_cast<size_t>(value_count) * components);
@@ -881,9 +881,9 @@ namespace tlg::v8::enc
           }
         }
 
-        if (training_ctx && training_ctx->file)
+        if (training_ctx && training_ctx->training_dump.enabled())
         {
-          FILE *ml_fp = training_ctx->file;
+          FILE *ml_fp = training_ctx->training_dump.file;
           std::fputc('{', ml_fp);
           write_json_string(ml_fp, "image");
           std::fputc(':', ml_fp);

@@ -10,7 +10,17 @@ namespace tlg::v8
 {
   struct TrainingDumpContext
   {
-    FILE *file = nullptr;
+    struct TrainingJsonState
+    {
+      FILE *file = nullptr;
+      std::string path;
+
+      bool enabled() const noexcept
+      {
+        return file != nullptr;
+      }
+    } training_dump;
+
     std::string image_tag;
     uint32_t image_width = 0;
     uint32_t image_height = 0;
@@ -35,6 +45,11 @@ namespace tlg::v8
         return !path.empty();
       }
     } feature_stats;
+
+    bool has_any_output() const noexcept
+    {
+      return training_dump.enabled() || label_cache.file != nullptr || feature_stats.enabled();
+    }
   };
 
   constexpr std::size_t kLabelRecordSize = 128;

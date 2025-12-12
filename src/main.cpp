@@ -46,6 +46,8 @@ static void print_usage()
             << " [--tlg8-reorder=hilbert-only]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
+  std::cerr << "  --label-cache-bin/--label-cache-meta は TLG8 エンコード時のみ有効で、2つ同時に指定してください。"
+            << " --tlg8-dump-training は併用しても、しなくても構いません。\n";
 }
 
 int main(int argc, char **argv)
@@ -366,11 +368,6 @@ int main(int argc, char **argv)
   if ((tlgopt.tlg8_label_cache_bin_path.empty() ^ tlgopt.tlg8_label_cache_meta_path.empty()))
   {
     std::cerr << "--label-cache-bin と --label-cache-meta は同時に指定してください\n";
-    return 2;
-  }
-  if (!tlgopt.tlg8_label_cache_bin_path.empty() && tlgopt.tlg8_training_dump_path.empty())
-  {
-    std::cerr << "--label-cache-* を使用する場合は --tlg8-dump-training も指定してください\n";
     return 2;
   }
 
