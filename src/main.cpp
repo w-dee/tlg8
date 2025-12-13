@@ -38,6 +38,7 @@ static void print_usage()
             << " [--tlg8-write-residuals-emphasis=<F>]"
             << " [--tlg8-dump-golomb-prediction=<path>]"
             << " [--dump-reorder-histogram=<path>]"
+            << " [--tlg8-dump-mode=features|labels|both]"
             << " [--tlg8-dump-training=<path>]"
             << " [--tlg8-training-tag=<text>]"
             << " [--tlg8-training-stats=<path>]"
@@ -46,7 +47,8 @@ static void print_usage()
             << " [--tlg8-reorder=hilbert-only]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
-  std::cerr << "  --label-cache-bin/--label-cache-meta は TLG8 エンコード時のみ有効で、2つ同時に指定してください。"
+  std::cerr << "  --label-cache-bin/--label-cache-meta は TLG8 エンコード時のみ有効で、"
+            << "--tlg8-dump-mode=labels|both と併せて 2 つ同時に指定してください。"
             << " --tlg8-dump-training は併用しても、しなくても構いません。\n";
 }
 
@@ -253,6 +255,23 @@ int main(int argc, char **argv)
       }
       tlgopt.tlg8_write_residuals_emphasis = emphasis;
     }
+    else if (arg.rfind("--tlg8-dump-mode=", 0) == 0)
+    {
+      std::string mode = arg.substr(17);
+      to_lower_inplace(mode);
+      if (mode == "features")
+        tlgopt.tlg8_dump_mode = TlgOptions::DumpMode::Features;
+      else if (mode == "labels")
+        tlgopt.tlg8_dump_mode = TlgOptions::DumpMode::Labels;
+      else if (mode == "both")
+        tlgopt.tlg8_dump_mode = TlgOptions::DumpMode::Both;
+      else
+      {
+        std::cerr << "Invalid --tlg8-dump-mode: " << mode << "\n";
+        return 2;
+      }
+      tlgopt.tlg8_dump_mode_specified = true;
+    }
     else if (arg.rfind("--tlg8-reorder=", 0) == 0)
     {
       std::string mode = arg.substr(15);
@@ -338,6 +357,20 @@ int main(int argc, char **argv)
     }
   }
 
+  const bool has_label_cache_paths = !tlgopt.tlg8_label_cache_bin_path.empty() ||
+                                     !tlgopt.tlg8_label_cache_meta_path.empty();
+  const bool has_training_outputs = !tlgopt.tlg8_training_dump_path.empty() ||
+                                    !tlgopt.tlg8_training_stats_path.empty();
+  const bool needs_dump_mode = has_label_cache_paths || has_training_outputs;
+  if (needs_dump_mode && !tlgopt.tlg8_dump_mode_specified)
+  {
+    std::cerr << "--tlg8-dump-mode=features|labels|both を指定してください\n";
+    return 2;
+  }
+
+  const bool mode_has_features = tlgopt.tlg8_dump_mode != TlgOptions::DumpMode::Labels;
+  const bool mode_has_labels = tlgopt.tlg8_dump_mode != TlgOptions::DumpMode::Features;
+
   if (tlgopt.print_entropy_bits && tlgopt.version != 8)
   {
     std::cerr << "--print-entropy-bits は TLG8 エンコード時のみ使用できます\n";
@@ -360,9 +393,19 @@ int main(int argc, char **argv)
     std::cerr << "--tlg8-training-stats は TLG8 エンコード時のみ使用できます\n";
     return 2;
   }
-  if ((!tlgopt.tlg8_label_cache_bin_path.empty() || !tlgopt.tlg8_label_cache_meta_path.empty()) && tlgopt.version != 8)
+  if (has_label_cache_paths && tlgopt.version != 8)
   {
     std::cerr << "--label-cache-* は TLG8 エンコード時のみ使用できます\n";
+    return 2;
+  }
+  if (!mode_has_labels && has_label_cache_paths)
+  {
+    std::cerr << "--label-cache-* は dump-mode=labels|both のときのみ有効です\n";
+    return 2;
+  }
+  if (!mode_has_features && !tlgopt.tlg8_training_stats_path.empty())
+  {
+    std::cerr << "--tlg8-training-stats は dump-mode=features|both のときのみ有効です\n";
     return 2;
   }
   if ((tlgopt.tlg8_label_cache_bin_path.empty() ^ tlgopt.tlg8_label_cache_meta_path.empty()))

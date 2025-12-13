@@ -33,7 +33,10 @@ class Tlg8TrainingCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="tlg8_dump_only_") as tmpdir:
             work = Path(tmpdir)
             dump_path = work / "dump.json"
-            result = self.run_command(work, [f"--tlg8-dump-training={dump_path}"])
+            result = self.run_command(
+                work,
+                ["--tlg8-dump-mode=features", f"--tlg8-dump-training={dump_path}"],
+            )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue(dump_path.exists(), "学習ダンプが生成されていません")
             self.assertGreater(dump_path.stat().st_size, 0)
@@ -47,7 +50,11 @@ class Tlg8TrainingCliTest(unittest.TestCase):
             meta_path = work / "labels.json"
             result = self.run_command(
                 work,
-                [f"--label-cache-bin={bin_path}", f"--label-cache-meta={meta_path}"],
+                [
+                    "--tlg8-dump-mode=labels",
+                    f"--label-cache-bin={bin_path}",
+                    f"--label-cache-meta={meta_path}",
+                ],
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue(bin_path.exists(), "ラベルキャッシュ bin が生成されていません")
@@ -68,6 +75,7 @@ class Tlg8TrainingCliTest(unittest.TestCase):
             result = self.run_command(
                 work,
                 [
+                    "--tlg8-dump-mode=both",
                     f"--tlg8-dump-training={dump_path}",
                     f"--label-cache-bin={bin_path}",
                     f"--label-cache-meta={meta_path}",
@@ -84,9 +92,34 @@ class Tlg8TrainingCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="tlg8_label_invalid_") as tmpdir:
             work = Path(tmpdir)
             bin_path = work / "labels.bin"
-            result = self.run_command(work, [f"--label-cache-bin={bin_path}"])
+            result = self.run_command(
+                work, ["--tlg8-dump-mode=labels", f"--label-cache-bin={bin_path}"]
+            )
             self.assertEqual(result.returncode, 2)
             self.assertIn("--label-cache-bin と --label-cache-meta は同時に指定してください", result.stderr)
+
+    def test_requires_dump_mode_for_outputs(self) -> None:
+        """ダンプ指定があるのに dump-mode が無い場合はエラーになる。"""
+
+        with tempfile.TemporaryDirectory(prefix="tlg8_dump_mode_missing_") as tmpdir:
+            work = Path(tmpdir)
+            dump_path = work / "dump.json"
+            result = self.run_command(work, [f"--tlg8-dump-training={dump_path}"])
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--tlg8-dump-mode", result.stderr)
+
+    def test_label_mode_blocks_feature_stats(self) -> None:
+        """labels モードでは特徴量統計が禁止される。"""
+
+        with tempfile.TemporaryDirectory(prefix="tlg8_label_mode_stats_") as tmpdir:
+            work = Path(tmpdir)
+            stats_path = work / "stats.bin"
+            result = self.run_command(
+                work,
+                ["--tlg8-dump-mode=labels", f"--tlg8-training-stats={stats_path}"],
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("dump-mode=features|both", result.stderr)
 
 
 if __name__ == "__main__":

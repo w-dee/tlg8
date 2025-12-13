@@ -75,17 +75,19 @@ namespace
   using tlg::v8::detail::bitio::BitWriter;
   using tlg::v8::detail::bitio::put_varuint;
   using tlg::v8::detail::bitio::varuint_bits;
-  using tlg::v8::TrainingDumpContext;
+  using tlg::v8::DumpContext;
   constexpr std::size_t kFeatureVectorSize = tlg::v8::kFeatureVectorSize;
 
   static_assert(sizeof(LabelRecord) == tlg::v8::kLabelRecordSize, "LabelRecord のサイズが想定値と一致しません");
 
-  void accumulate_feature_stats(TrainingDumpContext &ctx,
+  void accumulate_feature_stats(DumpContext &ctx,
                                 const std::vector<uint8_t> &block_pixels,
                                 uint32_t block_w,
                                 uint32_t block_h,
                                 uint32_t components)
   {
+    if (!ctx.enable_features)
+      return;
     auto &state = ctx.feature_stats;
     if (!state.enabled())
       return;
@@ -130,7 +132,7 @@ namespace
     }
   }
 
-  bool write_label_cache_record(TrainingDumpContext &ctx,
+  bool write_label_cache_record(DumpContext &ctx,
                                 uint32_t best_predictor,
                                 uint32_t best_filter,
                                 uint32_t best_reorder,
@@ -142,7 +144,7 @@ namespace
                                 uint32_t second_interleave,
                                 std::string &err)
   {
-    if (!ctx.label_cache.file)
+    if (!ctx.enable_labels || !ctx.label_cache.file)
       return true;
 
     LabelRecord record;
@@ -683,7 +685,7 @@ namespace tlg::v8::enc
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
                        std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
-                       TrainingDumpContext *training_ctx,
+                       DumpContext *training_ctx,
                        bool force_hilbert_reorder,
                        std::string &err)
   {
@@ -861,8 +863,7 @@ namespace tlg::v8::enc
         }
 
         std::vector<uint8_t> block_pixels;
-        const bool need_pixels = training_ctx &&
-                                 (training_ctx->training_dump.enabled() || training_ctx->feature_stats.enabled());
+        const bool need_pixels = training_ctx && training_ctx->wants_feature_pixels();
         if (need_pixels)
         {
           block_pixels.reserve(static_cast<size_t>(value_count) * components);
@@ -881,7 +882,7 @@ namespace tlg::v8::enc
           }
         }
 
-        if (training_ctx && training_ctx->training_dump.enabled())
+        if (training_ctx && training_ctx->wants_training_dump())
         {
           FILE *ml_fp = training_ctx->training_dump.file;
           std::fputc('{', ml_fp);
@@ -959,10 +960,10 @@ namespace tlg::v8::enc
           std::fputc('\n', ml_fp);
         }
 
-        if (training_ctx && training_ctx->feature_stats.enabled())
+        if (training_ctx && training_ctx->wants_feature_stats())
           accumulate_feature_stats(*training_ctx, block_pixels, block_w, block_h, components);
 
-        if (training_ctx)
+        if (training_ctx && training_ctx->wants_label_cache())
         {
           const bool has_second = (second_bits < std::numeric_limits<uint64_t>::max());
           if (!write_label_cache_record(*training_ctx,

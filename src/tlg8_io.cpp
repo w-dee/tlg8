@@ -23,6 +23,7 @@
 namespace
 {
   using tlg::detail::read_exact;
+  using tlg::v8::DumpContext;
 
   constexpr uint8_t kHeaderFlagHasGolombTable = 0x01;
   constexpr std::size_t kGolombSerializedFieldCount = tlg::v8::enc::kGolombColumnCount + 2;
@@ -82,7 +83,7 @@ namespace
     return write_u64le(fp, bits);
   }
 
-  bool write_feature_stats_file(const tlg::v8::TrainingDumpContext::FeatureStatsState &state, std::string &err)
+  bool write_feature_stats_file(const tlg::v8::DumpContext::FeatureStatsState &state, std::string &err)
   {
     if (!state.enabled())
       return true;
@@ -329,7 +330,7 @@ namespace
     return true;
   }
 
-  bool write_label_cache_meta(const tlg::v8::TrainingDumpContext::LabelCacheState &state,
+  bool write_label_cache_meta(const tlg::v8::DumpContext::LabelCacheState &state,
                               std::string &err)
   {
     if (state.meta_path.empty())
@@ -796,7 +797,7 @@ namespace tlg::v8
                        TlgOptions::DumpResidualsOrder residual_bitmap_order,
                        double residual_bitmap_emphasis,
                        std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
-                       TrainingDumpContext *training_ctx,
+                       DumpContext *training_ctx,
                        bool force_hilbert_reorder,
                        std::string &err);
 
@@ -810,6 +811,7 @@ namespace tlg::v8
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
+                   TlgOptions::DumpMode dump_mode,
                    const std::string &training_dump_path,
                    const std::string &training_image_tag,
                    const std::string &training_stats_path,
@@ -887,12 +889,26 @@ namespace tlg::v8
         return false;
       }
 
+      const bool mode_has_features = (dump_mode != TlgOptions::DumpMode::Labels);
+      const bool mode_has_labels = (dump_mode != TlgOptions::DumpMode::Features);
+
+      if (!mode_has_labels && (!label_cache_bin_path.empty() || !label_cache_meta_path.empty()))
+      {
+        err = "tlg8: --tlg8-dump-mode=features ではラベルキャッシュを出力できません";
+        return false;
+      }
+      if (!mode_has_features && !training_stats_path.empty())
+      {
+        err = "tlg8: --tlg8-dump-mode=labels では特徴量統計を出力できません";
+        return false;
+      }
+
       std::unique_ptr<FILE, FileCloser> training_dump_file;
       std::unique_ptr<FILE, FileCloser> label_cache_file;
-      TrainingDumpContext training_context;
+      DumpContext training_context;
       const bool enable_training_dump = !training_dump_path.empty();
-      const bool enable_feature_stats = !training_stats_path.empty();
-      const bool enable_label_cache = !label_cache_bin_path.empty() || !label_cache_meta_path.empty();
+      const bool enable_feature_stats = mode_has_features && !training_stats_path.empty();
+      const bool enable_label_cache = mode_has_labels && (!label_cache_bin_path.empty() || !label_cache_meta_path.empty());
       const bool need_training_ctx = enable_training_dump || enable_feature_stats || enable_label_cache;
       if (need_training_ctx)
       {
@@ -900,6 +916,8 @@ namespace tlg::v8
         training_context.image_width = src.width;
         training_context.image_height = src.height;
         training_context.components = static_cast<uint32_t>(desired_colors);
+        training_context.enable_features = mode_has_features;
+        training_context.enable_labels = mode_has_labels;
       }
 
       if (enable_feature_stats)
@@ -949,6 +967,7 @@ namespace tlg::v8
         if (enable_training_dump)
           training_context.label_cache.input_paths.push_back(training_dump_path);
         training_context.label_cache.record_count = 0;
+        training_context.enable_labels = mode_has_labels;
       }
 
       auto *training_ctx_ptr = need_training_ctx ? &training_context : nullptr;
@@ -1160,10 +1179,10 @@ namespace tlg::v8
         }
       }
 
-      if (training_ctx_ptr && training_ctx_ptr->training_dump.enabled())
+      if (training_ctx_ptr && training_ctx_ptr->wants_training_dump())
         std::fflush(training_ctx_ptr->training_dump.file);
 
-      if (training_ctx_ptr && training_ctx_ptr->label_cache.file)
+      if (training_ctx_ptr && training_ctx_ptr->wants_label_cache())
       {
         std::fflush(training_ctx_ptr->label_cache.file);
         training_ctx_ptr->label_cache.file = nullptr;
@@ -1172,7 +1191,7 @@ namespace tlg::v8
           return false;
       }
 
-      if (training_ctx_ptr && training_ctx_ptr->feature_stats.enabled())
+      if (training_ctx_ptr && training_ctx_ptr->wants_feature_stats())
       {
         if (!write_feature_stats_file(training_context.feature_stats, err))
           return false;

@@ -8,7 +8,7 @@
 
 namespace tlg::v8
 {
-  struct TrainingDumpContext
+  struct DumpContext
   {
     struct TrainingJsonState
     {
@@ -46,6 +46,29 @@ namespace tlg::v8
       }
     } feature_stats;
 
+    bool enable_features = false; // DumpMode に基づき特徴量系を有効化するか
+    bool enable_labels = false;   // DumpMode に基づきラベル系を有効化するか
+
+    bool wants_training_dump() const noexcept
+    {
+      return training_dump.enabled();
+    }
+
+    bool wants_feature_stats() const noexcept
+    {
+      return enable_features && feature_stats.enabled();
+    }
+
+    bool wants_feature_pixels() const noexcept
+    {
+      return wants_training_dump() || wants_feature_stats();
+    }
+
+    bool wants_label_cache() const noexcept
+    {
+      return enable_labels && label_cache.file != nullptr;
+    }
+
     bool has_any_output() const noexcept
     {
       return training_dump.enabled() || label_cache.file != nullptr || feature_stats.enabled();
@@ -70,6 +93,7 @@ namespace tlg::v8
                    const std::string &residual_bmp_path,
                    TlgOptions::DumpResidualsOrder residual_bmp_order,
                    double residual_bmp_emphasis,
+                   TlgOptions::DumpMode dump_mode,
                    const std::string &training_dump_path,
                    const std::string &training_image_tag,
                    const std::string &training_stats_path,

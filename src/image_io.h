@@ -48,6 +48,13 @@ bool save_bmp(const std::string &path, const PixelBuffer &src, std::string &err)
 // TLG I/O (TLG5/6) — implemented in later steps
 struct TlgOptions
 {
+  enum class DumpMode
+  {
+    Features,
+    Labels,
+    Both,
+  };
+
   enum class DumpResidualsOrder
   {
     AfterHilbert,
@@ -77,6 +84,8 @@ struct TlgOptions
   DumpResidualsOrder tlg8_write_residuals_order = DumpResidualsOrder::AfterPredictor;
   double tlg8_write_residuals_emphasis = 1.0; // 残差ビットマップの強調係数
   bool tlg8_force_hilbert_reorder = false;   // TLG8 並び替えをヒルベルト走査に固定するか
+  DumpMode tlg8_dump_mode = DumpMode::Both;  // TLG8 のダンプモード
+  bool tlg8_dump_mode_specified = false;     // CLI で明示されたかどうか
   std::string tlg8_training_dump_path;       // TLG8 ANN 学習用データを書き出すファイルパス
   std::string tlg8_training_dump_image_tag;  // 学習用データに付与する画像識別子
   std::string tlg8_training_stats_path;      // 学習用特徴量統計を書き出すファイルパス
