@@ -99,7 +99,7 @@ def should_skip(outputs: Sequence[Path], force: bool) -> bool:
 def build_command(job: Job, extra_args: List[str], mode: str, args: argparse.Namespace) -> List[str]:
     """tlgconv 実行コマンドを組み立てる。"""
 
-    output_path = args.tlg8_temp_dir / job.input_path.name
+    output_path = args.tlg8_temp_dir / job.input_path.with_suffix(".tlg8").name
     cmd = [str(args.tlgconv), str(job.input_path), str(output_path), f"--tlg8-dump-mode={mode}"]
     if args.out_training_json:
         training_path = args.out_training_json / (str(job.rel_rootless) + ".training.jsonl")
