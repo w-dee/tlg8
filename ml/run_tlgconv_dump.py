@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["features", "labels", "both"], default="both", help="ダンプモード")
     parser.add_argument("--out-training-json", type=Path, help="--tlg8-dump-training の出力先ルート")
     parser.add_argument("--out-label-cache", type=Path, help="--label-cache 出力先ルート")
+    parser.add_argument("--tlg8-temp-dir", required=True, type=Path, help="tlgconv の一時出力先ルート")
     parser.add_argument("--tlgconv-args", type=str, default="", help="tlgconv に渡す追加引数 (シェル形式)")
     parser.add_argument("--force", action="store_true", help="既存出力を上書きして実行")
     parser.add_argument("--dry-run", action="store_true", help="実行せずにコマンドのみ表示")
@@ -98,7 +99,8 @@ def should_skip(outputs: Sequence[Path], force: bool) -> bool:
 def build_command(job: Job, extra_args: List[str], mode: str, args: argparse.Namespace) -> List[str]:
     """tlgconv 実行コマンドを組み立てる。"""
 
-    cmd = [str(args.tlgconv), str(job.input_path), f"--tlg8-dump-mode={mode}"]
+    output_path = args.tlg8_temp_dir / job.input_path.name
+    cmd = [str(args.tlgconv), str(job.input_path), str(output_path), f"--tlg8-dump-mode={mode}"]
     if args.out_training_json:
         training_path = args.out_training_json / (str(job.rel_rootless) + ".training.jsonl")
         cmd.append(f"--tlg8-dump-training={training_path}")
@@ -147,6 +149,7 @@ def write_log(results: List[JobResult]) -> None:
 
 def main() -> int:
     args = parse_args()
+    args.tlg8_temp_dir.mkdir(parents=True, exist_ok=True)
     files = find_bmp_files(args.input_dir)
     if not files:
         print("入力ディレクトリに *.bmp が見つかりませんでした")
