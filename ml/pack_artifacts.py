@@ -44,6 +44,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, Optional, TextIO
 
+try:
+    # tqdm が入っていない環境でも動くように optional import にする。
+    # 進捗表示は「あるなら使う」方針。
+    from tqdm import tqdm  # type: ignore
+except Exception:  # ImportError 以外も一旦吸収（壊れた環境でも本体処理は動かす）
+    tqdm = None  # type: ignore
+
 
 LABEL_RECORD_SIZE = 128
 META_SCHEMA = 1
@@ -250,6 +257,30 @@ def open_log_file(dry_run: bool) -> Optional[TextIO]:
     return log_path.open("w", encoding="utf-8", newline="\n")
 
 
+def maybe_tqdm(
+    iterable: Iterable,
+    *,
+    total: int,
+    desc: str,
+    unit: str,
+):
+    """
+    tqdm が利用可能なら progress bar 付き iterable を返す。
+    戻り値: (pbar_or_none, iterable)
+    """
+    if tqdm is None:
+        return None, iterable
+    pbar = tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        unit=unit,
+        dynamic_ncols=True,
+        mininterval=0.2,
+    )
+    return pbar, pbar
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="TLG8 学習アーティファクトをパックして連続 I/O 化します。")
     parser.add_argument("--training-json-root", required=True, type=Path)
@@ -305,24 +336,31 @@ def main(argv: Optional[list[str]] = None) -> int:
         # 検証（strict の場合は最初の不整合で例外）
         validated: list[tuple[Pair, int, int, dict]] = []
         skipped = 0
-        for i, pair in enumerate(pairs, start=1):
-            try:
-                record_count = validate_label_bin(pair.label_bin)
-                meta = read_and_validate_label_meta(pair.label_meta, expected_record_count=record_count)
-                line_count = count_jsonl_lines(pair.training_jsonl)
-                if line_count != record_count:
-                    raise ValueError(
-                        "training jsonl 行数と label レコード数が不一致: "
-                        f"relpath={pair.relpath} lines={line_count} records={record_count}"
-                    )
-                validated.append((pair, line_count, record_count, meta))
-            except Exception as e:
-                if strict:
-                    raise
-                skipped += 1
-                logger.log(f"WARN: 検証失敗のためスキップ: {pair.relpath} ({e})")
-            if i % 500 == 0:
-                logger.log(f"検証進捗: {i}/{len(pairs)} processed, ok={len(validated)} skipped={skipped}")
+        vbar, viter = maybe_tqdm(pairs, total=len(pairs), desc="検証", unit="file")
+        try:
+            for i, pair in enumerate(viter, start=1):
+                try:
+                    record_count = validate_label_bin(pair.label_bin)
+                    meta = read_and_validate_label_meta(pair.label_meta, expected_record_count=record_count)
+                    line_count = count_jsonl_lines(pair.training_jsonl)
+                    if line_count != record_count:
+                        raise ValueError(
+                            "training jsonl 行数と label レコード数が不一致: "
+                            f"relpath={pair.relpath} lines={line_count} records={record_count}"
+                        )
+                    validated.append((pair, line_count, record_count, meta))
+                except Exception as e:
+                    if strict:
+                        raise
+                    skipped += 1
+                    logger.log(f"WARN: 検証失敗のためスキップ: {pair.relpath} ({e})")
+                if vbar is not None:
+                    vbar.set_postfix(ok=len(validated), skipped=skipped)
+                elif i % 500 == 0:
+                    logger.log(f"検証進捗: {i}/{len(pairs)} processed, ok={len(validated)} skipped={skipped}")
+        finally:
+            if vbar is not None:
+                vbar.close()
 
         logger.log(f"検証完了: ok={len(validated)} skipped={skipped}")
         if dry_run:
@@ -355,60 +393,67 @@ def main(argv: Optional[list[str]] = None) -> int:
             labels_out_tmp.open("wb") as labels_out,
             index_out_tmp.open("w", encoding="utf-8", newline="\n") as index_out,
         ):
-            for idx, (pair, line_count, record_count, _meta) in enumerate(validated, start=1):
-                # training jsonl
-                copied_lines = copy_training_jsonl(pair.training_jsonl, training_out)
-                if copied_lines != line_count:
-                    raise RuntimeError(
-                        f"内部エラー: 行数が変化しました: relpath={pair.relpath} expected={line_count} got={copied_lines}"
-                    )
+            wbar, witer = maybe_tqdm(validated, total=len(validated), desc="書き込み", unit="file")
+            try:
+                for idx, (pair, line_count, record_count, _meta) in enumerate(witer, start=1):
+                    # training jsonl
+                    copied_lines = copy_training_jsonl(pair.training_jsonl, training_out)
+                    if copied_lines != line_count:
+                        raise RuntimeError(
+                            f"内部エラー: 行数が変化しました: relpath={pair.relpath} expected={line_count} got={copied_lines}"
+                        )
 
-                # label bin（連結 + sha256）
-                label_bin_sha256 = copy_label_bin(pair.label_bin, labels_out)
+                    # label bin（連結 + sha256）
+                    label_bin_sha256 = copy_label_bin(pair.label_bin, labels_out)
 
-                # per-image meta sha256（元 JSON の bytes をハッシュ、軽量で十分）
-                label_meta_sha256 = sha256_file_bytes(pair.label_meta).hex()
+                    # per-image meta sha256（元 JSON の bytes をハッシュ、軽量で十分）
+                    label_meta_sha256 = sha256_file_bytes(pair.label_meta).hex()
 
-                # dataset_sha256 更新（指定フォーマット）
-                dataset_hasher.update(label_bin_sha256)
-                dataset_hasher.update(struct.pack("<Q", record_count))
-                dataset_hasher.update(pair.relpath.encode("utf-8"))
+                    # dataset_sha256 更新（指定フォーマット）
+                    dataset_hasher.update(label_bin_sha256)
+                    dataset_hasher.update(struct.pack("<Q", record_count))
+                    dataset_hasher.update(pair.relpath.encode("utf-8"))
 
-                # index
-                entry = {
-                    "relpath": pair.relpath,
-                    "training_path": f"{pair.relpath}.training.jsonl",
-                    "label_bin_path": f"{pair.relpath}.label_cache.bin",
-                    "label_meta_path": f"{pair.relpath}.label_cache.meta.json",
-                    "training_line_offset": training_line_offset,
-                    "training_line_count": line_count,
-                    "label_record_offset": label_record_offset,
-                    "label_record_count": record_count,
-                    "label_record_size": LABEL_RECORD_SIZE,
-                }
-                index_out.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-                # labels.meta.json の最小 inputs
-                inputs_min.append(
-                    {
+                    # index
+                    entry = {
                         "relpath": pair.relpath,
-                        "label_meta_sha256": label_meta_sha256,
-                        "label_bin_size": pair.label_bin.stat().st_size,
-                        "record_count": record_count,
+                        "training_path": f"{pair.relpath}.training.jsonl",
+                        "label_bin_path": f"{pair.relpath}.label_cache.bin",
+                        "label_meta_path": f"{pair.relpath}.label_cache.meta.json",
+                        "training_line_offset": training_line_offset,
+                        "training_line_count": line_count,
+                        "label_record_offset": label_record_offset,
+                        "label_record_count": record_count,
+                        "label_record_size": LABEL_RECORD_SIZE,
                     }
-                )
+                    index_out.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-                training_line_offset += line_count
-                label_record_offset += record_count
-                total_lines += line_count
-                total_records += record_count
-
-                if idx % 200 == 0:
-                    elapsed_write = time.perf_counter() - t_write0
-                    logger.log(
-                        f"書き込み進捗: {idx}/{len(validated)} "
-                        f"lines={total_lines} records={total_records} elapsed={elapsed_write:.2f}s"
+                    # labels.meta.json の最小 inputs
+                    inputs_min.append(
+                        {
+                            "relpath": pair.relpath,
+                            "label_meta_sha256": label_meta_sha256,
+                            "label_bin_size": pair.label_bin.stat().st_size,
+                            "record_count": record_count,
+                        }
                     )
+
+                    training_line_offset += line_count
+                    label_record_offset += record_count
+                    total_lines += line_count
+                    total_records += record_count
+
+                    if wbar is not None:
+                        wbar.set_postfix(lines=total_lines, records=total_records)
+                    elif idx % 200 == 0:
+                        elapsed_write = time.perf_counter() - t_write0
+                        logger.log(
+                            f"書き込み進捗: {idx}/{len(validated)} "
+                            f"lines={total_lines} records={total_records} elapsed={elapsed_write:.2f}s"
+                        )
+            finally:
+                if wbar is not None:
+                    wbar.close()
 
         packed_meta = {
             "schema": META_SCHEMA,
