@@ -1,15 +1,54 @@
-"""tlgconv を複数の BMP ファイルに対して並列実行する簡易スクリプト。
+"""Run tlgconv over many BMP files in parallel and dump training/features/labels.
 
-- 入力ディレクトリ以下の *.bmp を再帰的に処理する。
-- モード(features/labels/both)に応じて tlgconv のダンプオプションを切り替える。
-- 出力先は入力ルートからの相対パス構造を保つ。
-- 既存出力が揃っていればスキップし、--force で上書き実行する。
-- --dry-run で実行せずにコマンドのみ表示する。
+Behavior (kept):
+- Recursively finds *.bmp under --input-dir (sorted).
+- For each file, runs:
+    tlgconv <input.bmp> <temp.tlg8> --tlg8-dump-mode=<mode> [dump options...]
+- Output files are written under --out-training-json and/or --out-label-cache with
+  mirrored relative paths from --input-dir.
+- Skips work if all required outputs exist (unless --force).
+- Supports parallel execution with --jobs.
+- Writes failures to ml/run_tlgconv_dump.log (stdout/stderr tail).
+
+Important fix:
+- Temp outputs under --tlg8-temp-dir mirror the input relative path too, to avoid
+  collisions when basenames match across subdirectories:
+    <tlg8-temp-dir>/<relpath_without_ext>.tlg8
+
+Examples:
+  # Features/training JSONL only
+  python ml/run_tlgconv_dump.py \\
+    --input-dir data/images \\
+    --tlgconv build/tlgconv \\
+    --tlg8-temp-dir out/tmp_tlg8 \\
+    --mode features \\
+    --out-training-json out/training_jsonl \\
+    --jobs 8
+
+  # Label-cache only
+  python ml/run_tlgconv_dump.py \\
+    --input-dir data/images \\
+    --tlgconv build/tlgconv \\
+    --tlg8-temp-dir out/tmp_tlg8 \\
+    --mode labels \\
+    --out-label-cache out/label_cache \\
+    --jobs 8
+
+  # Both label-cache and training JSONL
+  python ml/run_tlgconv_dump.py \\
+    --input-dir data/images \\
+    --tlgconv build/tlgconv \\
+    --tlg8-temp-dir out/tmp_tlg8 \\
+    --mode both \\
+    --out-training-json out/training_jsonl \\
+    --out-label-cache out/label_cache \\
+    --jobs 8
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime as _dt
 import os
 import shlex
 import subprocess
@@ -23,22 +62,13 @@ MAX_LOG_OUTPUT = 2000
 
 @dataclass
 class JobResult:
-    """各ファイルに対する実行結果を保持するシンプルな構造体。"""
+    """A minimal container for a single input file result."""
 
-    path: Path
-    status: str  # "success" | "failure" | "skipped"
+    path: str
+    status: str  # "success" | "failure" | "skipped" | "dry-run"
     command: str
     returncode: int | None = None
     output_tail: str | None = None
-
-
-@dataclass
-class Job:
-    """実行に必要な情報をひとまとめにするだけの入れ物。"""
-
-    input_path: Path
-    rel_rootless: Path
-    outputs: List[Path]
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,84 +86,152 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    if not args.input_dir.exists() or not args.input_dir.is_dir():
+        raise SystemExit(f"--input-dir がディレクトリではありません: {args.input_dir}")
+
+    if not args.tlgconv.exists():
+        raise SystemExit(f"--tlgconv が存在しません: {args.tlgconv}")
+    if not args.tlgconv.is_file():
+        raise SystemExit(f"--tlgconv がファイルではありません: {args.tlgconv}")
+    if not os.access(args.tlgconv, os.X_OK):
+        raise SystemExit(f"--tlgconv が実行可能ではありません: {args.tlgconv}")
+
+    if args.jobs <= 0:
+        raise SystemExit("--jobs は 1 以上にしてください")
+
+    if args.mode == "features":
+        if not args.out_training_json:
+            raise SystemExit('mode="features" では --out-training-json が必須です（何も出力されません）')
+        return
+
+    if args.mode in {"labels", "both"}:
+        if not args.out_label_cache and not args.out_training_json:
+            raise SystemExit(
+                f'mode="{args.mode}" では --out-label-cache と --out-training-json のどちらかが必須です（何も出力されません）'
+            )
+        if args.mode == "labels" and not args.out_label_cache:
+            print(
+                'WARNING: mode="labels" ですが --out-label-cache が未指定です（training JSONL のみ出力します）'
+            )
+
+
 def find_bmp_files(root: Path) -> List[Path]:
-    """入力ディレクトリ以下の *.bmp をソートして返す。"""
+    """Find *.bmp under the given root (sorted)."""
 
     return sorted(p for p in root.rglob("*.bmp") if p.is_file())
 
 
 def rel_without_suffix(path: Path, root: Path) -> Path:
-    """入力ルートからの相対パスを拡張子なしで返す。"""
+    """Return the path relative to root, without the filename suffix."""
 
     return path.relative_to(root).with_suffix("")
 
 
-def build_outputs(rel_path: Path, args: argparse.Namespace) -> List[Path]:
-    """モードと出力指定に応じて必要な出力パス一覧を生成する。"""
+def build_required_outputs(
+    rel_path: Path, *, mode: str, out_training_json: Path | None, out_label_cache: Path | None
+) -> List[Path]:
+    """Build the list of required output paths for a given input file."""
 
     outputs: List[Path] = []
-    if args.out_training_json:
-        outputs.append(args.out_training_json / (str(rel_path) + ".training.jsonl"))
-    if args.out_label_cache and args.mode in {"labels", "both"}:
-        base = args.out_label_cache / rel_path
+    if out_training_json:
+        outputs.append(out_training_json / (str(rel_path) + ".training.jsonl"))
+    if out_label_cache and mode in {"labels", "both"}:
+        base = out_label_cache / rel_path
         outputs.append(base.with_suffix(".label_cache.bin"))
         outputs.append(base.with_suffix(".label_cache.meta.json"))
     return outputs
 
 
-def ensure_parent_dirs(paths: Iterable[Path]) -> None:
-    """出力ファイルの親ディレクトリを作成する。"""
+def ensure_parent_dirs(paths: Iterable[str]) -> None:
+    """Create parent directories for the given file paths."""
 
     for path in paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
 def should_skip(outputs: Sequence[Path], force: bool) -> bool:
-    """全ての出力が存在する場合にスキップする。"""
+    """Skip work if all required outputs already exist (unless forced)."""
 
     if force or not outputs:
         return False
     return all(p.exists() for p in outputs)
 
 
-def build_command(job: Job, extra_args: List[str], mode: str, args: argparse.Namespace) -> List[str]:
-    """tlgconv 実行コマンドを組み立てる。"""
+def temp_tlg8_path(tlg8_temp_dir: Path, rel_rootless: Path) -> Path:
+    return (tlg8_temp_dir / rel_rootless).with_suffix(".tlg8")
 
-    output_path = args.tlg8_temp_dir / job.input_path.with_suffix(".tlg8").name
-    cmd = [str(args.tlgconv), str(job.input_path), str(output_path), f"--tlg8-dump-mode={mode}"]
-    if args.out_training_json:
-        training_path = args.out_training_json / (str(job.rel_rootless) + ".training.jsonl")
+
+def build_command(
+    *,
+    tlgconv: Path,
+    input_path: Path,
+    temp_output_path: Path,
+    mode: str,
+    rel_rootless: Path,
+    out_training_json: Path | None,
+    out_label_cache: Path | None,
+    extra_args: Sequence[str],
+) -> List[str]:
+    """Build a tlgconv command line for one input file."""
+
+    cmd = [str(tlgconv), str(input_path), str(temp_output_path), f"--tlg8-dump-mode={mode}"]
+
+    if out_training_json:
+        training_path = out_training_json / (str(rel_rootless) + ".training.jsonl")
         cmd.append(f"--tlg8-dump-training={training_path}")
-    if args.out_label_cache and mode in {"labels", "both"}:
-        base = args.out_label_cache / job.rel_rootless
+    if out_label_cache and mode in {"labels", "both"}:
+        base = out_label_cache / rel_rootless
         cmd.append(f"--label-cache-bin={base.with_suffix('.label_cache.bin')}")
         cmd.append(f"--label-cache-meta={base.with_suffix('.label_cache.meta.json')}")
-    cmd.extend(extra_args)
+    cmd.extend(list(extra_args))
     return cmd
 
 
-def run_job(job: Job, mode: str, extra_args: List[str], dry_run: bool, args: argparse.Namespace) -> JobResult:
-    """単一ファイルに対して tlgconv を実行する。"""
+def run_job(input_path: str, command: List[str], mkdir_targets: List[str], dry_run: bool) -> JobResult:
+    """Run a single tlgconv job.
 
-    command = build_command(job, extra_args, mode, args)
+    Note: We intentionally use ThreadPoolExecutor and pass only primitives/lists here.
+    This avoids pickling issues and avoids passing argparse.Namespace into workers.
+    """
+
+    cmd_str = shlex.join(command)
     if dry_run:
-        return JobResult(job.input_path, "skipped", " ".join(command))
+        return JobResult(input_path, "dry-run", cmd_str)
 
-    ensure_parent_dirs(job.outputs)
-    completed = subprocess.run(command, capture_output=True, text=True)
+    try:
+        ensure_parent_dirs(mkdir_targets)
+        completed = subprocess.run(command, capture_output=True, text=True)
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        msg = f"{type(e).__name__}: {e}"
+        return JobResult(input_path, "failure", cmd_str, returncode=-1, output_tail=msg[-MAX_LOG_OUTPUT:])
+
     if completed.returncode == 0:
-        return JobResult(job.input_path, "success", " ".join(command))
+        return JobResult(input_path, "success", cmd_str, returncode=0)
 
     merged_output = (completed.stdout or "") + "\n" + (completed.stderr or "")
     tail = merged_output[-MAX_LOG_OUTPUT:]
-    return JobResult(job.input_path, "failure", " ".join(command), completed.returncode, tail)
+    return JobResult(input_path, "failure", cmd_str, completed.returncode, tail)
 
 
-def write_log(results: List[JobResult]) -> None:
-    """ログファイルに結果を追記する。"""
+def write_log(results: List[JobResult], *, started_at: _dt.datetime) -> None:
+    """Write the summary and failures to the log file (overwrite)."""
 
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("w", encoding="utf-8") as f:
+        success = sum(1 for r in results if r.status == "success")
+        failure = sum(1 for r in results if r.status == "failure")
+        skipped = sum(1 for r in results if r.status == "skipped")
+        dry_run = sum(1 for r in results if r.status == "dry-run")
+
+        f.write(f"timestamp: {started_at.isoformat(timespec='seconds')}\n")
+        f.write("counts:\n")
+        f.write(f"  success: {success}\n")
+        f.write(f"  failure: {failure}\n")
+        f.write(f"  skipped: {skipped}\n")
+        f.write(f"  dry-run: {dry_run}\n")
+        f.write("\n")
+
         for res in results:
             if res.status != "failure":
                 continue
@@ -149,38 +247,59 @@ def write_log(results: List[JobResult]) -> None:
 
 def main() -> int:
     args = parse_args()
+    validate_args(args)
+    started_at = _dt.datetime.now()
     args.tlg8_temp_dir.mkdir(parents=True, exist_ok=True)
+
     files = find_bmp_files(args.input_dir)
     if not files:
         print("入力ディレクトリに *.bmp が見つかりませんでした")
         return 1
 
     extra_args = shlex.split(args.tlgconv_args)
-    jobs: List[Job] = []
+    runnable: List[tuple[str, List[str], List[str]]] = []
     skipped: List[JobResult] = []
 
     for p in files:
         rel = rel_without_suffix(p, args.input_dir)
-        outputs = build_outputs(rel, args)
-        if should_skip(outputs, args.force):
-            skipped.append(JobResult(p, "skipped", ""))
+        required_outputs = build_required_outputs(
+            rel, mode=args.mode, out_training_json=args.out_training_json, out_label_cache=args.out_label_cache
+        )
+        if should_skip(required_outputs, args.force):
+            skipped.append(JobResult(str(p), "skipped", ""))
             continue
-        jobs.append(Job(p, rel, outputs))
 
-    print(f"対象ファイル数: {len(files)}, 実行: {len(jobs)}, スキップ: {len(skipped)}")
+        temp_out = temp_tlg8_path(args.tlg8_temp_dir, rel)
+        cmd = build_command(
+            tlgconv=args.tlgconv,
+            input_path=p,
+            temp_output_path=temp_out,
+            mode=args.mode,
+            rel_rootless=rel,
+            out_training_json=args.out_training_json,
+            out_label_cache=args.out_label_cache,
+            extra_args=extra_args,
+        )
+        mkdir_targets = [str(temp_out)] + [str(x) for x in required_outputs]
+        runnable.append((str(p), cmd, mkdir_targets))
+
+    print(f"対象ファイル数: {len(files)}, 実行: {len(runnable)}, スキップ: {len(skipped)}")
     results: List[JobResult] = []
 
     if args.dry_run:
-        for job in jobs:
-            res = run_job(job, args.mode, extra_args, dry_run=True, args=args)
+        for input_path, cmd, mkdir_targets in runnable:
+            res = run_job(input_path, cmd, mkdir_targets, dry_run=True)
             print(res.command)
             results.append(res)
     else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs) as executor:
-            future_to_job = {
-                executor.submit(run_job, job, args.mode, extra_args, False, args): job for job in jobs
-            }
-            for future in concurrent.futures.as_completed(future_to_job):
+        # Threads are sufficient here because the heavy work is external subprocess calls,
+        # and this avoids pickling/argparse.Namespace issues in multiprocessing.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            futures = [
+                executor.submit(run_job, input_path, cmd, mkdir_targets, False)
+                for (input_path, cmd, mkdir_targets) in runnable
+            ]
+            for future in concurrent.futures.as_completed(futures):
                 res = future.result()
                 results.append(res)
                 if res.status == "failure":
@@ -189,16 +308,18 @@ def main() -> int:
                     print(f"OK: {res.path}")
 
     results.extend(skipped)
-    write_log(results)
+    write_log(results, started_at=started_at)
 
     success = sum(1 for r in results if r.status == "success")
     failure = sum(1 for r in results if r.status == "failure")
     skip = sum(1 for r in results if r.status == "skipped")
+    dry_run = sum(1 for r in results if r.status == "dry-run")
 
     print("--- summary ---")
     print(f"success: {success}")
     print(f"failure: {failure}")
     print(f"skipped: {skip}")
+    print(f"dry-run: {dry_run}")
 
     return 0 if failure == 0 else 1
 
