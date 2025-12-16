@@ -41,6 +41,7 @@ LABEL_MAGIC = 0x4C424C38  # "LBL8"
 LABEL_VERSION = 1
 
 FEATURE_SET_RAW_PLUS_STATS_V1 = "raw_plus_stats_v1"
+FEATURE_SET_RAW_PLUS_STATS_V2 = "raw_plus_stats_v2"
 
 BLOCK_W = 8
 BLOCK_H = 8
@@ -138,10 +139,30 @@ def _feature_names_raw_plus_stats_v1() -> list[str]:
     return names
 
 
+def _feature_names_raw_plus_stats_v2() -> list[str]:
+    names = _feature_names_raw_plus_stats_v1()
+    # reorder_tv は C++ 側（tlgconv dump）で計算した 8 次元の Total Variation（平均 |Δ|）。
+    # クラス順は reorder の enum 値（0..7）と一致させる。
+    class_names = [
+        "hilbert",
+        "zigzag_diag",
+        "zigzag_antidiag",
+        "zigzag_horz",
+        "zigzag_vert",
+        "zigzag_nne_ssw",
+        "zigzag_nee_sww",
+        "zigzag_nww_see",
+    ]
+    names.extend([f"reorder_tv_{i}_{name}" for i, name in enumerate(class_names)])
+    return names
+
+
 def _feature_dim(feature_set: str) -> int:
-    if feature_set != FEATURE_SET_RAW_PLUS_STATS_V1:
-        raise ValueError(f"未対応の --feature-set: {feature_set}")
-    return len(_feature_names_raw_plus_stats_v1())
+    if feature_set == FEATURE_SET_RAW_PLUS_STATS_V1:
+        return len(_feature_names_raw_plus_stats_v1())
+    if feature_set == FEATURE_SET_RAW_PLUS_STATS_V2:
+        return len(_feature_names_raw_plus_stats_v2())
+    raise ValueError(f"未対応の --feature-set: {feature_set}")
 
 
 def _check_overwrite(out_dir: Path, force: bool, dry_run: bool) -> None:
@@ -343,6 +364,21 @@ def _fill_features_raw_plus_stats_v1(dst_row: np.ndarray, row: dict[str, Any], w
     }
 
 
+def _fill_features_raw_plus_stats_v2(dst_row: np.ndarray, row: dict[str, Any], work: _WorkBuffers) -> dict[str, Any]:
+    idx_fields = _fill_features_raw_plus_stats_v1(dst_row, row, work=work)
+    tv = row.get("reorder_tv")
+    if tv is None:
+        raise KeyError(
+            "training.all.jsonl に reorder_tv がありません。"
+            "新しい tlgconv の dump（--tlg8-dump-training）で生成し直してください。"
+        )
+    if not isinstance(tv, list) or len(tv) != 8:
+        raise ValueError(f"reorder_tv の形式が不正です: type={type(tv)} len={len(tv) if isinstance(tv, list) else 'n/a'}")
+    offset = len(_feature_names_raw_plus_stats_v1())
+    dst_row[offset : offset + 8] = np.asarray([float(x) for x in tv], dtype=np.float32)
+    return idx_fields
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     tmp.write_text(text, encoding="utf-8")
@@ -366,7 +402,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--feature-set",
         default=FEATURE_SET_RAW_PLUS_STATS_V1,
-        help=f"特徴量セット（現在は {FEATURE_SET_RAW_PLUS_STATS_V1} のみ）",
+        help=f"特徴量セット（{FEATURE_SET_RAW_PLUS_STATS_V1}, {FEATURE_SET_RAW_PLUS_STATS_V2}）",
     )
     parser.add_argument("--force", action="store_true", help="出力ファイルを上書きします。")
     parser.add_argument("--dry-run", action="store_true", help="書き込みを行わず、検証と予定出力のみ表示します。")
@@ -409,7 +445,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         n_blocks = min(total_lines, limit_blocks)
 
     d = _feature_dim(feature_set)
-    feature_names = _feature_names_raw_plus_stats_v1()
+    if feature_set == FEATURE_SET_RAW_PLUS_STATS_V1:
+        feature_names = _feature_names_raw_plus_stats_v1()
+    elif feature_set == FEATURE_SET_RAW_PLUS_STATS_V2:
+        feature_names = _feature_names_raw_plus_stats_v2()
+    else:
+        raise ValueError(f"未対応の --feature-set: {feature_set}")
     if len(feature_names) != d:
         raise RuntimeError("内部エラー: feature_names と feature_dim が一致しません")
 
@@ -486,6 +527,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             # feature
             if feature_set == FEATURE_SET_RAW_PLUS_STATS_V1:
                 idx_fields = _fill_features_raw_plus_stats_v1(x[i], row, work=work)
+            elif feature_set == FEATURE_SET_RAW_PLUS_STATS_V2:
+                idx_fields = _fill_features_raw_plus_stats_v2(x[i], row, work=work)
             else:
                 raise ValueError(f"未対応の --feature-set: {feature_set}")
 
@@ -549,6 +592,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "hf_energy_Y",
                     "hf_norm_Y",
                 ]
+            },
+            "reorder_tv": {
+                "names": [n for n in feature_names if n.startswith("reorder_tv_")],
+                "definition": "各 reorder の走査順に沿った mean(|Δ|)（tlgconv 側で計算）",
             },
         },
         "color_transform": {

@@ -26,7 +26,7 @@ TLG8 reorder（8クラス）分類器のベースライン学習スクリプト�
   python ml/train.py \\
     --data-dir ml/runs/dataset \\
     --out-dir ml/runs/reorder_baseline_ft1 \\
-    --resume-best ml/runs/reorder_baseline/model_best.pt \\
+    --resume-weights ml/runs/reorder_baseline/model_best.pt \\
     --epochs 100 \\
     --lr 2e-5 \\
     --amp \\
@@ -98,6 +98,32 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _get_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python_random": random.getstate(),
+        "numpy_random": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda_all"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _set_rng_state(state: dict[str, Any]) -> None:
+    try:
+        if "python_random" in state:
+            random.setstate(state["python_random"])
+        if "numpy_random" in state:
+            np.random.set_state(state["numpy_random"])
+        if "torch_cpu" in state:
+            torch.set_rng_state(state["torch_cpu"])
+        if torch.cuda.is_available() and "torch_cuda_all" in state:
+            torch.cuda.set_rng_state_all(state["torch_cuda_all"])
+    except Exception as e:
+        # RNG 復元は補助的なものなので、壊れていても学習自体は継続できるよう WARN に留める。
+        print(f"WARN: RNG state の復元に失敗しました: {e}", flush=True)
 
 
 @dataclass(frozen=True)
@@ -508,8 +534,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--save-best", action=argparse.BooleanOptionalAction, default=True)
     resume_group = p.add_mutually_exclusive_group()
-    resume_group.add_argument("--resume", type=Path, default=None)
-    resume_group.add_argument("--resume-best", type=Path, default=None)
+    resume_group.add_argument("--resume", type=Path, default=None, help="checkpoint_last.pt 等から完全再開（optimizer/scaler/epoch/best/RNG）")
+    resume_group.add_argument(
+        "--resume-weights",
+        "--resume-best",
+        dest="resume_weights",
+        type=Path,
+        default=None,
+        help="model_best.pt 等の重みのみロードして fine-tune（optimizer/scaler/epoch は新規）",
+    )
+    p.add_argument(
+        "--reset-best-metric",
+        action="store_true",
+        default=False,
+        help="--resume-weights 時に best 指標を引き継がず、0 から開始する",
+    )
     p.add_argument("--early-stop-patience", type=int, default=0)
     return p
 
@@ -616,28 +655,36 @@ def main() -> int:
         start_epoch = 1
         best_val_acc3 = -1.0
 
-        if args.resume_best is not None:
-            resume_best_path = Path(args.resume_best)
-            if resume_best_path.is_dir():
-                resume_best_path = resume_best_path / "model_best.pt"
-            if not resume_best_path.is_file():
-                raise FileNotFoundError(f"--resume-best で指定されたファイルが見つかりません: {resume_best_path}")
-            ckpt = torch.load(resume_best_path, map_location="cpu")
+        if args.resume_weights is not None:
+            resume_weights_path = Path(args.resume_weights)
+            if resume_weights_path.is_dir():
+                resume_weights_path = resume_weights_path / "model_best.pt"
+            if not resume_weights_path.is_file():
+                raise FileNotFoundError(f"--resume-weights で指定されたファイルが見つかりません: {resume_weights_path}")
+            ckpt = torch.load(resume_weights_path, map_location="cpu")
             model_state = _extract_model_state_dict(ckpt)
             model.load_state_dict(model_state)
 
             # fine-tune は「新規 run 扱い」なので epoch/optimizer/scaler はロードしない。
-            # best 指標は「新規 run 扱い」でリセットする（早期停止や best 保存をこの run 内で完結させるため）。
+            # best 指標はデフォルトで「ロード元の best」を引き継ぐ（初回エポックでの不自然な best 更新を避けるため）。
             loaded_val_acc3: Optional[float] = None
             if isinstance(ckpt, dict):
                 v = ckpt.get("val_acc3", ckpt.get("best_val_acc3"))
                 if v is not None:
                     loaded_val_acc3 = float(v)
-            best_val_acc3 = -1.0
-            if loaded_val_acc3 is None:
-                logger.log(f"resume_best: {resume_best_path} (weights only)")
+            if bool(args.reset_best_metric) or loaded_val_acc3 is None:
+                best_val_acc3 = -1.0
+                if loaded_val_acc3 is None:
+                    logger.log(f"resume_weights: {resume_weights_path} (weights only)")
+                else:
+                    logger.log(
+                        f"resume_weights: {resume_weights_path} (weights only) loaded_val_acc3={loaded_val_acc3:.6f} (best_metric reset)"
+                    )
             else:
-                logger.log(f"resume_best: {resume_best_path} (weights only) loaded_val_acc3={loaded_val_acc3:.6f}")
+                best_val_acc3 = float(loaded_val_acc3)
+                logger.log(
+                    f"resume_weights: {resume_weights_path} (weights only) loaded_val_acc3={loaded_val_acc3:.6f} (best_metric inherited)"
+                )
 
         elif args.resume is not None:
             ckpt = torch.load(args.resume, map_location="cpu")
@@ -647,6 +694,9 @@ def main() -> int:
                 scaler.load_state_dict(ckpt["scaler_state"])
             start_epoch = int(ckpt["epoch"]) + 1
             best_val_acc3 = float(ckpt.get("best_val_acc3", best_val_acc3))
+            rng_state = ckpt.get("rng_state")
+            if isinstance(rng_state, dict):
+                _set_rng_state(rng_state)
             logger.log(f"resume: {args.resume} start_epoch={start_epoch} best_val_acc3={best_val_acc3:.6f}")
 
         args_json: dict[str, Any] = {}
@@ -762,6 +812,7 @@ def main() -> int:
                 "optim_state": optimizer.state_dict(),
                 "scaler_state": scaler.state_dict() if scaler is not None else None,
                 "best_val_acc3": float(best_val_acc3),
+                "rng_state": _get_rng_state(),
                 "args": args_json,
             }
             torch.save(ckpt_last, out_dir / "checkpoint_last.pt")

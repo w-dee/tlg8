@@ -44,6 +44,10 @@
   - `components==3` のとき：`[R,G,B, R,G,B, ...]`
   - `components==4` のとき：**ARGB 順**で `[A,R,G,B, A,R,G,B, ...]`
   - 長さ：`block_w * block_h * components`
+- `reorder_tv`：各 reorder パターンの「スキャン順の滑らかさ」（float 配列、長さ 8）
+  - 定義：`tv = sum_{t=0..62} |v[order[t+1]] - v[order[t]]| / 63`
+  - `v` は 8×8 の輝度（Y）で、端の小ブロックは 0 埋め
+  - 配列の順序は `reorder` の 0–7（enum 値順）と一致
 - `best`：最良候補（オブジェクト）または `null`
 - `second`：次点候補（オブジェクト）または `null`
 

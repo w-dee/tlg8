@@ -912,6 +912,49 @@ namespace tlg::v8::enc
           std::fputc(']', ml_fp);
           std::fputc(',', ml_fp);
 
+          // 各リオーダー（8クラス）に対して、スキャン順の滑らかさ（TV）を追加する。
+          // 学習側ではこの 8 次元が reorder の本質（隣接差の小ささ）に直結するため、top-K の改善が期待できる。
+          std::array<float, tlg::v8::enc::kMaxBlockPixels> luma{};
+          for (uint32_t yy = 0; yy < 8; ++yy)
+          {
+            for (uint32_t xx = 0; xx < 8; ++xx)
+            {
+              float yv = 0.0f;
+              if (yy < block_h && xx < block_w)
+              {
+                const size_t base = (static_cast<size_t>(yy) * block_w + xx) * components;
+                if (components == 3)
+                {
+                  const float r = static_cast<float>(block_pixels[base + 0]);
+                  const float g = static_cast<float>(block_pixels[base + 1]);
+                  const float b = static_cast<float>(block_pixels[base + 2]);
+                  yv = 0.299f * r + 0.587f * g + 0.114f * b;
+                }
+                else
+                {
+                  // components==4 のとき pixels は ARGB（A を捨てる）
+                  const float r = static_cast<float>(block_pixels[base + 1]);
+                  const float g = static_cast<float>(block_pixels[base + 2]);
+                  const float b = static_cast<float>(block_pixels[base + 3]);
+                  yv = 0.299f * r + 0.587f * g + 0.114f * b;
+                }
+              }
+              luma[yy * 8 + xx] = yv;
+            }
+          }
+          const auto reorder_tv = tlg::v8::enc::compute_reorder_tv_mean(luma);
+          write_json_string(ml_fp, "reorder_tv");
+          std::fputc(':', ml_fp);
+          std::fputc('[', ml_fp);
+          for (size_t i = 0; i < reorder_tv.size(); ++i)
+          {
+            if (i > 0)
+              std::fputc(',', ml_fp);
+            std::fprintf(ml_fp, "%.6f", static_cast<double>(reorder_tv[i]));
+          }
+          std::fputc(']', ml_fp);
+          std::fputc(',', ml_fp);
+
           auto write_candidate = [&](const char *key,
                                      uint32_t predictor,
                                      uint32_t filter,
