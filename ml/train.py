@@ -21,6 +21,16 @@ TLG8 reorder（8クラス）分類器のベースライン学習スクリプト�
 
 依存:
   - numpy, torch, tqdm
+
+動作確認例（best 重みから fine-tune）:
+  python ml/train.py \\
+    --data-dir ml/runs/dataset \\
+    --out-dir ml/runs/reorder_baseline_ft1 \\
+    --resume-best ml/runs/reorder_baseline/model_best.pt \\
+    --epochs 100 \\
+    --lr 2e-5 \\
+    --amp \\
+    --early-stop-patience 20
 """
 
 from __future__ import annotations
@@ -287,7 +297,7 @@ def _train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     amp: bool,
-    scaler: Optional[torch.cuda.amp.GradScaler],
+    scaler: Optional[torch.amp.GradScaler],
     norm_mean: Optional[torch.Tensor],
     norm_inv_std: Optional[torch.Tensor],
     log_every: int,
@@ -309,9 +319,10 @@ def _train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         if use_cuda_amp and scaler is not None:
-            with torch.cuda.amp.autocast():
+            # autocast は forward（=モデル推論）に限定して、挙動差分を最小化する。
+            with torch.amp.autocast("cuda"):
                 logits = model(x)
-                loss = F.cross_entropy(logits, y)
+            loss = F.cross_entropy(logits, y)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -451,6 +462,27 @@ def _resolve_device(arg: str) -> torch.device:
     raise ValueError(f"未対応の --device: {arg}")
 
 
+def _extract_model_state_dict(ckpt: Any) -> dict[str, torch.Tensor]:
+    """
+    チェックポイント形式の揺れに対応して state_dict を取り出す。
+
+    想定:
+      - {"model_state": state_dict, ...}  (本スクリプトの形式)
+      - {"model": state_dict, ...}
+      - {"state_dict": state_dict, ...}
+      - state_dict そのもの（{"layer.weight": tensor, ...}）
+    """
+    if isinstance(ckpt, dict):
+        for k in ("model_state", "model", "state_dict"):
+            v = ckpt.get(k)
+            if isinstance(v, dict):
+                return v  # type: ignore[return-value]
+        # state_dict そのものっぽい場合（値が全部 Tensor）
+        if ckpt and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+            return ckpt  # type: ignore[return-value]
+    raise ValueError("チェックポイントから model state_dict を取り出せません（形式が未対応です）")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="TLG8 reorder(8-class) MLP trainer")
     p.add_argument("--data-dir", type=Path, required=True)
@@ -475,7 +507,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-every", type=int, default=50)
 
     p.add_argument("--save-best", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--resume", type=Path, default=None)
+    resume_group = p.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", type=Path, default=None)
+    resume_group.add_argument("--resume-best", type=Path, default=None)
+    p.add_argument("--early-stop-patience", type=int, default=0)
     return p
 
 
@@ -568,13 +603,43 @@ def main() -> int:
             weight_decay=float(args.weight_decay),
         )
 
-        scaler: Optional[torch.cuda.amp.GradScaler] = None
+        logger.log(f"optimizer: AdamW lr={float(args.lr):.8g} wd={float(args.weight_decay):.8g}")
+        if int(args.early_stop_patience) > 0:
+            logger.log(f"early_stop_patience: {int(args.early_stop_patience)}")
+        else:
+            logger.log("early_stop_patience: disabled")
+
+        scaler: Optional[torch.amp.GradScaler] = None
         if bool(args.amp) and device.type == "cuda":
-            scaler = torch.cuda.amp.GradScaler()
+            scaler = torch.amp.GradScaler("cuda")
 
         start_epoch = 1
         best_val_acc3 = -1.0
-        if args.resume is not None:
+
+        if args.resume_best is not None:
+            resume_best_path = Path(args.resume_best)
+            if resume_best_path.is_dir():
+                resume_best_path = resume_best_path / "model_best.pt"
+            if not resume_best_path.is_file():
+                raise FileNotFoundError(f"--resume-best で指定されたファイルが見つかりません: {resume_best_path}")
+            ckpt = torch.load(resume_best_path, map_location="cpu")
+            model_state = _extract_model_state_dict(ckpt)
+            model.load_state_dict(model_state)
+
+            # fine-tune は「新規 run 扱い」なので epoch/optimizer/scaler はロードしない。
+            # best 指標は「新規 run 扱い」でリセットする（早期停止や best 保存をこの run 内で完結させるため）。
+            loaded_val_acc3: Optional[float] = None
+            if isinstance(ckpt, dict):
+                v = ckpt.get("val_acc3", ckpt.get("best_val_acc3"))
+                if v is not None:
+                    loaded_val_acc3 = float(v)
+            best_val_acc3 = -1.0
+            if loaded_val_acc3 is None:
+                logger.log(f"resume_best: {resume_best_path} (weights only)")
+            else:
+                logger.log(f"resume_best: {resume_best_path} (weights only) loaded_val_acc3={loaded_val_acc3:.6f}")
+
+        elif args.resume is not None:
             ckpt = torch.load(args.resume, map_location="cpu")
             model.load_state_dict(ckpt["model_state"])
             optimizer.load_state_dict(ckpt["optim_state"])
@@ -624,6 +689,9 @@ def main() -> int:
                 logger.log("WARN: metrics.json の読み込みに失敗（新規作成します）")
                 all_metrics = {"epochs": []}
 
+        early_stop_patience = int(args.early_stop_patience)
+        no_improve_epochs = 0
+
         for epoch in range(start_epoch, int(args.epochs) + 1):
             logger.log(f"epoch {epoch}/{int(args.epochs)}")
             # 毎エポックの巨大インデックスシャッフルは避け、バッチ順序だけを入れ替える。
@@ -669,18 +737,23 @@ def main() -> int:
             _save_json(metrics_path, all_metrics)
 
             val_acc3 = float(val_stats["acc3"])
-            if bool(args.save_best) and val_acc3 > best_val_acc3:
+            improved = val_acc3 > best_val_acc3
+            if improved:
                 best_val_acc3 = val_acc3
-                best = {
-                    "epoch": int(epoch),
-                    "feature_dim": int(d),
-                    "val_acc3": float(val_acc3),
-                    "model_state": model.state_dict(),
-                    "args": args_json,
-                    "meta": meta,
-                }
-                torch.save(best, out_dir / "model_best.pt")
-                logger.log(f"best updated: val_acc3={best_val_acc3:.6f} -> model_best.pt")
+                no_improve_epochs = 0
+                if bool(args.save_best):
+                    best = {
+                        "epoch": int(epoch),
+                        "feature_dim": int(d),
+                        "val_acc3": float(val_acc3),
+                        "model_state": model.state_dict(),
+                        "args": args_json,
+                        "meta": meta,
+                    }
+                    torch.save(best, out_dir / "model_best.pt")
+                    logger.log(f"best updated: val_acc3={best_val_acc3:.6f} -> model_best.pt")
+            else:
+                no_improve_epochs += 1
 
             ckpt_last = {
                 "epoch": int(epoch),
@@ -692,6 +765,13 @@ def main() -> int:
                 "args": args_json,
             }
             torch.save(ckpt_last, out_dir / "checkpoint_last.pt")
+
+            if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
+                logger.log(
+                    "early stop triggered: "
+                    f"patience={early_stop_patience} best_val_acc3={best_val_acc3:.6f}"
+                )
+                break
 
         logger.log("done")
         return 0
