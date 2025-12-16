@@ -39,7 +39,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
 
@@ -204,17 +204,12 @@ class ReorderBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self.y = y
         self.batches = batches
 
+        # 正規化は Dataset 内（CPU）では行わない。
+        # エポック毎の前処理や DataLoader の重い処理と重なると GPU が待たされやすいので、
+        # train/eval ループ側で device 転送後（GPU 側）にまとめて行う。
         self.eps = float(eps)
         self.mean = None if mean is None else mean.astype(np.float32, copy=False)
         self.std = None if std is None else std.astype(np.float32, copy=False)
-        if self.mean is not None and self.std is not None:
-            # 正規化は Torch 側で行い、不要な numpy コピーを避ける。
-            self.mean_t = torch.from_numpy(self.mean)
-            inv_std = (1.0 / (self.std + np.float32(self.eps))).astype(np.float32, copy=False)
-            self.inv_std_t = torch.from_numpy(inv_std)
-        else:
-            self.mean_t = None
-            self.inv_std_t = None
 
         d = x.shape[1]
         if self.mean is not None and self.mean.shape != (d,):
@@ -229,8 +224,6 @@ class ReorderBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         base_idx = self.batches[i]
         feats_np = np.asarray(self.x[base_idx], dtype=np.float32)
         feats = torch.from_numpy(feats_np)
-        if self.mean_t is not None and self.inv_std_t is not None:
-            feats.sub_(self.mean_t).mul_(self.inv_std_t)
 
         labs_np = np.asarray(self.y[base_idx], dtype=np.int64)
         labs = torch.from_numpy(labs_np)
@@ -295,6 +288,8 @@ def _train_one_epoch(
     device: torch.device,
     amp: bool,
     scaler: Optional[torch.cuda.amp.GradScaler],
+    norm_mean: Optional[torch.Tensor],
+    norm_inv_std: Optional[torch.Tensor],
     log_every: int,
     max_batches: Optional[int],
 ) -> dict[str, float]:
@@ -308,6 +303,8 @@ def _train_one_epoch(
         if max_batches is not None and step > max_batches:
             break
         x = x.to(device, non_blocking=True)
+        if norm_mean is not None and norm_inv_std is not None:
+            x.sub_(norm_mean).mul_(norm_inv_std)
         y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
@@ -342,6 +339,8 @@ def _eval(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    norm_mean: Optional[torch.Tensor],
+    norm_inv_std: Optional[torch.Tensor],
     max_batches: Optional[int],
 ) -> dict[str, float]:
     model.eval()
@@ -352,6 +351,8 @@ def _eval(
         if max_batches is not None and step > max_batches:
             break
         x = x.to(device, non_blocking=True)
+        if norm_mean is not None and norm_inv_std is not None:
+            x.sub_(norm_mean).mul_(norm_inv_std)
         y = y.to(device, non_blocking=True)
         logits = model(x)
         loss = F.cross_entropy(logits, y)
@@ -368,10 +369,39 @@ def _eval(
     return stats.as_dict()
 
 
+class _EpochBatchOrderSampler(Sampler[int]):
+    """
+    Dataset の「バッチ番号」だけをエポック毎に並び替える Sampler。
+
+    N=9.2M のような巨大データで「インデックス全体を毎エポックシャッフル」すると CPU が支配的になり、
+    GPU が待つ（starvation）問題が起きやすい。ここではバッチ数（だいたい N/batch_size）だけを
+    シャッフルすることで、十分なランダム性を保ちつつコストを大幅に下げる。
+    """
+
+    def __init__(self, n_batches: int, seed: int) -> None:
+        if n_batches <= 0:
+            raise ValueError(f"n_batches は正である必要があります: {n_batches}")
+        self._n = int(n_batches)
+        self._seed = int(seed)
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self._seed + self._epoch)
+        order = rng.permutation(self._n)
+        return iter(order.tolist())
+
+    def __len__(self) -> int:
+        return self._n
+
+
 def _make_loader(
     dataset: Dataset,
     num_workers: int,
     device: torch.device,
+    sampler: Optional[Sampler[int]] = None,
 ) -> DataLoader:
     pin = device.type == "cuda"
     persistent_workers = num_workers > 0
@@ -379,6 +409,7 @@ def _make_loader(
         dataset,
         batch_size=None,
         shuffle=False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin,
         persistent_workers=persistent_workers,
@@ -500,7 +531,27 @@ def main() -> int:
         logger.log(f"train blocks: {len(train_idx)}")
         logger.log(f"val blocks:   {len(val_idx)}")
 
+        norm_mean_t: Optional[torch.Tensor] = None
+        norm_inv_std_t: Optional[torch.Tensor] = None
+        if mean is not None and std is not None:
+            eps = np.float32(1e-6)
+            inv_std = (1.0 / (std.astype(np.float32, copy=False) + eps)).astype(np.float32, copy=False)
+            norm_mean_t = torch.from_numpy(mean.astype(np.float32, copy=False)).to(device)
+            norm_inv_std_t = torch.from_numpy(inv_std).to(device)
+
         # 学習は 1バッチ=1getitem で Python オーバーヘッドを削減する。
+        # train は split の順序（作成時点で乱択済み）をそのままバッチ化し、
+        # エポック毎は「バッチ順序」だけをシャッフルする。
+        train_batches = _make_batches(train_idx.astype(np.int64, copy=False), int(args.batch_size), drop_last=True)
+        train_ds_batch = ReorderBatchDataset(x=x, y=y, batches=train_batches, mean=mean, std=std)
+        train_sampler = _EpochBatchOrderSampler(n_batches=len(train_batches), seed=int(args.seed))
+        train_loader = _make_loader(
+            train_ds_batch,
+            num_workers=int(args.num_workers),
+            device=device,
+            sampler=train_sampler,
+        )
+
         # validation は順序固定でよいので、一度だけ batch 化する。
         val_batches = _make_batches(val_idx.astype(np.int64, copy=False), int(args.batch_size), drop_last=False)
         val_ds = ReorderBatchDataset(x=x, y=y, batches=val_batches, mean=mean, std=std)
@@ -575,17 +626,8 @@ def main() -> int:
 
         for epoch in range(start_epoch, int(args.epochs) + 1):
             logger.log(f"epoch {epoch}/{int(args.epochs)}")
-            # ここで train_idx をシャッフルし、バッチ単位に分割する（1件ずつの __getitem__ を避ける）。
-            rng = np.random.default_rng(int(args.seed) + int(epoch))
-            epoch_train_idx = train_idx.copy()
-            rng.shuffle(epoch_train_idx)
-            train_batches = _make_batches(epoch_train_idx, int(args.batch_size), drop_last=True)
-            train_ds_batch = ReorderBatchDataset(x=x, y=y, batches=train_batches, mean=mean, std=std)
-            train_loader = _make_loader(
-                train_ds_batch,
-                num_workers=int(args.num_workers),
-                device=device,
-            )
+            # 毎エポックの巨大インデックスシャッフルは避け、バッチ順序だけを入れ替える。
+            train_sampler.set_epoch(int(epoch))
             train_stats = _train_one_epoch(
                 model=model,
                 loader=train_loader,
@@ -593,6 +635,8 @@ def main() -> int:
                 device=device,
                 amp=bool(args.amp),
                 scaler=scaler,
+                norm_mean=norm_mean_t,
+                norm_inv_std=norm_inv_std_t,
                 log_every=int(args.log_every),
                 max_batches=args.max_train_batches,
             )
@@ -600,6 +644,8 @@ def main() -> int:
                 model=model,
                 loader=val_loader,
                 device=device,
+                norm_mean=norm_mean_t,
+                norm_inv_std=norm_inv_std_t,
                 max_batches=args.max_val_batches,
             )
             logger.log(
