@@ -9,14 +9,14 @@ namespace tlg::v8::enc
 {
   enum class ReorderPattern : uint32_t
   {
-    Hilbert = 0,
-    ZigzagDiag,
-    ZigzagAntiDiag,
-    ZigzagHorz,
-    ZigzagVert,
-    ZigzagNNESSW,
-    ZigzagNEESWW,
-    ZigzagNWWSEE,
+    Hilbert = 0,    // ヒルベルト曲線
+    ZigzagDiag,     // 左上から右下へのジグザグ
+    ZigzagAntiDiag, // 右上から左下へのジグザグ
+    ZigzagHorz,     // 横方向ジグザグ
+    ZigzagVert,     // 縦方向ジグザグ
+    ZigzagNNESSW,   // ジグザグ：北北東から南南西
+    ZigzagNEESWW,   // ジグザグ：北東東から南西西
+    ZigzagNWWSEE,   // ジグザグ：北西西から南西西
     Count,
   };
 
@@ -36,4 +36,3 @@ namespace tlg::v8::enc
                          uint32_t block_h,
                          ReorderPattern pattern);
 }
-
