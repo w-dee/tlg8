@@ -485,12 +485,10 @@ namespace
 
 namespace tlg::v8::enc
 {
-  std::array<float, kReorderPatternCount> compute_reorder_tv_mean(
-      const std::array<float, kMaxBlockPixels> &luma)
+  namespace
   {
-    std::array<float, kReorderPatternCount> out{};
     // enum 値順（0..7）でテーブルを並べる（JSONL の reorder インデックスと一致させる）
-    constexpr std::array<const reorder_table *, kReorderPatternCount> tables = {
+    constexpr std::array<const reorder_table *, kReorderPatternCount> kReorderTvTables = {
         &kHilbertOrder,
         &kZigzagDiagOrder,
         &kZigzagAntiDiagOrder,
@@ -500,11 +498,17 @@ namespace tlg::v8::enc
         &kZigzagNEESWWOrder,
         &kZigzagNWWSEEOrder,
     };
+  }
+
+  std::array<float, kReorderPatternCount> compute_reorder_tv_mean(
+      const std::array<float, kMaxBlockPixels> &luma)
+  {
+    std::array<float, kReorderPatternCount> out{};
 
     constexpr float inv_steps = 1.0f / 63.0f;
     for (uint32_t cls = 0; cls < kReorderPatternCount; ++cls)
     {
-      const reorder_table &order = *tables[cls];
+      const reorder_table &order = *kReorderTvTables[cls];
       float tv = 0.0f;
       float prev = luma[static_cast<size_t>(order[0])];
       for (size_t t = 1; t < kMaxBlockPixels; ++t)
@@ -514,6 +518,28 @@ namespace tlg::v8::enc
         prev = cur;
       }
       out[cls] = tv * inv_steps;
+    }
+    return out;
+  }
+
+  std::array<float, kReorderPatternCount> compute_reorder_tv2_mean(
+      const std::array<float, kMaxBlockPixels> &luma)
+  {
+    std::array<float, kReorderPatternCount> out{};
+    constexpr float inv_steps = 1.0f / 63.0f;
+    for (uint32_t cls = 0; cls < kReorderPatternCount; ++cls)
+    {
+      const reorder_table &order = *kReorderTvTables[cls];
+      float tv2 = 0.0f;
+      float prev = luma[static_cast<size_t>(order[0])];
+      for (size_t t = 1; t < kMaxBlockPixels; ++t)
+      {
+        const float cur = luma[static_cast<size_t>(order[t])];
+        const float d = cur - prev;
+        tv2 += d * d;
+        prev = cur;
+      }
+      out[cls] = tv2 * inv_steps;
     }
     return out;
   }

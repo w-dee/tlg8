@@ -42,6 +42,7 @@ LABEL_VERSION = 1
 
 FEATURE_SET_RAW_PLUS_STATS_V1 = "raw_plus_stats_v1"
 FEATURE_SET_RAW_PLUS_STATS_V2 = "raw_plus_stats_v2"
+FEATURE_SET_RAW_PLUS_STATS_V3 = "raw_plus_stats_v2_tv1y_tv2y"
 
 BLOCK_W = 8
 BLOCK_H = 8
@@ -157,11 +158,34 @@ def _feature_names_raw_plus_stats_v2() -> list[str]:
     return names
 
 
+def _feature_names_raw_plus_stats_v3() -> list[str]:
+    names = _feature_names_raw_plus_stats_v1()
+    # reorder_tv_mean / reorder_tv2_mean は C++ 側（tlgconv dump）で計算した 8 次元×2 の特徴量。
+    # - reorder_tv_mean : mean(|Δ|)
+    # - reorder_tv2_mean: mean(Δ^2)
+    # クラス順は reorder の enum 値（0..7）と一致させる。
+    class_names = [
+        "hilbert",
+        "zigzag_diag",
+        "zigzag_antidiag",
+        "zigzag_horz",
+        "zigzag_vert",
+        "zigzag_nne_ssw",
+        "zigzag_nee_sww",
+        "zigzag_nww_see",
+    ]
+    names.extend([f"reorder_tv_mean_{i}_{name}" for i, name in enumerate(class_names)])
+    names.extend([f"reorder_tv2_mean_{i}_{name}" for i, name in enumerate(class_names)])
+    return names
+
+
 def _feature_dim(feature_set: str) -> int:
     if feature_set == FEATURE_SET_RAW_PLUS_STATS_V1:
         return len(_feature_names_raw_plus_stats_v1())
     if feature_set == FEATURE_SET_RAW_PLUS_STATS_V2:
         return len(_feature_names_raw_plus_stats_v2())
+    if feature_set == FEATURE_SET_RAW_PLUS_STATS_V3:
+        return len(_feature_names_raw_plus_stats_v3())
     raise ValueError(f"未対応の --feature-set: {feature_set}")
 
 
@@ -366,16 +390,55 @@ def _fill_features_raw_plus_stats_v1(dst_row: np.ndarray, row: dict[str, Any], w
 
 def _fill_features_raw_plus_stats_v2(dst_row: np.ndarray, row: dict[str, Any], work: _WorkBuffers) -> dict[str, Any]:
     idx_fields = _fill_features_raw_plus_stats_v1(dst_row, row, work=work)
-    tv = row.get("reorder_tv")
+    tv = row.get("reorder_tv_mean")
+    if tv is None:
+        # 後方互換：旧キー reorder_tv は reorder_tv_mean と同義
+        tv = row.get("reorder_tv")
     if tv is None:
         raise KeyError(
-            "training.all.jsonl に reorder_tv がありません。"
+            "training.all.jsonl に reorder_tv_mean（または reorder_tv）がありません。"
             "新しい tlgconv の dump（--tlg8-dump-training）で生成し直してください。"
         )
     if not isinstance(tv, list) or len(tv) != 8:
-        raise ValueError(f"reorder_tv の形式が不正です: type={type(tv)} len={len(tv) if isinstance(tv, list) else 'n/a'}")
+        raise ValueError(
+            f"reorder_tv_mean の形式が不正です: type={type(tv)} len={len(tv) if isinstance(tv, list) else 'n/a'}"
+        )
     offset = len(_feature_names_raw_plus_stats_v1())
     dst_row[offset : offset + 8] = np.asarray([float(x) for x in tv], dtype=np.float32)
+    return idx_fields
+
+
+def _fill_features_raw_plus_stats_v3(dst_row: np.ndarray, row: dict[str, Any], work: _WorkBuffers) -> dict[str, Any]:
+    idx_fields = _fill_features_raw_plus_stats_v1(dst_row, row, work=work)
+
+    tv1 = row.get("reorder_tv_mean")
+    if tv1 is None:
+        # 後方互換：旧キー reorder_tv は reorder_tv_mean と同義
+        tv1 = row.get("reorder_tv")
+    if tv1 is None:
+        raise KeyError(
+            "training.all.jsonl に reorder_tv_mean（または reorder_tv）がありません。"
+            "新しい tlgconv の dump（--tlg8-dump-training）で生成し直してください。"
+        )
+    if not isinstance(tv1, list) or len(tv1) != 8:
+        raise ValueError(
+            f"reorder_tv_mean の形式が不正です: type={type(tv1)} len={len(tv1) if isinstance(tv1, list) else 'n/a'}"
+        )
+
+    tv2 = row.get("reorder_tv2_mean")
+    if tv2 is None:
+        raise KeyError(
+            "training.all.jsonl に reorder_tv2_mean がありません。"
+            "新しい tlgconv の dump（--tlg8-dump-training）で生成し直してください。"
+        )
+    if not isinstance(tv2, list) or len(tv2) != 8:
+        raise ValueError(
+            f"reorder_tv2_mean の形式が不正です: type={type(tv2)} len={len(tv2) if isinstance(tv2, list) else 'n/a'}"
+        )
+
+    offset = len(_feature_names_raw_plus_stats_v1())
+    dst_row[offset : offset + 8] = np.asarray([float(x) for x in tv1], dtype=np.float32)
+    dst_row[offset + 8 : offset + 16] = np.asarray([float(x) for x in tv2], dtype=np.float32)
     return idx_fields
 
 
@@ -402,7 +465,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--feature-set",
         default=FEATURE_SET_RAW_PLUS_STATS_V1,
-        help=f"特徴量セット（{FEATURE_SET_RAW_PLUS_STATS_V1}, {FEATURE_SET_RAW_PLUS_STATS_V2}）",
+        help=(
+            "特徴量セット（"
+            f"{FEATURE_SET_RAW_PLUS_STATS_V1}, "
+            f"{FEATURE_SET_RAW_PLUS_STATS_V2}, "
+            f"{FEATURE_SET_RAW_PLUS_STATS_V3}"
+            "）"
+        ),
     )
     parser.add_argument("--force", action="store_true", help="出力ファイルを上書きします。")
     parser.add_argument("--dry-run", action="store_true", help="書き込みを行わず、検証と予定出力のみ表示します。")
@@ -449,6 +518,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         feature_names = _feature_names_raw_plus_stats_v1()
     elif feature_set == FEATURE_SET_RAW_PLUS_STATS_V2:
         feature_names = _feature_names_raw_plus_stats_v2()
+    elif feature_set == FEATURE_SET_RAW_PLUS_STATS_V3:
+        feature_names = _feature_names_raw_plus_stats_v3()
     else:
         raise ValueError(f"未対応の --feature-set: {feature_set}")
     if len(feature_names) != d:
@@ -529,6 +600,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 idx_fields = _fill_features_raw_plus_stats_v1(x[i], row, work=work)
             elif feature_set == FEATURE_SET_RAW_PLUS_STATS_V2:
                 idx_fields = _fill_features_raw_plus_stats_v2(x[i], row, work=work)
+            elif feature_set == FEATURE_SET_RAW_PLUS_STATS_V3:
+                idx_fields = _fill_features_raw_plus_stats_v3(x[i], row, work=work)
             else:
                 raise ValueError(f"未対応の --feature-set: {feature_set}")
 
@@ -565,6 +638,38 @@ def main(argv: Optional[list[str]] = None) -> int:
     _atomic_np_save(out_dir / "feature_mean.npy", mean)
     _atomic_np_save(out_dir / "feature_std.npy", std)
 
+    feature_layout: dict[str, Any] = {
+        "raw_rgb": {"dims": RAW_RGB_DIMS, "order": "y->x->rgb", "range": "[0,1]"},
+        "extra": {"names": ["block_w", "block_h"]},
+        "stats": {
+            "names": [
+                "mean_Y",
+                "var_Y",
+                "var_Cb",
+                "var_Cr",
+                "Gx_Y",
+                "Gy_Y",
+                "edge_density_Y",
+                "hf_energy_Y",
+                "hf_norm_Y",
+            ]
+        },
+    }
+    if feature_set == FEATURE_SET_RAW_PLUS_STATS_V2:
+        feature_layout["reorder_tv"] = {
+            "names": [n for n in feature_names if n.startswith("reorder_tv_")],
+            "definition": "各 reorder の走査順に沿った mean(|Δ|)（tlgconv 側で計算）",
+        }
+    if feature_set == FEATURE_SET_RAW_PLUS_STATS_V3:
+        feature_layout["reorder_tv_mean"] = {
+            "names": [n for n in feature_names if n.startswith("reorder_tv_mean_")],
+            "definition": "mean_abs_diff_per_step（= sum(|Δ|)/63, tlgconv 側で計算）",
+        }
+        feature_layout["reorder_tv2_mean"] = {
+            "names": [n for n in feature_names if n.startswith("reorder_tv2_mean_")],
+            "definition": "mean_squared_diff_per_step（= sum(Δ^2)/63, tlgconv 側で計算）",
+        }
+
     meta = {
         "schema": 1,
         "created_at": _now_iso(),
@@ -577,27 +682,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "label_name": "reorder",
         "reorder_classes": 8,
         "feature_names": feature_names,
-        "feature_layout": {
-            "raw_rgb": {"dims": RAW_RGB_DIMS, "order": "y->x->rgb", "range": "[0,1]"},
-            "extra": {"names": ["block_w", "block_h"]},
-            "stats": {
-                "names": [
-                    "mean_Y",
-                    "var_Y",
-                    "var_Cb",
-                    "var_Cr",
-                    "Gx_Y",
-                    "Gy_Y",
-                    "edge_density_Y",
-                    "hf_energy_Y",
-                    "hf_norm_Y",
-                ]
-            },
-            "reorder_tv": {
-                "names": [n for n in feature_names if n.startswith("reorder_tv_")],
-                "definition": "各 reorder の走査順に沿った mean(|Δ|)（tlgconv 側で計算）",
-            },
-        },
+        "feature_layout": feature_layout,
         "color_transform": {
             "note": "R/G/B は raw RGB を [0,1] に正規化した値",
             "Y": "0.299*R + 0.587*G + 0.114*B",
@@ -626,6 +711,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             "packed_index_jsonl": "index.jsonl",
         },
     }
+    if feature_set == FEATURE_SET_RAW_PLUS_STATS_V3:
+        meta["reorder_tv_mean"] = "mean_abs_diff_per_step"
+        meta["reorder_tv2_mean"] = "mean_squared_diff_per_step"
     _atomic_write_text(out_dir / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
 
     return 0

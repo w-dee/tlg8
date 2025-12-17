@@ -942,17 +942,30 @@ namespace tlg::v8::enc
               luma[yy * 8 + xx] = yv;
             }
           }
-          const auto reorder_tv = tlg::v8::enc::compute_reorder_tv_mean(luma);
-          write_json_string(ml_fp, "reorder_tv");
-          std::fputc(':', ml_fp);
-          std::fputc('[', ml_fp);
-          for (size_t i = 0; i < reorder_tv.size(); ++i)
+          const auto reorder_tv_mean = tlg::v8::enc::compute_reorder_tv_mean(luma);
+          const auto reorder_tv2_mean = tlg::v8::enc::compute_reorder_tv2_mean(luma);
+
+          auto write_float_array = [&](const char *key, const auto &arr)
           {
-            if (i > 0)
-              std::fputc(',', ml_fp);
-            std::fprintf(ml_fp, "%.6f", static_cast<double>(reorder_tv[i]));
-          }
-          std::fputc(']', ml_fp);
+            write_json_string(ml_fp, key);
+            std::fputc(':', ml_fp);
+            std::fputc('[', ml_fp);
+            for (size_t i = 0; i < arr.size(); ++i)
+            {
+              if (i > 0)
+                std::fputc(',', ml_fp);
+              std::fprintf(ml_fp, "%.6f", static_cast<double>(arr[i]));
+            }
+            std::fputc(']', ml_fp);
+          };
+
+          // 既存（平均 |Δ|）に加えて、平均 Δ^2 を追加する（Y のみ）。
+          // 互換性のため、旧キー reorder_tv も同じ内容で残す（= reorder_tv_mean）。
+          write_float_array("reorder_tv_mean", reorder_tv_mean);
+          std::fputc(',', ml_fp);
+          write_float_array("reorder_tv2_mean", reorder_tv2_mean);
+          std::fputc(',', ml_fp);
+          write_float_array("reorder_tv", reorder_tv_mean);
           std::fputc(',', ml_fp);
 
           auto write_candidate = [&](const char *key,

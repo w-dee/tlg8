@@ -30,6 +30,14 @@ namespace tlg::v8::enc
   std::array<float, kReorderPatternCount> compute_reorder_tv_mean(
       const std::array<float, kMaxBlockPixels> &luma);
 
+  // 8x8 ブロックの輝度（Luma）64値に対して、各リオーダーパターンの
+  // 「スキャン順の滑らかさ（Total Variation^2 の平均）」を計算する。
+  //
+  // 出力 reorder_tv2[i] は、ReorderPattern の enum 値（0..7）順に対応する。
+  // 値は「隣接差分 Δ の二乗の平均」（= sum(Δ^2)/63）で、スケールは入力 luma の二乗に相当する。
+  std::array<float, kReorderPatternCount> compute_reorder_tv2_mean(
+      const std::array<float, kMaxBlockPixels> &luma);
+
   // カラーフィルター後の係数を指定した走査順へ並び替える。
   void reorder_to_scan(component_colors &colors,
                        uint32_t components,
