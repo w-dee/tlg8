@@ -36,7 +36,9 @@ TLG8 reorder（8クラス）分類器のベースライン学習スクリプト�
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import os
 import random
 import subprocess
@@ -68,6 +70,72 @@ class _Logger:
         line = f"[{_now_ts()}] {msg}"
         print(line, flush=True)
         self._fp.write(line + "\n")
+        self._fp.flush()
+
+
+def _is_rank0() -> bool:
+    """
+    分散実行時にログが多重出力されるのを避けるための簡易判定。
+    このスクリプトは基本的に単一プロセス想定だが、環境変数や torch.distributed 初期化済み
+    の場合は rank0 のみがログ/CSV を書く。
+    """
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank()) == 0
+    except Exception:
+        pass
+    rank = os.environ.get("RANK")
+    if rank is None:
+        return True
+    try:
+        return int(rank) == 0
+    except ValueError:
+        return True
+
+
+def _fmt_float3(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        x = float(value)
+    except Exception:
+        return ""
+    if not math.isfinite(x):
+        return ""
+    return f"{x:.3f}"
+
+
+def _fmt_lr(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        x = float(value)
+    except Exception:
+        return ""
+    if not math.isfinite(x):
+        return ""
+    # lr は 0.000 になりやすいので科学表記にする（小数点以下 3 桁）。
+    return f"{x:.3e}"
+
+
+class CsvLogger:
+    def __init__(self, path: Path, fieldnames: list[str]) -> None:
+        self._path = path
+        self._fieldnames = fieldnames
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        need_header = (not self._path.exists()) or self._path.stat().st_size == 0
+        self._fp = self._path.open("a", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(self._fp, fieldnames=self._fieldnames, extrasaction="ignore")
+        if need_header:
+            self._writer.writeheader()
+            self._fp.flush()
+
+    def close(self) -> None:
+        self._fp.close()
+
+    def write_row(self, row: dict[str, Any]) -> None:
+        normalized: dict[str, Any] = {k: row.get(k, "") for k in self._fieldnames}
+        self._writer.writerow(normalized)
         self._fp.flush()
 
 
@@ -513,6 +581,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="TLG8 reorder(8-class) MLP trainer")
     p.add_argument("--data-dir", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--log-csv", type=Path, default=None, help="学習過程のCSVログを追記保存（未指定なら無効）")
 
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=8192)
@@ -559,6 +628,7 @@ def main() -> int:
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     logger = _Logger(out_dir / "train.log")
+    csv_logger: Optional[CsvLogger] = None
     try:
         _seed_everything(int(args.seed))
         device = _resolve_device(args.device)
@@ -739,11 +809,34 @@ def main() -> int:
                 logger.log("WARN: metrics.json の読み込みに失敗（新規作成します）")
                 all_metrics = {"epochs": []}
 
+        if args.log_csv is not None and _is_rank0():
+            csv_logger = CsvLogger(
+                Path(args.log_csv),
+                fieldnames=[
+                    "epoch",
+                    "lr",
+                    "time_sec",
+                    "train_loss",
+                    "train_acc1",
+                    "train_acc3",
+                    "train_acc5",
+                    "val_loss",
+                    "val_acc1",
+                    "val_acc3",
+                    "val_acc5",
+                    "best_metric_name",
+                    "best_metric",
+                    "is_best",
+                ],
+            )
+            logger.log(f"csv_log: {Path(args.log_csv)}")
+
         early_stop_patience = int(args.early_stop_patience)
         no_improve_epochs = 0
 
         for epoch in range(start_epoch, int(args.epochs) + 1):
             logger.log(f"epoch {epoch}/{int(args.epochs)}")
+            epoch_t0 = time.perf_counter()
             # 毎エポックの巨大インデックスシャッフルは避け、バッチ順序だけを入れ替える。
             train_sampler.set_epoch(int(epoch))
             train_stats = _train_one_epoch(
@@ -777,6 +870,8 @@ def main() -> int:
                 f"acc3={val_stats['acc3']*100:.2f}% acc5={val_stats['acc5']*100:.2f}%"
             )
 
+            epoch_time_sec = time.perf_counter() - epoch_t0
+
             all_metrics["epochs"].append(
                 {
                     "epoch": int(epoch),
@@ -805,6 +900,27 @@ def main() -> int:
             else:
                 no_improve_epochs += 1
 
+            if csv_logger is not None:
+                lr = float(optimizer.param_groups[0].get("lr", float(args.lr)))
+                csv_logger.write_row(
+                    {
+                        "epoch": int(epoch),
+                        "lr": _fmt_lr(lr),
+                        "time_sec": _fmt_float3(epoch_time_sec),
+                        "train_loss": _fmt_float3(train_stats.get("loss")),
+                        "train_acc1": _fmt_float3(train_stats.get("acc1")),
+                        "train_acc3": _fmt_float3(train_stats.get("acc3")),
+                        "train_acc5": _fmt_float3(train_stats.get("acc5")),
+                        "val_loss": _fmt_float3(val_stats.get("loss")),
+                        "val_acc1": _fmt_float3(val_stats.get("acc1")),
+                        "val_acc3": _fmt_float3(val_stats.get("acc3")),
+                        "val_acc5": _fmt_float3(val_stats.get("acc5")),
+                        "best_metric_name": "val_acc3",
+                        "best_metric": _fmt_float3(val_acc3),
+                        "is_best": 1 if improved else 0,
+                    }
+                )
+
             ckpt_last = {
                 "epoch": int(epoch),
                 "feature_dim": int(d),
@@ -827,6 +943,8 @@ def main() -> int:
         logger.log("done")
         return 0
     finally:
+        if csv_logger is not None:
+            csv_logger.close()
         logger.close()
 
 
