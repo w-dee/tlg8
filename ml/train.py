@@ -644,6 +644,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=8192)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument(
+        "--tv2-weight-decay",
+        type=float,
+        default=None,
+        help="tvheads 時の tv2 ブランチ(tv2_fc.weight)用 weight decay（未指定なら --weight-decay と同じ）",
+    )
     p.add_argument("--hidden", type=int, default=2048)
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--val-ratio", type=float, default=0.1)
@@ -681,6 +687,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    tv2_wd = args.weight_decay if args.tv2_weight_decay is None else float(args.tv2_weight_decay)
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -775,13 +782,33 @@ def main() -> int:
             ).to(device)
         else:
             raise ValueError(f"unknown --model: {args.model}")
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=float(args.lr),
-            weight_decay=float(args.weight_decay),
-        )
+        if args.model == "tvheads":
+            tv2_params = []
+            other_params = []
+            for name, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if name.endswith("tv2_fc.weight"):
+                    tv2_params.append(p)
+                else:
+                    other_params.append(p)
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": other_params, "weight_decay": float(args.weight_decay)},
+                    {"params": tv2_params, "weight_decay": float(tv2_wd)},
+                ],
+                lr=float(args.lr),
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=float(args.lr),
+                weight_decay=float(args.weight_decay),
+            )
 
         logger.log(f"optimizer: AdamW lr={float(args.lr):.8g} wd={float(args.weight_decay):.8g}")
+        if args.model == "tvheads":
+            logger.log(f"tv2_weight_decay: {float(tv2_wd):.8g}")
         if int(args.early_stop_patience) > 0:
             logger.log(f"early_stop_patience: {int(args.early_stop_patience)}")
         else:
