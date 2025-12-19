@@ -438,7 +438,9 @@ def _fill_features_raw_plus_stats_v3(dst_row: np.ndarray, row: dict[str, Any], w
 
     offset = len(_feature_names_raw_plus_stats_v1())
     dst_row[offset : offset + 8] = np.asarray([float(x) for x in tv1], dtype=np.float32)
-    dst_row[offset + 8 : offset + 16] = np.asarray([float(x) for x in tv2], dtype=np.float32)
+    tv2_arr = np.asarray(tv2, dtype=np.float32)
+    tv2_arr = np.log1p(np.maximum(tv2_arr, 0.0))
+    dst_row[offset + 8 : offset + 16] = tv2_arr
     return idx_fields
 
 
