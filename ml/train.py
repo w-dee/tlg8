@@ -102,7 +102,7 @@ def _fmt_float3(value: Any) -> str:
         return ""
     if not math.isfinite(x):
         return ""
-    return f"{x:.3f}"
+    return f"{x:.6f}"
 
 
 def _fmt_lr(value: Any) -> str:
