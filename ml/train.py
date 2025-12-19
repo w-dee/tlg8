@@ -348,6 +348,59 @@ class MLPReorderClassifier(nn.Module):
         return self.fc3(x)
 
 
+class MLPReorderClassifierTvHeads(nn.Module):
+    """
+    特徴量末尾の tv1(8) / tv2(8) を分離して扱う版。
+
+    前提:
+      - 入力 x: [B, D]
+      - 末尾 16 次元が tv1(8) + tv2(8)（この順）
+      - それ以外を base としてまとめて扱う
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden: int,
+        dropout: float,
+        tv_dim: int = 8,
+        base_head: int = 256,
+        tv_head: int = 64,
+    ) -> None:
+        super().__init__()
+        if in_dim < tv_dim * 2:
+            raise ValueError(f"in_dim が小さすぎます: in_dim={in_dim} tv_dim={tv_dim}")
+        self.tv_dim = int(tv_dim)
+        self.base_dim = int(in_dim - tv_dim * 2)
+
+        self.base_fc = nn.Linear(self.base_dim, int(base_head))
+        self.tv1_fc = nn.Linear(self.tv_dim, int(tv_head))
+        self.tv2_fc = nn.Linear(self.tv_dim, int(tv_head))
+        self.drop = nn.Dropout(p=float(dropout))
+
+        trunk_in = int(base_head) + int(tv_head) * 2
+        self.fc1 = nn.Linear(trunk_in, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fc3 = nn.Linear(hidden, 8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d0 = self.base_dim
+        d1 = d0 + self.tv_dim
+
+        x_base = x[:, :d0]
+        x_tv1 = x[:, d0:d1]
+        x_tv2 = x[:, d1 : d1 + self.tv_dim]
+
+        h_base = self.drop(F.gelu(self.base_fc(x_base)))
+        h_tv1 = self.drop(F.gelu(self.tv1_fc(x_tv1)))
+        h_tv2 = self.drop(F.gelu(self.tv2_fc(x_tv2)))
+
+        h = torch.cat([h_base, h_tv1, h_tv2], dim=1)
+        h = self.drop(F.gelu(self.fc1(h)))
+        h = self.drop(F.gelu(self.fc2(h)))
+        return self.fc3(h)
+
+
 @torch.no_grad()
 def _acc_topk(logits: torch.Tensor, y: torch.Tensor, k: int) -> int:
     if k <= 0:
@@ -583,6 +636,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--log-csv", type=Path, default=None, help="学習過程のCSVログを追記保存（未指定なら無効）")
 
+    p.add_argument("--model", choices=["baseline", "tvheads"], default="baseline")
+    p.add_argument("--tvhead-base", type=int, default=256)
+    p.add_argument("--tvhead-tv", type=int, default=64)
+
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=8192)
     p.add_argument("--lr", type=float, default=5e-5)
@@ -705,7 +762,19 @@ def main() -> int:
             device=device,
         )
 
-        model = MLPReorderClassifier(in_dim=d, hidden=int(args.hidden), dropout=float(args.dropout)).to(device)
+        if args.model == "baseline":
+            model = MLPReorderClassifier(in_dim=d, hidden=int(args.hidden), dropout=float(args.dropout)).to(device)
+        elif args.model == "tvheads":
+            model = MLPReorderClassifierTvHeads(
+                in_dim=d,
+                hidden=int(args.hidden),
+                dropout=float(args.dropout),
+                tv_dim=8,
+                base_head=int(args.tvhead_base),
+                tv_head=int(args.tvhead_tv),
+            ).to(device)
+        else:
+            raise ValueError(f"unknown --model: {args.model}")
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=float(args.lr),
