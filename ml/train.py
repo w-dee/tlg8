@@ -93,7 +93,7 @@ def _is_rank0() -> bool:
         return True
 
 
-def _fmt_float3(value: Any) -> str:
+def _fmt_float6(value: Any) -> str:
     if value is None:
         return ""
     try:
@@ -1002,17 +1002,17 @@ def main() -> int:
                     {
                         "epoch": int(epoch),
                         "lr": _fmt_lr(lr),
-                        "time_sec": _fmt_float3(epoch_time_sec),
-                        "train_loss": _fmt_float3(train_stats.get("loss")),
-                        "train_acc1": _fmt_float3(train_stats.get("acc1")),
-                        "train_acc3": _fmt_float3(train_stats.get("acc3")),
-                        "train_acc5": _fmt_float3(train_stats.get("acc5")),
-                        "val_loss": _fmt_float3(val_stats.get("loss")),
-                        "val_acc1": _fmt_float3(val_stats.get("acc1")),
-                        "val_acc3": _fmt_float3(val_stats.get("acc3")),
-                        "val_acc5": _fmt_float3(val_stats.get("acc5")),
+                        "time_sec": _fmt_float6(epoch_time_sec),
+                        "train_loss": _fmt_float6(train_stats.get("loss")),
+                        "train_acc1": _fmt_float6(train_stats.get("acc1")),
+                        "train_acc3": _fmt_float6(train_stats.get("acc3")),
+                        "train_acc5": _fmt_float6(train_stats.get("acc5")),
+                        "val_loss": _fmt_float6(val_stats.get("loss")),
+                        "val_acc1": _fmt_float6(val_stats.get("acc1")),
+                        "val_acc3": _fmt_float6(val_stats.get("acc3")),
+                        "val_acc5": _fmt_float6(val_stats.get("acc5")),
                         "best_metric_name": "val_acc3",
-                        "best_metric": _fmt_float3(val_acc3),
+                        "best_metric": _fmt_float6(val_acc3),
                         "is_best": 1 if improved else 0,
                     }
                 )
