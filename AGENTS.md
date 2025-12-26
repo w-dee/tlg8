@@ -1,168 +1,318 @@
-##  natural language usage
+# AGENTS.md — TLG8 ML Candidate-Reduction Pipeline (CODEX)
 
- - 日本語で回答してください
- - ソースコード中のコメントは日本語
+This document defines a **fully-automatable** machine-learning pipeline for TLG8.
 
-# TLG8 encoder project
+## Goal
 
-## about building
+TLG8 ML is **NOT** optimizing compression ratio directly. The purpose is:
 
- - ビルドコマンドは `mkdir -p build && cmake --build build`
+* Use ML to **narrow encoder parameter candidates to top-N**
+* Reduce **total wall-clock encode time** by reducing exhaustive search
+
+Primary metrics:
+
+* **Accuracy:** block-micro hit-rate (see below)
+* **Speed proxy:** minimize **#params** (model parameter count)
+
+## Repository Layout (MUST)
+
+* All scripts go under: `ml/`
+* All run outputs, artifacts, and logs go under: `ml/runs/`
+
+### Required output structure per run
+
+Each run must create a unique directory:
+
+* `ml/runs/<run_id>/`
+
+  * `config.json` (all knobs used)
+  * `progress.jsonl` (append-only; one line per trial)
+  * `best.json` (current best summary)
+  * `artifacts/`
+
+    * trained model weights + exported inference bundles
+    * feature pipeline metadata
+    * evaluation reports
+  * `splits/`
+
+    * split manifest (fixed, reproducible)
+
+### Progress logging and resume (MUST)
+
+The agent must be robust against API stops or manual pauses.
+
+* Write an **append-only** trial log at: `ml/runs/<run_id>/progress.jsonl`
+* Each trial must record:
+
+  * trial_id, timestamp
+  * git commit hash
+  * dataset identifiers and counts
+  * feature set specification (selected raw features + derived features)
+  * MLP architecture for each head
+  * training hyperparameters (seed, max_epochs, patience, lr, etc.)
+  * valid loss (for early stopping), valid hit-rate
+  * total #params per head and total
+  * any failure mode / exception summaries
+* On start, the pipeline must:
+
+  * locate an existing `ml/runs/<run_id>/progress.jsonl` if resuming
+  * load the **best** results so far
+  * continue from the **next** trial_id
+
+## Data Sources
+
+Input artifacts are produced by the C++ extractor and pack step.
+
+* `training.all.jsonl` (concatenated; contains block features + best/second metadata)
+* `labels.all.bin` (LabelRecord array; fixed-order)
+* `index.jsonl` (image offsets)
+* `labels.meta.json` (integrity metadata)
+
+**Order guarantee:** `training.all.jsonl` and `labels.all.bin` are aligned in identical block order.
+
+### LabelRecord format
+
+`labels` is `int16[12]`, unset = `-1`.
+
+| idx | meaning                 |
+| --: | ----------------------- |
+|   0 | best_predictor          |
+|   1 | best_filter_perm        |
+|   2 | best_filter_primary     |
+|   3 | best_filter_secondary   |
+|   4 | best_reorder            |
+|   5 | best_interleave         |
+|   6 | second_predictor        |
+|   7 | second_filter_perm      |
+|   8 | second_filter_primary   |
+|   9 | second_filter_secondary |
+|  10 | second_reorder          |
+|  11 | second_interleave       |
+
+Filter split (matches `split_filter()`):
+
+* `perm      = ((code >> 4) & 0x7) % 6`
+* `primary   = ((code >> 2) & 0x3) % 4`
+* `secondary = (code & 0x3) % 4`
+
+### Bits sidecar (MUST)
+
+Create and use:
+
+* `ml/runs/<run_id>/dataset/bits.all.npy`
+
+Spec:
+
+* dtype: `uint64`
+* shape: `[N, 2]`
+* col0: `bits_best`
+* col1: `bits_second`
+* Block order MUST match `labels.all.bin`.
+
+## Dataset Filtering Rules (MUST)
+
+A block is eligible iff:
+
+* `block_size == [8, 8]`
+* `best != null` and `second != null`
+* `second` differs from `best` (the full (predictor, filter, reorder, interleave) must not be identical)
+* `components` can be 3 or 4, but:
+
+  * for `components==4`, drop alpha and use RGB only
+
+Entropy is NOT part of ML search:
+
+* `entropy` is fixed to **Plain (0)**
+
+## Feature Policy
+
+### Pixels
+
+* Allowed: use raw `pixels` as-is.
+* Flatten order is `y → x → comp`.
+
+  * components==3: `RGBRGB...`
+  * components==4: `ARGBARGB...` (alpha dropped; keep RGB)
+* Normalize: `pixel_float = pixel_uint8 / 255.0`.
+
+### Additional features
+
+* Use non-pixel numeric features present in JSONL (e.g., `reorder_tv_mean`, `reorder_tv2_mean`, etc.).
+
+### Feature search (agent allowed)
+
+The agent is allowed to:
+
+* select/drop raw feature columns
+* apply **lightweight** derived transforms only:
+
+  * unary: log1p, sqrt, square, abs, clip
+  * limited pairwise: sum/diff/product/ratio
+  * quantile binning
+
+Hard constraint:
+
+* total feature dimension after derivation must be **≤ 256** (excluding pixels; pixels are fixed 192)
+
+## Model Architecture
+
+### Multi-stage decision flow (fixed)
+
+`predictor → cf_perm → cf_primary → cf_secondary → reorder → interleave`
+
+Heads have class counts:
+
+* predictor: 8
+* cf_perm: 6
+* cf_primary: 4
+* cf_secondary: 4
+* reorder: 8
+* interleave: 2
+
+### Beam widths (fixed)
+
+* predictor: keep top **4**
+* cf_perm: keep top **4**
+* cf_primary: keep top **3**
+* cf_secondary: keep top **2**
+* reorder: keep top **4**
+* interleave: keep top **2**
+
+Final candidate count: `4 × (4×3×2) × 4 × 2 = 768` full tuples.
+
+### Models (fixed)
+
+* Each head is an independent **MLP**.
+* Each head outputs logits for all classes in one forward pass.
+* Tie-break: deterministic by class id ascending.
+
+### Optimization objective
+
+* Primary: meet accuracy constraint
+* Secondary: minimize total `#params` across all heads
+
+## Training Targets (Projection)
+
+### Scalar minimized for projection
+
+Define:
+
+* `score := bits_best` (from `bits.all.npy[:,0]`)
+
+`margin := bits_second - bits_best` is optional for analysis only.
+
+### Best-case projection (fixed)
+
+For each head and each class value `v`, define projected score:
+
+* `proj_score_head[v] = min(score | head_value == v)`
+
+This is computed independently per head (no conditional projection).
+
+### Head ground-truth set per sample
+
+For each head, the positive set is:
+
+* the **top-2** class values with smallest `proj_score_head[v]` (rank-based; no threshold)
+
+### Loss (fixed)
+
+Soft-target cross entropy:
+
+* Assign 0.5 / 0.5 to the two positive classes; 0 to others.
+
+## Train/Validation Split (fixed)
+
+* Split unit: **block**
+* Random split with fixed seed:
+
+  * train 90%
+  * valid 10%
+* Split must be saved to `ml/runs/<run_id>/splits/split.json` for reproducibility.
+
+## Early Stopping and Model Selection
+
+* Early stopping monitors: **valid CE loss**
+* Best model selection uses: **valid hit-rate**
+
+## Inference Scoring (fixed)
+
+### Combine head logits
+
+For a full tuple, combine by simple sum:
+
+`S(full) = S_pred[p] + S_perm[perm] + S_primary[primary] + S_secondary[secondary] + S_reorder[r] + S_interleave[i]`
+
+Higher is better.
+
+### Output
+
+Return top-3 full tuples (predictor, filter_code 0–95, reorder, interleave).
+
+Filter code is reconstructed from (perm, primary, secondary) using the inverse mapping consistent with `split_filter()` (implementation detail).
+
+Entropy is fixed to Plain.
+
+## Evaluation
+
+### Block-micro hit-rate (primary metric)
+
+A prediction is a hit if:
+
+* among the returned **top-3 full tuples**, at least one matches either of the block’s **true top-2** full tuples.
+
+### Hard constraint
+
+* Valid hit-rate must be **≥ 90%**.
+
+## Trial Definition (fixed)
+
+One **trial** means:
+
+* choose a feature pipeline (≤256 derived dims + pixels)
+* choose MLP architectures for all heads (layers/widths)
+* train all heads with early stopping
+* evaluate hit-rate and #params
+
+## Global Stopping Condition (failure)
+
+If the best valid hit-rate fails to improve by **≥ 0.1%** for **10** consecutive trials:
+
+* stop the search and mark the plan as failed.
+
+## Implementation Tasks (for CODEX)
+
+1. `ml/make_bits_sidecar.py`
+
+   * Input: `training.all.jsonl`
+   * Output: `bits.all.npy` in run dataset dir
+
+2. `ml/dataset_builder.py`
+
+   * Input: `training.all.jsonl`, `labels.all.bin`, `bits.all.npy`
+   * Output: tensors/arrays suitable for training
+   * Enforce filtering rules
+
+3. `ml/train_rankers.py`
+
+   * Implements trial loop, feature search, MLP architecture search (bounded)
+   * Writes progress logs and supports resume
+
+4. `ml/infer_rankers.py`
+
+   * Loads trained head models
+   * Applies beam search
+   * Returns top-3 full tuples
+
+5. `ml/eval_rankers.py`
+
+   * Computes block-micro hit-rate
+
+## Notes
+
+* Keep every run fully reproducible (fixed seed and saved split).
+* Never overwrite artifacts; create new run_id if configuration changes materially.
+* Always write append-only logs for recoverability.
 
 
-## about encoder round-trip testing
-
- - テスト画像に対してエンコード→デコードを行い、元の画像と一致するか(一致すれば成功)をテストするラウンドトリップテストは → `python test/run_roundtrip.py --tlgconv build/tlgconv --images test/images`  このテストは数分かかります。気長に待ってね。
-
-
-# TLG8 Machine Learning Design Intent
-
-## 1. この機械学習の目的（最重要）
-
-TLG8 における機械学習の目的は、
-
-**圧縮率を最大化することそのものではない。**
-**また、ニューラルネットワーク単体の推論精度（top-1 accuracy）を最大化することでもない。**
-
-この機械学習の唯一の目的は：
-
-> **TLG8 のエンコード時に必要な「パラメータ総当たり試行数」を削減し、  
-> トータルのエンコード時間を短縮すること**
-
-である。
-
----
-
-## 2. 基本方針（重要な判断軸）
-
-### 2.1 許容されるトレードオフ
-
-以下は **明確に許容される**：
-
-- 前処理（C++ エクストラクター）が多少重くなること  
-  **ただし** それによって：
-  - NN の推論精度（特に top-N）が向上し
-  - 試行すべきエンコードパラメータ数が減り
-  - 結果として **全体のエンコード時間が短縮される場合**
-
-このプロジェクトでは、
-
-> **「前処理が重い = 悪」ではない**  
-> **「トータルで速くなる = 勝ち」**
-
-という評価基準を採用する。
-
----
-
-### 2.2 NN の役割
-
-ニューラルネットワークは：
-
-- 「最適な圧縮結果を直接出力する存在」ではない
-- 「エンコードパラメータ空間を探索するためのガイド」である
-
-具体的には：
-
-- 入力：8×8 ブロック由来の特徴量
-- 出力：  
-  - reorder などの **エンコードパラメータ候補の順位（ランキング）**
-- 利用方法：
-  - 上位 N 個のみを実際の TLG8 エンコードで試す
-
-したがって、
-
-- **top-3 / top-5 精度が top-1 より重要**
-- 「ほぼ正解に近い候補を早く出す」ことが最優先
-
----
-
-## 3. ラベル生成と特徴量生成の分離（設計上の重要点）
-
-### 3.1 ラベル（正解）の性質
-
-- ラベルは「現状の TLG8 実装」に基づく
-- 各ブロックについて：
-  - 全エンコードパラメータを総当たり
-  - 最も圧縮結果が良いパラメータを正解ラベルとする
-- この処理は **極めて計算コストが高い**
-
-### 3.2 特徴量の性質
-
-- 特徴量は主に：
-  - 8×8 ピクセルブロック
-  - その統計量・周波数特性・エッジ特性など
-- ラベル生成と比べて **計算コストは低い**
-- 特徴設計は頻繁に変更・実験される
-
-### 3.3 設計方針
-
-そのため、
-
-- **labels と features は完全に独立して生成できる設計とする**
-- 同一ブロックに対して：
-  - 重い label 生成は「なるべく一度だけ」
-  - 軽い feature 生成は「何度でも作り直せる」
-
-この分離は **最適化・実験速度・コード理解性** のために必須である。
-
----
-
-## 4. エクストラクター設計に関する指針
-
-### 4.1 C++ エクストラクターの役割
-
-- 数千〜数万枚の画像
-- 数百万〜数千万ブロック
-を扱うため、エクストラクターは **C++ 実装を前提**とする。
-
-### 4.2 特徴量の段階的設計（Tier 概念）
-
-特徴量は計算コストに応じて段階化する：
-
-- Tier0：  
-  - 極めて軽量（平均・分散・簡単な差分など）
-- Tier1：  
-  - 中程度（8×8 DCT など）
-- Tier2：  
-  - 重いが精度向上が期待できる（簡易エンコード結果など）
-
-どの Tier を使うかは **実験で決める**。  
-設計段階で「重いから却下」はしない。
-
----
-
-## 5. 機械学習コードに対する姿勢（重要）
-
-このプロジェクトでは：
-
-- 実装速度のために Codex / LLM を利用することを許可する
-- しかし：
-  - **コードの意味を作者自身が理解できること**
-  - **後から読み直して追跡できること**
-を最優先とする
-
-そのため、
-
-- 複雑な抽象化
-- 過度な自動生成コード
-- 意図が読み取れないトリック
-
-は避ける。
-
-**「少し遅くても、読めるコード」**  
-**「1年後の自分が理解できる設計」**  
-をこのリポジトリの原則とする。
-
----
-
-## 6. 成功の定義
-
-この機械学習が成功したと言える条件は：
-
-- NN の精度指標が改善したことではなく
-- **TLG8 エンコード全体の wall-clock time が短縮されたこと**
-
-である。
-
-モデル・特徴量・損失関数・前処理は、
-この目的に資する限りにおいてのみ評価される。
+* 元画像から 生成した label-cache と training-json は ml/runs/ の下にあります。
