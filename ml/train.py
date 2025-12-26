@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TLG8 reorder（8クラス）分類器のベースライン学習スクリプト（最小・素直な MLP）。
+TLG8 のマルチタスク分類器（reorder/predictor/color_filter/interleave）学習スクリプト。
 
 目的:
   - 圧縮率や top-1 の最大化ではなく、エンコード時の試行回数削減に繋がる top-K 精度を確認する
@@ -9,6 +9,11 @@ TLG8 reorder（8クラス）分類器のベースライン学習スクリプト�
 入力（--data-dir）:
   - features.npy            float32 [N, D]  （推奨: np.load(..., mmap_mode="r") で参照）
   - labels_reorder.npy      int64   [N]     （reorder クラス 0..7）
+  - labels_predictor.npy    int64   [N]     （predictor クラス 0..7）
+  - labels_cf_perm.npy      int64   [N]     （color filter perm 0..5）
+  - labels_cf_primary.npy   int64   [N]     （color filter primary 0..3）
+  - labels_cf_secondary.npy int64   [N]     （color filter secondary 0..3）
+  - labels_interleave.npy   int64   [N]     （interleave 0/1）
   - meta.json               特徴量仕様（任意。存在すれば保存する）
   - feature_mean.npy / feature_std.npy （任意。存在すれば z-score 正規化に使用）
 
@@ -53,6 +58,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
+
+TASK_LABEL_FILES = {
+    "predictor": "labels_predictor.npy",
+    "cf_perm": "labels_cf_perm.npy",
+    "cf_primary": "labels_cf_primary.npy",
+    "cf_secondary": "labels_cf_secondary.npy",
+    "reorder": "labels_reorder.npy",
+    "interleave": "labels_interleave.npy",
+}
+TASK_CLASS_COUNTS = {
+    "predictor": 8,
+    "cf_perm": 6,
+    "cf_primary": 4,
+    "cf_secondary": 4,
+    "reorder": 8,
+    "interleave": 2,
+}
+TASK_ACC_KS = {
+    "predictor": (1, 3, 5),
+    "cf_perm": (1, 3),
+    "cf_primary": (1,),
+    "cf_secondary": (1,),
+    "reorder": (1, 3, 5),
+    "interleave": (1,),
+}
+TASK_BEST_K = {
+    "predictor": 3,
+    "cf_perm": 3,
+    "cf_primary": 1,
+    "cf_secondary": 1,
+    "reorder": 3,
+    "interleave": 1,
+}
 
 
 def _now_ts() -> str:
@@ -116,6 +154,58 @@ def _fmt_lr(value: Any) -> str:
         return ""
     # lr は 0.000 になりやすいので科学表記にする（小数点以下 3 桁）。
     return f"{x:.3e}"
+
+
+def _parse_tasks(arg: Optional[str]) -> list[str]:
+    if arg is None:
+        return ["reorder"]
+    raw = [s.strip() for s in arg.split(",") if s.strip()]
+    if not raw:
+        return ["reorder"]
+
+    tasks: list[str] = []
+    for name in raw:
+        if name == "cf":
+            for t in ("cf_perm", "cf_primary", "cf_secondary"):
+                if t not in tasks:
+                    tasks.append(t)
+            continue
+        if name not in TASK_LABEL_FILES:
+            raise ValueError(f"未対応のタスク名です: {name}")
+        if name not in tasks:
+            tasks.append(name)
+
+    if not tasks:
+        tasks = ["reorder"]
+    return tasks
+
+
+def _parse_loss_weights(arg: Optional[str], tasks: list[str]) -> dict[str, float]:
+    weights = {t: 1.0 for t in tasks}
+    if arg is None:
+        return weights
+    raw = [s.strip() for s in arg.split(",") if s.strip()]
+    for token in raw:
+        if "=" not in token:
+            raise ValueError(f"--loss-weights の形式が不正です: {token} (name=value 形式)")
+        name, value = token.split("=", 1)
+        name = name.strip()
+        value = float(value.strip())
+        if name == "cf":
+            for t in ("cf_perm", "cf_primary", "cf_secondary"):
+                if t in weights:
+                    weights[t] = value
+            continue
+        if name not in weights:
+            raise ValueError(f"--loss-weights に未対応のタスク名があります: {name}")
+        weights[name] = value
+    return weights
+
+
+def _primary_task(tasks: list[str]) -> str:
+    if "reorder" in tasks:
+        return "reorder"
+    return tasks[0]
 
 
 class CsvLogger:
@@ -281,7 +371,7 @@ def _prepare_split(
     return paths
 
 
-class ReorderBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
+class MultiTaskBatchDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
     """
     1アイテム = 1バッチ（まとめて memmap を index する）として返す Dataset。
 
@@ -292,7 +382,7 @@ class ReorderBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
         x: np.ndarray,
-        y: np.ndarray,
+        labels: dict[str, np.ndarray],
         batches: list[np.ndarray],
         mean: Optional[np.ndarray],
         std: Optional[np.ndarray],
@@ -300,12 +390,13 @@ class ReorderBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     ) -> None:
         if x.ndim != 2:
             raise ValueError(f"features.npy は 2次元である必要があります: shape={x.shape}")
-        if y.ndim != 1:
-            raise ValueError(f"labels_reorder.npy は 1次元である必要があります: shape={y.shape}")
-        if x.shape[0] != y.shape[0]:
-            raise ValueError(f"N が一致しません: X={x.shape} y={y.shape}")
+        for name, y in labels.items():
+            if y.ndim != 1:
+                raise ValueError(f"labels_{name} は 1次元である必要があります: shape={y.shape}")
+            if x.shape[0] != y.shape[0]:
+                raise ValueError(f"N が一致しません: X={x.shape} labels_{name}={y.shape}")
         self.x = x
-        self.y = y
+        self.labels = labels
         self.batches = batches
 
         # 正規化は Dataset 内（CPU）では行わない。
@@ -324,28 +415,38 @@ class ReorderBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     def __len__(self) -> int:
         return len(self.batches)
 
-    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         base_idx = self.batches[i]
         feats_np = np.asarray(self.x[base_idx], dtype=np.float32)
         feats = torch.from_numpy(feats_np)
 
-        labs_np = np.asarray(self.y[base_idx], dtype=np.int64)
-        labs = torch.from_numpy(labs_np)
-        return feats, labs
+        labels: dict[str, torch.Tensor] = {}
+        for name, arr in self.labels.items():
+            labs_np = np.asarray(arr[base_idx], dtype=np.int64)
+            labels[name] = torch.from_numpy(labs_np)
+        return feats, labels
 
 
 class MLPReorderClassifier(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, dropout: float) -> None:
+    def __init__(self, in_dim: int, hidden: int, dropout: float, head_dims: dict[str, int]) -> None:
         super().__init__()
         self.fc1 = nn.Linear(in_dim, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
-        self.fc3 = nn.Linear(hidden, 8)
         self.drop = nn.Dropout(p=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.drop(F.gelu(self.fc1(x)))
-        x = self.drop(F.gelu(self.fc2(x)))
-        return self.fc3(x)
+        reorder_dim = head_dims.get("reorder", 8)
+        self.fc3 = nn.Linear(hidden, reorder_dim)
+        self.heads = nn.ModuleDict(
+            {name: nn.Linear(hidden, dim) for name, dim in head_dims.items() if name != "reorder"}
+        )
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        h = self.drop(F.gelu(self.fc1(x)))
+        h = self.drop(F.gelu(self.fc2(h)))
+        out = {"reorder": self.fc3(h)}
+        for name, head in self.heads.items():
+            out[name] = head(h)
+        return out
 
 
 class MLPReorderClassifierTvHeads(nn.Module):
@@ -363,6 +464,7 @@ class MLPReorderClassifierTvHeads(nn.Module):
         in_dim: int,
         hidden: int,
         dropout: float,
+        head_dims: dict[str, int],
         tv_dim: int = 8,
         base_head: int = 256,
         tv_head: int = 64,
@@ -381,9 +483,13 @@ class MLPReorderClassifierTvHeads(nn.Module):
         trunk_in = int(base_head) + int(tv_head) * 2
         self.fc1 = nn.Linear(trunk_in, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
-        self.fc3 = nn.Linear(hidden, 8)
+        reorder_dim = head_dims.get("reorder", 8)
+        self.fc3 = nn.Linear(hidden, reorder_dim)
+        self.heads = nn.ModuleDict(
+            {name: nn.Linear(hidden, dim) for name, dim in head_dims.items() if name != "reorder"}
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         d0 = self.base_dim
         d1 = d0 + self.tv_dim
 
@@ -398,7 +504,10 @@ class MLPReorderClassifierTvHeads(nn.Module):
         h = torch.cat([h_base, h_tv1, h_tv2], dim=1)
         h = self.drop(F.gelu(self.fc1(h)))
         h = self.drop(F.gelu(self.fc2(h)))
-        return self.fc3(h)
+        out = {"reorder": self.fc3(h)}
+        for name, head in self.heads.items():
+            out[name] = head(h)
+        return out
 
 
 @torch.no_grad()
@@ -411,31 +520,70 @@ def _acc_topk(logits: torch.Tensor, y: torch.Tensor, k: int) -> int:
     return int(correct.sum().item())
 
 
-@dataclass
-class PhaseStats:
-    loss_sum: float = 0.0
-    n: int = 0
-    correct1: int = 0
-    correct3: int = 0
-    correct5: int = 0
+def _get_task_metric(stats: dict[str, Any], task: str, k: int) -> float:
+    task_stats = stats.get("tasks", {}).get(task, {})
+    value = task_stats.get(f"acc{k}")
+    try:
+        return float(value)
+    except Exception:
+        return float("nan")
+
+
+class TaskStats:
+    def __init__(self, ks: tuple[int, ...]) -> None:
+        self.loss_sum = 0.0
+        self.n = 0
+        self.ks = ks
+        self.correct = {k: 0 for k in ks}
 
     def update(self, loss: torch.Tensor, logits: torch.Tensor, y: torch.Tensor) -> None:
         bs = int(y.shape[0])
         self.loss_sum += float(loss.item()) * bs
         self.n += bs
-        self.correct1 += _acc_topk(logits, y, 1)
-        self.correct3 += _acc_topk(logits, y, 3)
-        self.correct5 += _acc_topk(logits, y, 5)
+        for k in self.ks:
+            self.correct[k] += _acc_topk(logits, y, k)
 
     def as_dict(self) -> dict[str, float]:
         if self.n == 0:
-            return {"loss": float("nan"), "acc1": float("nan"), "acc3": float("nan"), "acc5": float("nan")}
-        return {
-            "loss": self.loss_sum / self.n,
-            "acc1": self.correct1 / self.n,
-            "acc3": self.correct3 / self.n,
-            "acc5": self.correct5 / self.n,
-        }
+            out = {"loss": float("nan")}
+            for k in self.ks:
+                out[f"acc{k}"] = float("nan")
+            return out
+        out = {"loss": self.loss_sum / self.n}
+        for k in self.ks:
+            out[f"acc{k}"] = self.correct[k] / self.n
+        return out
+
+
+class MultiTaskStats:
+    def __init__(self, tasks: list[str]) -> None:
+        self.loss_sum = 0.0
+        self.n = 0
+        self.task_stats = {t: TaskStats(TASK_ACC_KS[t]) for t in tasks}
+
+    def update(self, total_loss: torch.Tensor, per_task: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> None:
+        if not per_task:
+            return
+        first_task = next(iter(per_task.values()))
+        bs = int(first_task[2].shape[0])
+        self.loss_sum += float(total_loss.item()) * bs
+        self.n += bs
+        for task, (loss, logits, y) in per_task.items():
+            self.task_stats[task].update(loss, logits, y)
+
+    def as_dict(self, primary_task: str) -> dict[str, Any]:
+        if self.n == 0:
+            base = {"loss": float("nan"), "acc1": float("nan"), "acc3": float("nan"), "acc5": float("nan")}
+        else:
+            base = {"loss": self.loss_sum / self.n, "acc1": float("nan"), "acc3": float("nan"), "acc5": float("nan")}
+
+        if primary_task in self.task_stats:
+            p = self.task_stats[primary_task].as_dict()
+            base["acc1"] = float(p.get("acc1", float("nan")))
+            base["acc3"] = float(p.get("acc3", float("nan")))
+            base["acc5"] = float(p.get("acc5", float("nan")))
+        base["tasks"] = {t: self.task_stats[t].as_dict() for t in self.task_stats}
+        return base
 
 
 def _train_one_epoch(
@@ -449,39 +597,56 @@ def _train_one_epoch(
     norm_inv_std: Optional[torch.Tensor],
     log_every: int,
     max_batches: Optional[int],
-) -> dict[str, float]:
+    tasks: list[str],
+    loss_weights: dict[str, float],
+) -> dict[str, Any]:
     model.train()
-    stats = PhaseStats()
+    stats = MultiTaskStats(tasks)
+    primary = _primary_task(tasks)
 
     use_cuda_amp = amp and device.type == "cuda"
 
     pbar = tqdm(loader, desc="train", unit="step")
-    for step, (x, y) in enumerate(pbar, start=1):
+    for step, (x, y_dict) in enumerate(pbar, start=1):
         if max_batches is not None and step > max_batches:
             break
         x = x.to(device, non_blocking=True)
         if norm_mean is not None and norm_inv_std is not None:
             x.sub_(norm_mean).mul_(norm_inv_std)
-        y = y.to(device, non_blocking=True)
+        y = {t: y_dict[t].to(device, non_blocking=True) for t in tasks}
 
         optimizer.zero_grad(set_to_none=True)
         if use_cuda_amp and scaler is not None:
             # autocast は forward（=モデル推論）に限定して、挙動差分を最小化する。
             with torch.amp.autocast("cuda"):
                 logits = model(x)
-            loss = F.cross_entropy(logits, y)
-            scaler.scale(loss).backward()
+                total_loss = 0.0
+                per_task: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+                for task in tasks:
+                    task_logits = logits[task]
+                    task_y = y[task]
+                    task_loss = F.cross_entropy(task_logits, task_y)
+                    total_loss = total_loss + task_loss * float(loss_weights[task])
+                    per_task[task] = (task_loss, task_logits, task_y)
+            scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
             logits = model(x)
-            loss = F.cross_entropy(logits, y)
-            loss.backward()
+            total_loss = 0.0
+            per_task = {}
+            for task in tasks:
+                task_logits = logits[task]
+                task_y = y[task]
+                task_loss = F.cross_entropy(task_logits, task_y)
+                total_loss = total_loss + task_loss * float(loss_weights[task])
+                per_task[task] = (task_loss, task_logits, task_y)
+            total_loss.backward()
             optimizer.step()
 
-        stats.update(loss.detach(), logits.detach(), y.detach())
+        stats.update(total_loss.detach(), {k: (v[0].detach(), v[1].detach(), v[2].detach()) for k, v in per_task.items()})
         if log_every > 0 and (step % log_every == 0 or step == 1):
-            cur = stats.as_dict()
+            cur = stats.as_dict(primary)
             pbar.set_postfix(
                 loss=f"{cur['loss']:.4f}",
                 acc1=f"{cur['acc1']*100:.2f}%",
@@ -489,7 +654,7 @@ def _train_one_epoch(
                 acc5=f"{cur['acc5']*100:.2f}%",
             )
     pbar.close()
-    return stats.as_dict()
+    return stats.as_dict(primary)
 
 
 @torch.no_grad()
@@ -500,23 +665,33 @@ def _eval(
     norm_mean: Optional[torch.Tensor],
     norm_inv_std: Optional[torch.Tensor],
     max_batches: Optional[int],
-) -> dict[str, float]:
+    tasks: list[str],
+    loss_weights: dict[str, float],
+) -> dict[str, Any]:
     model.eval()
-    stats = PhaseStats()
+    stats = MultiTaskStats(tasks)
+    primary = _primary_task(tasks)
 
     pbar = tqdm(loader, desc="val", unit="step")
-    for step, (x, y) in enumerate(pbar, start=1):
+    for step, (x, y_dict) in enumerate(pbar, start=1):
         if max_batches is not None and step > max_batches:
             break
         x = x.to(device, non_blocking=True)
         if norm_mean is not None and norm_inv_std is not None:
             x.sub_(norm_mean).mul_(norm_inv_std)
-        y = y.to(device, non_blocking=True)
+        y = {t: y_dict[t].to(device, non_blocking=True) for t in tasks}
         logits = model(x)
-        loss = F.cross_entropy(logits, y)
-        stats.update(loss, logits, y)
+        total_loss = 0.0
+        per_task: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        for task in tasks:
+            task_logits = logits[task]
+            task_y = y[task]
+            task_loss = F.cross_entropy(task_logits, task_y)
+            total_loss = total_loss + task_loss * float(loss_weights[task])
+            per_task[task] = (task_loss, task_logits, task_y)
+        stats.update(total_loss, per_task)
 
-        cur = stats.as_dict()
+        cur = stats.as_dict(primary)
         pbar.set_postfix(
             loss=f"{cur['loss']:.4f}",
             acc1=f"{cur['acc1']*100:.2f}%",
@@ -524,7 +699,7 @@ def _eval(
             acc5=f"{cur['acc5']*100:.2f}%",
         )
     pbar.close()
-    return stats.as_dict()
+    return stats.as_dict(primary)
 
 
 class _EpochBatchOrderSampler(Sampler[int]):
@@ -590,12 +765,14 @@ def _make_batches(indices: np.ndarray, batch_size: int, drop_last: bool) -> list
     return batches
 
 
-def _validate_labels_range(y: np.ndarray) -> tuple[int, int]:
+def _validate_labels_range(name: str, y: np.ndarray, n_classes: int) -> tuple[int, int]:
     # int64 [N] を全走査して min/max を確認（大きいが 9.2M 程度なので許容）
     y_min = int(np.min(y))
     y_max = int(np.max(y))
-    if y_min < 0 or y_max > 7:
-        raise ValueError(f"labels_reorder の範囲が不正です: min={y_min} max={y_max} expected=[0..7]")
+    if y_min < 0 or y_max >= n_classes:
+        raise ValueError(
+            f"labels_{name} の範囲が不正です: min={y_min} max={y_max} expected=[0..{n_classes-1}]"
+        )
     return y_min, y_max
 
 
@@ -635,6 +812,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--log-csv", type=Path, default=None, help="学習過程のCSVログを追記保存（未指定なら無効）")
+    p.add_argument(
+        "--tasks",
+        type=str,
+        default=None,
+        help="学習タスク（例: reorder,predictor,cf,interleave / default: reorder）",
+    )
+    p.add_argument(
+        "--loss-weights",
+        type=str,
+        default=None,
+        help="タスク別 loss 重み（例: reorder=1,predictor=1,cf=1,interleave=1）",
+    )
 
     p.add_argument("--model", choices=["baseline", "tvheads"], default="baseline")
     p.add_argument("--tvhead-base", type=int, default=256)
@@ -701,11 +890,19 @@ def main() -> int:
 
         data_dir: Path = args.data_dir
         features_path = data_dir / "features.npy"
-        labels_path = data_dir / "labels_reorder.npy"
         if not features_path.is_file():
             raise FileNotFoundError(f"features.npy が見つかりません: {features_path}")
-        if not labels_path.is_file():
-            raise FileNotFoundError(f"labels_reorder.npy が見つかりません: {labels_path}")
+
+        tasks = _parse_tasks(args.tasks)
+        loss_weights = _parse_loss_weights(args.loss_weights, tasks)
+        primary_task = _primary_task(tasks)
+
+        label_paths: dict[str, Path] = {}
+        for task in tasks:
+            label_path = data_dir / TASK_LABEL_FILES[task]
+            if not label_path.is_file():
+                raise FileNotFoundError(f"labels_{task}.npy が見つかりません: {label_path}")
+            label_paths[task] = label_path
 
         meta = _load_json_if_exists(data_dir / "meta.json")
         mean_path = data_dir / "feature_mean.npy"
@@ -718,18 +915,32 @@ def main() -> int:
             std = None
 
         logger.log(f"features: {features_path}")
-        logger.log(f"labels:   {labels_path}")
+        for task in tasks:
+            logger.log(f"labels_{task}: {label_paths[task]}")
+        logger.log(f"tasks: {','.join(tasks)}")
+        logger.log(
+            "loss_weights: "
+            + ",".join(f"{name}={loss_weights[name]:.3f}" for name in tasks)
+        )
         if mean is not None:
             logger.log("normalization: z-score (feature_mean.npy / feature_std.npy)")
         else:
             logger.log("normalization: none")
 
         x = np.load(features_path, mmap_mode="r")
-        y = np.load(labels_path, mmap_mode="r")
+        labels = {task: np.load(path, mmap_mode="r") for task, path in label_paths.items()}
 
-        y_min, y_max = _validate_labels_range(y)
-        label_hist_np = np.bincount(np.asarray(y, dtype=np.int64), minlength=8)
-        label_hist = {str(i): int(label_hist_np[i]) for i in range(8)}
+        for task, y in labels.items():
+            if int(y.shape[0]) != int(x.shape[0]):
+                raise ValueError(f"N が一致しません: features={x.shape} labels_{task}={y.shape}")
+
+        label_ranges: dict[str, tuple[int, int]] = {}
+        label_hist: dict[str, dict[str, int]] = {}
+        for task, y in labels.items():
+            y_min, y_max = _validate_labels_range(task, y, TASK_CLASS_COUNTS[task])
+            label_ranges[task] = (y_min, y_max)
+            hist_np = np.bincount(np.asarray(y, dtype=np.int64), minlength=TASK_CLASS_COUNTS[task])
+            label_hist[task] = {str(i): int(hist_np[i]) for i in range(TASK_CLASS_COUNTS[task])}
         n, d = int(x.shape[0]), int(x.shape[1])
         logger.log(f"dataset: N={n} D={d}")
 
@@ -751,7 +962,7 @@ def main() -> int:
         # train は split の順序（作成時点で乱択済み）をそのままバッチ化し、
         # エポック毎は「バッチ順序」だけをシャッフルする。
         train_batches = _make_batches(train_idx.astype(np.int64, copy=False), int(args.batch_size), drop_last=True)
-        train_ds_batch = ReorderBatchDataset(x=x, y=y, batches=train_batches, mean=mean, std=std)
+        train_ds_batch = MultiTaskBatchDataset(x=x, labels=labels, batches=train_batches, mean=mean, std=std)
         train_sampler = _EpochBatchOrderSampler(n_batches=len(train_batches), seed=int(args.seed))
         train_loader = _make_loader(
             train_ds_batch,
@@ -762,20 +973,27 @@ def main() -> int:
 
         # validation は順序固定でよいので、一度だけ batch 化する。
         val_batches = _make_batches(val_idx.astype(np.int64, copy=False), int(args.batch_size), drop_last=False)
-        val_ds = ReorderBatchDataset(x=x, y=y, batches=val_batches, mean=mean, std=std)
+        val_ds = MultiTaskBatchDataset(x=x, labels=labels, batches=val_batches, mean=mean, std=std)
         val_loader = _make_loader(
             val_ds,
             num_workers=int(args.num_workers),
             device=device,
         )
 
+        head_dims = {task: TASK_CLASS_COUNTS[task] for task in tasks}
         if args.model == "baseline":
-            model = MLPReorderClassifier(in_dim=d, hidden=int(args.hidden), dropout=float(args.dropout)).to(device)
+            model = MLPReorderClassifier(
+                in_dim=d,
+                hidden=int(args.hidden),
+                dropout=float(args.dropout),
+                head_dims=head_dims,
+            ).to(device)
         elif args.model == "tvheads":
             model = MLPReorderClassifierTvHeads(
                 in_dim=d,
                 hidden=int(args.hidden),
                 dropout=float(args.dropout),
+                head_dims=head_dims,
                 tv_dim=8,
                 base_head=int(args.tvhead_base),
                 tv_head=int(args.tvhead_tv),
@@ -820,6 +1038,7 @@ def main() -> int:
 
         start_epoch = 1
         best_val_acc3 = -1.0
+        best_metric_name = f"val_{primary_task}_acc{TASK_BEST_K[primary_task]}"
 
         if args.resume_weights is not None:
             resume_weights_path = Path(args.resume_weights)
@@ -829,13 +1048,17 @@ def main() -> int:
                 raise FileNotFoundError(f"--resume-weights で指定されたファイルが見つかりません: {resume_weights_path}")
             ckpt = torch.load(resume_weights_path, map_location="cpu")
             model_state = _extract_model_state_dict(ckpt)
-            model.load_state_dict(model_state)
+            missing, unexpected = model.load_state_dict(model_state, strict=False)
+            if missing:
+                logger.log(f"resume_weights: missing_keys={len(missing)}")
+            if unexpected:
+                logger.log(f"resume_weights: unexpected_keys={len(unexpected)}")
 
             # fine-tune は「新規 run 扱い」なので epoch/optimizer/scaler はロードしない。
             # best 指標はデフォルトで「ロード元の best」を引き継ぐ（初回エポックでの不自然な best 更新を避けるため）。
             loaded_val_acc3: Optional[float] = None
             if isinstance(ckpt, dict):
-                v = ckpt.get("val_acc3", ckpt.get("best_val_acc3"))
+                v = ckpt.get("val_acc3", ckpt.get("best_val_acc3", ckpt.get("best_metric")))
                 if v is not None:
                     loaded_val_acc3 = float(v)
             if bool(args.reset_best_metric) or loaded_val_acc3 is None:
@@ -860,10 +1083,14 @@ def main() -> int:
                 scaler.load_state_dict(ckpt["scaler_state"])
             start_epoch = int(ckpt["epoch"]) + 1
             best_val_acc3 = float(ckpt.get("best_val_acc3", best_val_acc3))
+            best_metric_name = str(ckpt.get("best_metric_name", best_metric_name))
             rng_state = ckpt.get("rng_state")
             if isinstance(rng_state, dict):
                 _set_rng_state(rng_state)
-            logger.log(f"resume: {args.resume} start_epoch={start_epoch} best_val_acc3={best_val_acc3:.6f}")
+            logger.log(
+                f"resume: {args.resume} start_epoch={start_epoch} "
+                f"{best_metric_name}={best_val_acc3:.6f}"
+            )
 
         args_json: dict[str, Any] = {}
         for k, v in vars(args).items():
@@ -884,9 +1111,11 @@ def main() -> int:
             "val_ratio": float(args.val_ratio),
             "seed": int(args.seed),
             "feature_dim": d,
-            "label_min": int(y_min),
-            "label_max": int(y_max),
+            "label_ranges": {k: {"min": int(v[0]), "max": int(v[1])} for k, v in label_ranges.items()},
             "label_hist": label_hist,
+            "tasks": tasks,
+            "loss_weights": {k: float(v) for k, v in loss_weights.items()},
+            "label_classes": {k: int(TASK_CLASS_COUNTS[k]) for k in tasks},
             "normalization": {
                 "kind": "zscore" if mean is not None else "none",
                 "mean_file": "feature_mean.npy" if mean is not None else None,
@@ -946,6 +1175,8 @@ def main() -> int:
                 norm_inv_std=norm_inv_std_t,
                 log_every=int(args.log_every),
                 max_batches=args.max_train_batches,
+                tasks=tasks,
+                loss_weights=loss_weights,
             )
             val_stats = _eval(
                 model=model,
@@ -954,6 +1185,8 @@ def main() -> int:
                 norm_mean=norm_mean_t,
                 norm_inv_std=norm_inv_std_t,
                 max_batches=args.max_val_batches,
+                tasks=tasks,
+                loss_weights=loss_weights,
             )
             logger.log(
                 "train: "
@@ -977,22 +1210,25 @@ def main() -> int:
             )
             _save_json(metrics_path, all_metrics)
 
-            val_acc3 = float(val_stats["acc3"])
-            improved = val_acc3 > best_val_acc3
+            best_k = TASK_BEST_K[primary_task]
+            val_metric = _get_task_metric(val_stats, primary_task, best_k)
+            improved = val_metric > best_val_acc3
             if improved:
-                best_val_acc3 = val_acc3
+                best_val_acc3 = val_metric
                 no_improve_epochs = 0
                 if bool(args.save_best):
                     best = {
                         "epoch": int(epoch),
                         "feature_dim": int(d),
-                        "val_acc3": float(val_acc3),
+                        "val_acc3": float(val_metric),
+                        "best_metric_name": best_metric_name,
+                        "best_metric": float(val_metric),
                         "model_state": model.state_dict(),
                         "args": args_json,
                         "meta": meta,
                     }
                     torch.save(best, out_dir / "model_best.pt")
-                    logger.log(f"best updated: val_acc3={best_val_acc3:.6f} -> model_best.pt")
+                    logger.log(f"best updated: {best_metric_name}={best_val_acc3:.6f} -> model_best.pt")
             else:
                 no_improve_epochs += 1
 
@@ -1011,8 +1247,8 @@ def main() -> int:
                         "val_acc1": _fmt_float6(val_stats.get("acc1")),
                         "val_acc3": _fmt_float6(val_stats.get("acc3")),
                         "val_acc5": _fmt_float6(val_stats.get("acc5")),
-                        "best_metric_name": "val_acc3",
-                        "best_metric": _fmt_float6(val_acc3),
+                        "best_metric_name": best_metric_name,
+                        "best_metric": _fmt_float6(val_metric),
                         "is_best": 1 if improved else 0,
                     }
                 )
@@ -1024,6 +1260,8 @@ def main() -> int:
                 "optim_state": optimizer.state_dict(),
                 "scaler_state": scaler.state_dict() if scaler is not None else None,
                 "best_val_acc3": float(best_val_acc3),
+                "best_metric_name": best_metric_name,
+                "best_metric": float(best_val_acc3),
                 "rng_state": _get_rng_state(),
                 "args": args_json,
             }

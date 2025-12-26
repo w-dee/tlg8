@@ -9,7 +9,12 @@ pack_artifacts.py が生成した packed ディレクトリから、学習用の
 
 出力（--out-dir）:
   - features.npy         : float32 [N, D]
+  - labels_predictor.npy : int64   [N]
+  - labels_cf_perm.npy   : int64   [N]
+  - labels_cf_primary.npy: int64   [N]
+  - labels_cf_secondary.npy: int64 [N]
   - labels_reorder.npy   : int64   [N]
+  - labels_interleave.npy: int64   [N]
   - feature_mean.npy     : float32 [D]
   - feature_std.npy      : float32 [D]
   - index.jsonl          : 1行=1ブロック（追跡用）
@@ -39,6 +44,28 @@ LABEL_RECORD_SIZE = 128
 LABEL_RECORD_STRUCT = struct.Struct("<IHH12hI92s")  # 128 bytes
 LABEL_MAGIC = 0x4C424C38  # "LBL8"
 LABEL_VERSION = 1
+LABEL_FIELDS = {
+    "best_predictor": 0,
+    "best_filter_perm": 1,
+    "best_filter_primary": 2,
+    "best_filter_secondary": 3,
+    "best_reorder": 4,
+    "best_interleave": 5,
+    "second_predictor": 6,
+    "second_filter_perm": 7,
+    "second_filter_primary": 8,
+    "second_filter_secondary": 9,
+    "second_reorder": 10,
+    "second_interleave": 11,
+}
+LABEL_RANGES = {
+    "predictor": (0, 7),
+    "filter_perm": (0, 5),
+    "filter_primary": (0, 3),
+    "filter_secondary": (0, 3),
+    "reorder": (0, 7),
+    "interleave": (0, 1),
+}
 
 FEATURE_SET_RAW_PLUS_STATS_V1 = "raw_plus_stats_v1"
 FEATURE_SET_RAW_PLUS_STATS_V2 = "raw_plus_stats_v2"
@@ -192,7 +219,12 @@ def _feature_dim(feature_set: str) -> int:
 def _check_overwrite(out_dir: Path, force: bool, dry_run: bool) -> None:
     targets = [
         out_dir / "features.npy",
+        out_dir / "labels_predictor.npy",
+        out_dir / "labels_cf_perm.npy",
+        out_dir / "labels_cf_primary.npy",
+        out_dir / "labels_cf_secondary.npy",
         out_dir / "labels_reorder.npy",
+        out_dir / "labels_interleave.npy",
         out_dir / "feature_mean.npy",
         out_dir / "feature_std.npy",
         out_dir / "index.jsonl",
@@ -222,7 +254,15 @@ def _validate_inputs(in_dir: Path) -> dict[str, Path]:
     return paths
 
 
-def _read_label_best_reorder(fp) -> int:
+def _validate_label_value(name: str, value: int, allow_minus1: bool) -> None:
+    if allow_minus1 and value == -1:
+        return
+    min_v, max_v = LABEL_RANGES[name]
+    if not (min_v <= value <= max_v):
+        raise ValueError(f"{name} が範囲外です: {value} expected=[{min_v}..{max_v}]")
+
+
+def _read_label_record(fp) -> dict[str, int]:
     chunk = fp.read(LABEL_RECORD_SIZE)
     if len(chunk) != LABEL_RECORD_SIZE:
         raise ValueError("labels.all.bin の途中でファイルが終わりました")
@@ -234,10 +274,30 @@ def _read_label_best_reorder(fp) -> int:
         raise ValueError(f"LabelRecord version 不明: {version}")
     if reserved != 0:
         raise ValueError(f"LabelRecord reserved が 0 ではありません: {reserved}")
-    best_reorder = int(labels[4])
-    if not (0 <= best_reorder <= 7):
-        raise ValueError(f"best_reorder が範囲外です: {best_reorder}")
-    return best_reorder
+
+    out: dict[str, int] = {}
+    for name, idx in LABEL_FIELDS.items():
+        out[name] = int(labels[idx])
+
+    _validate_label_value("predictor", out["best_predictor"], allow_minus1=False)
+    _validate_label_value("filter_perm", out["best_filter_perm"], allow_minus1=False)
+    _validate_label_value("filter_primary", out["best_filter_primary"], allow_minus1=False)
+    _validate_label_value("filter_secondary", out["best_filter_secondary"], allow_minus1=False)
+    _validate_label_value("reorder", out["best_reorder"], allow_minus1=False)
+    _validate_label_value("interleave", out["best_interleave"], allow_minus1=False)
+
+    _validate_label_value("predictor", out["second_predictor"], allow_minus1=True)
+    _validate_label_value("filter_perm", out["second_filter_perm"], allow_minus1=True)
+    _validate_label_value("filter_primary", out["second_filter_primary"], allow_minus1=True)
+    _validate_label_value("filter_secondary", out["second_filter_secondary"], allow_minus1=True)
+    _validate_label_value("reorder", out["second_reorder"], allow_minus1=True)
+    _validate_label_value("interleave", out["second_interleave"], allow_minus1=True)
+    return out
+
+
+def _read_label_best_reorder(fp) -> int:
+    rec = _read_label_record(fp)
+    return rec["best_reorder"]
 
 
 def _fill_features_raw_plus_stats_v1(dst_row: np.ndarray, row: dict[str, Any], work: _WorkBuffers) -> dict[str, Any]:
@@ -547,7 +607,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # 配列は全体を保持して良い前提（後で mean/std を計算する）
     x = np.empty((n_blocks, d), dtype=np.float32)
-    y = np.empty((n_blocks,), dtype=np.int64)
+    y_predictor = np.empty((n_blocks,), dtype=np.int64)
+    y_cf_perm = np.empty((n_blocks,), dtype=np.int64)
+    y_cf_primary = np.empty((n_blocks,), dtype=np.int64)
+    y_cf_secondary = np.empty((n_blocks,), dtype=np.int64)
+    y_reorder = np.empty((n_blocks,), dtype=np.int64)
+    y_interleave = np.empty((n_blocks,), dtype=np.int64)
 
     # index.jsonl は逐次出力する（ブロック単位の追跡情報）
     index_tmp = out_dir / f"index.jsonl.tmp.{os.getpid()}"
@@ -595,7 +660,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             row = json.loads(line)
 
             # label
-            y[i] = _read_label_best_reorder(label_fp)
+            labels = _read_label_record(label_fp)
+            y_predictor[i] = labels["best_predictor"]
+            y_cf_perm[i] = labels["best_filter_perm"]
+            y_cf_primary[i] = labels["best_filter_primary"]
+            y_cf_secondary[i] = labels["best_filter_secondary"]
+            y_reorder[i] = labels["best_reorder"]
+            y_interleave[i] = labels["best_interleave"]
 
             # feature
             if feature_set == FEATURE_SET_RAW_PLUS_STATS_V1:
@@ -636,7 +707,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # 保存（np.save は自動で .npy を付けるケースがあるため原子的に置換）
     _atomic_np_save(out_dir / "features.npy", x)
-    _atomic_np_save(out_dir / "labels_reorder.npy", y)
+    _atomic_np_save(out_dir / "labels_predictor.npy", y_predictor)
+    _atomic_np_save(out_dir / "labels_cf_perm.npy", y_cf_perm)
+    _atomic_np_save(out_dir / "labels_cf_primary.npy", y_cf_primary)
+    _atomic_np_save(out_dir / "labels_cf_secondary.npy", y_cf_secondary)
+    _atomic_np_save(out_dir / "labels_reorder.npy", y_reorder)
+    _atomic_np_save(out_dir / "labels_interleave.npy", y_interleave)
     _atomic_np_save(out_dir / "feature_mean.npy", mean)
     _atomic_np_save(out_dir / "feature_std.npy", std)
 
@@ -682,7 +758,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         "x_dtype": "float32",
         "y_dtype": "int64",
         "label_name": "reorder",
-        "reorder_classes": 8,
+        "label_names": ["predictor", "cf_perm", "cf_primary", "cf_secondary", "reorder", "interleave"],
+        "label_classes": {
+            "predictor": 8,
+            "cf_perm": 6,
+            "cf_primary": 4,
+            "cf_secondary": 4,
+            "reorder": 8,
+            "interleave": 2,
+        },
         "feature_names": feature_names,
         "feature_layout": feature_layout,
         "color_transform": {
