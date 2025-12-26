@@ -46,7 +46,12 @@ class FeatureSpec:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train TLG8 ML ranker heads with trial logging")
-    parser.add_argument("--in-dir", required=True, type=Path, help="Directory with training.all.jsonl/labels.all.bin")
+    parser.add_argument(
+        "--in-dir",
+        type=Path,
+        default=None,
+        help="Directory with training.all.jsonl/labels.all.bin (defaults to ml/runs/packed_smoke if present)",
+    )
     parser.add_argument("--run-id", type=str, default=None, help="Run ID under ml/runs (auto if omitted)")
     parser.add_argument("--run-root", type=Path, default=Path("ml/runs"), help="Run root directory")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
@@ -56,7 +61,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
     parser.add_argument("--max-trials", type=int, default=None, help="Max trials to run")
     parser.add_argument("--rebuild-dataset", action="store_true", help="Rebuild dataset cache")
+    parser.add_argument("--smoke", action="store_true", help="Run a small, fast smoke trial")
     return parser.parse_args()
+
+
+def resolve_in_dir(path: Path | None) -> Path:
+    if path is not None:
+        return path
+    fallback = Path("ml/runs/packed_smoke")
+    if (fallback / "training.all.jsonl").is_file() and (fallback / "labels.all.bin").is_file():
+        return fallback
+    raise SystemExit("Missing --in-dir and no fallback dataset found at ml/runs/packed_smoke")
 
 
 def ensure_cuda() -> torch.device:
@@ -127,6 +142,22 @@ def build_feature_specs(dataset: DatasetCache) -> list[FeatureSpec]:
                     name=f"raw_top{k}_sqrt",
                     raw_indices=idx,
                     transforms=[{"kind": "sqrt", "apply_to": "all"}],
+                )
+            )
+        if k * 2 <= 256:
+            specs.append(
+                FeatureSpec(
+                    name=f"raw_top{k}_square",
+                    raw_indices=idx,
+                    transforms=[{"kind": "square", "apply_to": "all"}],
+                )
+            )
+        if k * 2 <= 256:
+            specs.append(
+                FeatureSpec(
+                    name=f"raw_top{k}_abs",
+                    raw_indices=idx,
+                    transforms=[{"kind": "abs", "apply_to": "all"}],
                 )
             )
     return specs
@@ -356,6 +387,12 @@ def get_trial_config(
 
 def main() -> None:
     args = parse_args()
+    if args.smoke:
+        args.max_epochs = min(args.max_epochs, 2)
+        args.patience = min(args.patience, 1)
+        args.batch_size = min(args.batch_size, 64)
+        args.max_trials = 1 if args.max_trials is None else min(args.max_trials, 1)
+    args.in_dir = resolve_in_dir(args.in_dir)
     device = ensure_cuda()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -406,6 +443,17 @@ def main() -> None:
     bits_best = dataset.bits[:, 0]
     targets = build_soft_targets(dataset.labels_best, bits_best)
 
+    if args.smoke:
+        train_idx = dataset.train_indices[: min(256, dataset.train_indices.shape[0])]
+        valid_idx = dataset.valid_indices[: min(128, dataset.valid_indices.shape[0])]
+    else:
+        train_idx = dataset.train_indices
+        valid_idx = dataset.valid_indices
+
+    def write_best_state(payload: dict[str, Any]) -> None:
+        payload["timestamp"] = now_iso()
+        save_json(best_path, payload)
+
     for trial_id in range(start_trial, max_trials):
         feature_spec, arch_spec = get_trial_config(trial_id, feature_specs, arch_specs, args.seed)
         non_pixel = apply_feature_pipeline(dataset.raw_numeric, feature_spec)
@@ -413,8 +461,6 @@ def main() -> None:
             continue
         features = np.concatenate([dataset.pixels, non_pixel], axis=1).astype(np.float32)
         input_dim = features.shape[1]
-        train_idx = dataset.train_indices
-        valid_idx = dataset.valid_indices
 
         trial_dir = run_dir / "artifacts" / f"trial_{trial_id:04d}"
         ensure_dir(trial_dir)
@@ -527,6 +573,7 @@ def main() -> None:
                 "patience": args.patience,
                 "lr": args.lr,
                 "batch_size": args.batch_size,
+                "smoke": args.smoke,
             },
             "valid_loss_mean": valid_loss_mean,
             "valid_hit_rate": valid_hit_rate,
@@ -558,27 +605,29 @@ def main() -> None:
         if updated:
             best_rate = valid_hit_rate
             no_improve = 0
-            best_payload = {
-                "status": "ok" if valid_hit_rate >= 0.9 else "below_threshold",
-                "trial_id": trial_id,
-                "valid_hit_rate": valid_hit_rate,
-                "valid_loss_mean": valid_loss_mean,
-                "params": {"per_head": head_params, "total": total_params},
-                "bundle_path": str(bundle_path),
-                "timestamp": now_iso(),
-            }
-            save_json(best_path, best_payload)
         else:
             no_improve += 1
+
+        best_payload = {
+            "status": "ok" if best_rate >= 0.9 else "below_threshold",
+            "trial_id": trial_id,
+            "valid_hit_rate": best_rate,
+            "latest_valid_hit_rate": valid_hit_rate,
+            "valid_loss_mean": valid_loss_mean,
+            "params": {"per_head": head_params, "total": total_params},
+            "bundle_path": str(bundle_path),
+            "no_improve": no_improve,
+        }
+        write_best_state(best_payload)
 
         if no_improve >= 10:
             failure_payload = {
                 "status": "failed_no_improve",
                 "trial_id": trial_id,
                 "best_valid_hit_rate": best_rate,
-                "timestamp": now_iso(),
+                "no_improve": no_improve,
             }
-            save_json(best_path, failure_payload)
+            write_best_state(failure_payload)
             break
 
 

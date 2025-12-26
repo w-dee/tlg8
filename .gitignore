@@ -10,8 +10,6 @@
 /ml/runs/
 
 
-
-
 # Analysis temporary
 /analysis/
 
@@ -63,3 +61,6 @@ __pycache__/
 # OS-specific clutter
 .DS_Store
 Thumbs.db
+
+# Python pytest_cache
+.pytest_cache/

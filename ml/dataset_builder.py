@@ -27,6 +27,7 @@ IGNORE_KEYS = {
     "pixels",
     "best",
     "second",
+    "entropy",
     "image",
     "image_size",
     "tile_origin",

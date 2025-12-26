@@ -308,6 +308,15 @@ If the best valid hit-rate fails to improve by **≥ 0.1%** for **10** consecuti
 
    * Computes block-micro hit-rate
 
+## Verification (MUST RUN)
+
+Codex MUST run verification commands after making changes and before declaring completion.
+
+Required:
+- python -m compileall ml
+- python ml/train_rankers.py --run-id <run_id> --smoke
+
+
 ## Notes
 
 * Keep every run fully reproducible (fixed seed and saved split).
