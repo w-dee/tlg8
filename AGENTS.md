@@ -316,3 +316,4 @@ If the best valid hit-rate fails to improve by **≥ 0.1%** for **10** consecuti
 
 
 * 元画像から 生成した label-cache と training-json は ml/runs/ の下にあります。
+* 機械学習タスクでは CUDA を使用するようにしてください。
