@@ -100,8 +100,8 @@ namespace tlg::v8
                    const std::string &label_cache_bin_path,
                    const std::string &label_cache_meta_path,
                    bool force_hilbert_reorder,
+                   int force_entropy,
                    std::string &err,
                    uint64_t *out_entropy_bits = nullptr);
   }
 } // namespace tlg::v8
-

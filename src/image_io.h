@@ -91,6 +91,7 @@ struct TlgOptions
   std::string tlg8_training_stats_path;      // 学習用特徴量統計を書き出すファイルパス
   std::string tlg8_label_cache_bin_path;     // ラベルキャッシュのバイナリ出力先
   std::string tlg8_label_cache_meta_path;    // ラベルキャッシュのメタデータ出力先
+  int tlg8_force_entropy = -1; // -1: auto(best of all) / 0: Plain / 1: RunLength
   bool print_entropy_bits = false;     // エントロピー符号化で使用した正味ビット数を表示するか
 };
 

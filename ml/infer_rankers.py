@@ -113,6 +113,16 @@ def apply_feature_pipeline(raw_numeric: np.ndarray, spec: dict[str, Any]) -> np.
         return np.concatenate(features, axis=1)
     return np.empty((raw_numeric.shape[0], 0), dtype=np.float32)
 
+def apply_non_pixel_norm(non_pixel: np.ndarray, bundle: dict[str, Any]) -> np.ndarray:
+    norm = bundle.get("feature_norm") or {}
+    mean = np.asarray(norm.get("non_pixel_mean", []), dtype=np.float32)
+    std = np.asarray(norm.get("non_pixel_std", []), dtype=np.float32)
+    if mean.size == 0 or std.size == 0:
+        return non_pixel.astype(np.float32, copy=False)
+    if non_pixel.shape[1] != mean.shape[0]:
+        raise ValueError("non-pixel feature dimension mismatch vs bundle feature_norm")
+    return ((non_pixel - mean[None, :]) / std[None, :]).astype(np.float32, copy=False)
+
 
 def is_eligible(row: dict[str, Any]) -> bool:
     if row.get("block_size") != [8, 8]:
@@ -175,7 +185,9 @@ def main() -> None:
         feats = np.stack(batch_features, axis=0).astype(np.float32)
         feats_t = torch.from_numpy(feats).to(device)
         with torch.no_grad():
-            logits = {head: model(feats_t).detach().cpu().numpy() for head, model in models.items()}
+            logits = {
+                head: torch.log_softmax(model(feats_t), dim=1).detach().cpu().numpy() for head, model in models.items()
+            }
         for i, row in enumerate(batch_rows):
             index = batch_indices[i]
             if args.require_eligible and not is_eligible(row):
@@ -218,6 +230,7 @@ def main() -> None:
                 payload = {"index": idx, "eligible": False, "predictions": []}
                 out_fp.write(json.dumps(payload) + "\n")
                 continue
+            non_pixel = apply_non_pixel_norm(non_pixel, bundle)
             features = np.concatenate([pixels, non_pixel.squeeze(0)], axis=0)
             if features.shape[0] != bundle["input_dim"]:
                 raise ValueError("feature dimension mismatch vs bundle input_dim")

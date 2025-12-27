@@ -83,6 +83,16 @@ def apply_feature_pipeline(raw_numeric: np.ndarray, spec: dict[str, Any]) -> np.
         return np.concatenate(features, axis=1)
     return np.empty((raw_numeric.shape[0], 0), dtype=np.float32)
 
+def apply_non_pixel_norm(non_pixel: np.ndarray, bundle: dict[str, Any]) -> np.ndarray:
+    norm = bundle.get("feature_norm") or {}
+    mean = np.asarray(norm.get("non_pixel_mean", []), dtype=np.float32)
+    std = np.asarray(norm.get("non_pixel_std", []), dtype=np.float32)
+    if mean.size == 0 or std.size == 0:
+        return non_pixel.astype(np.float32, copy=False)
+    if non_pixel.shape[1] != mean.shape[0]:
+        raise SystemExit("non-pixel feature dimension mismatch vs bundle feature_norm")
+    return ((non_pixel - mean[None, :]) / std[None, :]).astype(np.float32, copy=False)
+
 
 def load_models(bundle: dict[str, Any], device: torch.device) -> dict[str, nn.Module]:
     models: dict[str, nn.Module] = {}
@@ -118,7 +128,7 @@ def evaluate_hit_rate(
         for (xb,) in loader:
             xb = xb.to(device)
             batch_size_local = xb.shape[0]
-            logits = {head: model(xb).detach().cpu().numpy() for head, model in models.items()}
+            logits = {head: torch.log_softmax(model(xb), dim=1).detach().cpu().numpy() for head, model in models.items()}
             for i in range(batch_size_local):
                 idx = indices[offset + i]
                 best = labels_best[idx]
@@ -176,6 +186,7 @@ def main() -> None:
     non_pixel = apply_feature_pipeline(dataset.raw_numeric, bundle["feature_spec"])
     if non_pixel.shape[1] > 256:
         raise SystemExit("non-pixel feature dimension exceeds 256")
+    non_pixel = apply_non_pixel_norm(non_pixel, bundle)
     features = np.concatenate([dataset.pixels, non_pixel], axis=1).astype(np.float32)
     if features.shape[1] != bundle["input_dim"]:
         raise SystemExit("feature dimension mismatch vs bundle input_dim")

@@ -153,6 +153,7 @@ bool save_tlg(const std::string &path,
                                  opt.tlg8_label_cache_bin_path,
                                  opt.tlg8_label_cache_meta_path,
                                  opt.tlg8_force_hilbert_reorder,
+                                 opt.tlg8_force_entropy,
                                  err,
                                  out_entropy_bits);
   }

@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 try:
     from tqdm import tqdm
@@ -61,6 +62,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
+    parser.add_argument("--neg-k", type=int, default=32, help="Negatives per sample for tuple ranking loss")
+    parser.add_argument(
+        "--target-temp",
+        type=float,
+        default=10.0,
+        help="Temperature for bits-weighted soft targets (smaller => prefer best more)",
+    )
     parser.add_argument("--max-trials", type=int, default=None, help="Max trials to run")
     parser.add_argument(
         "--max-blocks",
@@ -83,9 +91,15 @@ def resolve_in_dir(path: Path | None, *, smoke: bool) -> Path:
     if path is not None:
         return path
     if smoke:
+        fallback = Path("ml/runs/packed_smoke_entropy0")
+        if (fallback / "training.all.jsonl").is_file() and (fallback / "labels.all.bin").is_file():
+            return fallback
         fallback = Path("ml/runs/packed_smoke")
         if (fallback / "training.all.jsonl").is_file() and (fallback / "labels.all.bin").is_file():
             return fallback
+    packed_out = Path("ml/source/packed_out_entropy0")
+    if (packed_out / "training.all.jsonl").is_file() and (packed_out / "labels.all.bin").is_file():
+        return packed_out
     packed_out = Path("ml/source/packed_out")
     if (packed_out / "training.all.jsonl").is_file() and (packed_out / "labels.all.bin").is_file():
         return packed_out
@@ -143,7 +157,7 @@ def build_feature_specs(dataset: DatasetCache) -> list[FeatureSpec]:
     variances = np.var(train_raw, axis=0)
     order = np.argsort(-variances)
 
-    specs: list[FeatureSpec] = [FeatureSpec(name="raw_top0", raw_indices=[], transforms=[])]
+    specs: list[FeatureSpec] = []
     for k in (16, 32, 64, 128, 192, 256):
         if k > raw_dim:
             continue
@@ -181,18 +195,23 @@ def build_feature_specs(dataset: DatasetCache) -> list[FeatureSpec]:
                     transforms=[{"kind": "abs", "apply_to": "all"}],
                 )
             )
+    specs.append(FeatureSpec(name="raw_top0", raw_indices=[], transforms=[]))
     return specs
 
 
 def build_arch_specs() -> list[dict[str, list[int]]]:
     candidates = [
-        [],
-        [32],
-        [64],
-        [96],
-        [128],
-        [64, 32],
+        [512, 256],
+        [256, 128],
         [128, 64],
+        [64, 32],
+        [512],
+        [256],
+        [128],
+        [96],
+        [64],
+        [32],
+        [],
     ]
     specs: list[dict[str, list[int]]] = []
     for hidden in candidates:
@@ -221,23 +240,214 @@ def soft_ce_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return -(targets * log_probs).sum(dim=1).mean()
 
 
-def build_soft_targets(labels_best: np.ndarray, bits_best: np.ndarray) -> dict[str, np.ndarray]:
+def build_soft_targets(
+    labels_best: np.ndarray,
+    labels_second: np.ndarray,
+    bits_best: np.ndarray,
+    bits_second: np.ndarray,
+    *,
+    target_temp: float,
+) -> dict[str, np.ndarray]:
     targets: dict[str, np.ndarray] = {}
+    n = int(labels_best.shape[0])
+    if labels_second.shape[0] != n:
+        raise ValueError("labels_best/labels_second length mismatch")
     for head_idx, head in enumerate(HEAD_ORDER):
         classes = HEADS[head]
-        proj_scores = np.full((classes,), np.inf, dtype=np.float64)
-        for i in range(labels_best.shape[0]):
-            v = int(labels_best[i, head_idx])
-            proj_scores[v] = min(proj_scores[v], float(bits_best[i]))
-        order = np.argsort(proj_scores)
-        if np.isinf(proj_scores[order[1]]):
-            raise ValueError(f"not enough classes present for head {head}")
-        pos = order[:2]
-        target = np.zeros((labels_best.shape[0], classes), dtype=np.float32)
-        target[:, pos[0]] = 0.5
-        target[:, pos[1]] = 0.5
+        target = np.zeros((n, classes), dtype=np.float32)
+        best_vals = labels_best[:, head_idx].astype(np.int64, copy=False)
+        second_vals = labels_second[:, head_idx].astype(np.int64, copy=False)
+        # Soft targets:
+        # - Always include best + second head values.
+        # - Weight them by bits margin so the model prefers the true best tuple when they differ.
+        for i in range(n):
+            b = int(best_vals[i])
+            s = int(second_vals[i])
+            if b == s:
+                target[i, b] = 1.0
+                continue
+            b_bits = float(bits_best[i])
+            s_bits = float(bits_second[i])
+            delta = max(0.0, s_bits - b_bits)
+            # Temperature is tuned to bits scale (a few bits difference should matter).
+            temp = float(target_temp)
+            w_best = 1.0
+            w_second = float(np.exp(-delta / temp))
+            z = w_best + w_second
+            target[i, b] = float(w_best / z)
+            target[i, s] = float(w_second / z)
         targets[head] = target
     return targets
+
+
+def standardize_features(
+    x_train: np.ndarray, x_valid: np.ndarray, *, eps: float = 1e-6
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if x_train.shape[1] == 0:
+        empty = np.empty((0,), dtype=np.float32)
+        return x_train.astype(np.float32, copy=False), x_valid.astype(np.float32, copy=False), empty, empty
+    mean = x_train.mean(axis=0, dtype=np.float64)
+    var = x_train.var(axis=0, dtype=np.float64)
+    std = np.sqrt(var + eps)
+    x_train_z = ((x_train - mean) / std).astype(np.float32, copy=False)
+    x_valid_z = ((x_valid - mean) / std).astype(np.float32, copy=False)
+    return x_train_z, x_valid_z, mean.astype(np.float32), std.astype(np.float32)
+
+
+def tuple_score_from_logits(logits: dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+    labels = labels.to(torch.int64)
+    score = torch.zeros((labels.shape[0],), device=labels.device, dtype=logits["predictor"].dtype)
+    for head_idx, head in enumerate(HEAD_ORDER):
+        ids = labels[:, head_idx]
+        score = score + logits[head].gather(1, ids[:, None]).squeeze(1)
+    return score
+
+
+def sample_negative_labels(
+    device: torch.device, batch_size: int, neg_k: int, *, generator: torch.Generator | None = None
+) -> dict[str, torch.Tensor]:
+    if neg_k <= 0:
+        raise ValueError("--neg-k must be positive")
+    neg: dict[str, torch.Tensor] = {}
+    for head in HEAD_ORDER:
+        classes = int(HEADS[head])
+        neg[head] = torch.randint(0, classes, (batch_size, neg_k), device=device, generator=generator, dtype=torch.int64)
+    return neg
+
+
+def tuple_scores_for_negatives(logits: dict[str, torch.Tensor], neg: dict[str, torch.Tensor]) -> torch.Tensor:
+    score = torch.zeros_like(neg["predictor"], dtype=logits["predictor"].dtype)
+    for head in HEAD_ORDER:
+        score = score + logits[head].gather(1, neg[head])
+    return score
+
+
+def tuple_ranking_loss(
+    logits: dict[str, torch.Tensor],
+    labels_best: torch.Tensor,
+    labels_second: torch.Tensor,
+    *,
+    neg_k: int,
+    neg: dict[str, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    bsz = int(labels_best.shape[0])
+    if neg is None:
+        neg = sample_negative_labels(labels_best.device, bsz, neg_k)
+    s_best = tuple_score_from_logits(logits, labels_best)
+    s_second = tuple_score_from_logits(logits, labels_second)
+    s_neg = tuple_scores_for_negatives(logits, neg)
+    loss_best_neg = F.softplus(-(s_best[:, None] - s_neg)).mean()
+    loss_second_neg = F.softplus(-(s_second[:, None] - s_neg)).mean()
+    loss_best_second = F.softplus(-(s_best - s_second)).mean()
+    return loss_best_neg + 0.5 * loss_second_neg + 0.5 * loss_best_second
+
+
+def train_all_heads(
+    device: torch.device,
+    models: dict[str, nn.Module],
+    x_train: torch.Tensor,
+    labels_best_train: torch.Tensor,
+    labels_second_train: torch.Tensor,
+    x_valid: torch.Tensor,
+    labels_best_valid: torch.Tensor,
+    labels_second_valid: torch.Tensor,
+    *,
+    batch_size: int,
+    max_epochs: int,
+    patience: int,
+    lr: float,
+    neg_k: int,
+    eval_topn: list[int],
+    trial_id: int,
+) -> tuple[float, int, dict[int, float]]:
+    params: list[torch.Tensor] = []
+    for m in models.values():
+        params.extend(list(m.parameters()))
+    optimizer = torch.optim.Adam(params, lr=lr)
+
+    best_valid_loss = float("inf")
+    epochs_no_improve = 0
+
+    best_hit_rate = -1.0
+    best_hit_epoch = 0
+    best_hit_rates_at: dict[int, float] = {n: 0.0 for n in eval_topn}
+    best_hit_state: dict[str, dict[str, torch.Tensor]] | None = None
+
+    n_train = int(x_train.shape[0])
+    n_valid = int(x_valid.shape[0])
+    train_slices = _batch_slices(n_train, batch_size)
+    valid_slices = _batch_slices(n_valid, batch_size)
+
+    pbar = tqdm(total=max_epochs, desc=f"trial {trial_id:04d} joint", leave=False, dynamic_ncols=True)
+    for epoch in range(max_epochs):
+        for m in models.values():
+            m.train()
+        order = torch.randperm(n_train, device=device, dtype=torch.int64)
+        for s, e in train_slices:
+            idx = order[s:e]
+            xb = x_train.index_select(0, idx)
+            best_b = labels_best_train.index_select(0, idx)
+            second_b = labels_second_train.index_select(0, idx)
+            optimizer.zero_grad()
+            logits = {name: model(xb) for name, model in models.items()}
+            loss = tuple_ranking_loss(logits, best_b, second_b, neg_k=neg_k)
+            loss.backward()
+            optimizer.step()
+
+        for m in models.values():
+            m.eval()
+        gen = torch.Generator(device=device)
+        gen.manual_seed(0xC0D3 + int(trial_id) * 1000 + int(epoch))
+        valid_losses: list[float] = []
+        with torch.no_grad():
+            for s, e in valid_slices:
+                xb = x_valid[s:e]
+                best_b = labels_best_valid[s:e]
+                second_b = labels_second_valid[s:e]
+                logits = {name: model(xb) for name, model in models.items()}
+                neg = sample_negative_labels(device, int(xb.shape[0]), neg_k, generator=gen)
+                loss = tuple_ranking_loss(logits, best_b, second_b, neg_k=neg_k, neg=neg)
+                valid_losses.append(float(loss.item()))
+        valid_loss = float(np.mean(valid_losses)) if valid_losses else float("inf")
+
+        # Best model selection by hit-rate.
+        valid_hit_rates_at = evaluate_hit_rates_at(
+            device,
+            models,
+            x_valid,
+            labels_best_valid.detach().cpu().numpy(),
+            labels_second_valid.detach().cpu().numpy(),
+            batch_size,
+            topn=eval_topn,
+            trial_id=trial_id,
+        )
+        valid_hit_rate = float(valid_hit_rates_at.get(3, 0.0))
+
+        if valid_hit_rate >= best_hit_rate + 1e-9:
+            best_hit_rate = valid_hit_rate
+            best_hit_epoch = epoch
+            best_hit_rates_at = valid_hit_rates_at
+            best_hit_state = {k: {n: v.detach().cpu().clone() for n, v in m.state_dict().items()} for k, m in models.items()}
+
+        if valid_loss < best_valid_loss - 1e-6:
+            best_valid_loss = valid_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        pbar.set_postfix_str(
+            f"loss={valid_loss:.5f} best_loss={best_valid_loss:.5f} hit@3={valid_hit_rate*100:.2f}% no_imp={epochs_no_improve}"
+        )
+        pbar.update(1)
+        if epochs_no_improve >= patience:
+            break
+    pbar.close()
+
+    if best_hit_state is None:
+        raise RuntimeError("failed to capture best hit-rate state")
+    for head, state in best_hit_state.items():
+        models[head].load_state_dict(state)
+    return best_valid_loss, best_hit_epoch, best_hit_rates_at
 
 
 def count_params(model: nn.Module) -> int:
@@ -392,7 +602,9 @@ def evaluate_hit_rates_at(
     with torch.no_grad():
         for s, e in batch_slices:
             xb = x_valid[s:e]
-            logits: dict[str, torch.Tensor] = {name: model(xb) for name, model in models.items()}
+            logits: dict[str, torch.Tensor] = {
+                name: torch.log_softmax(model(xb), dim=1) for name, model in models.items()
+            }
 
             pred_scores, pred_ids = _topk_with_tiebreak_torch(logits["predictor"], BEAM_WIDTHS["predictor"])
             perm_scores, perm_ids = _topk_with_tiebreak_torch(logits["cf_perm"], BEAM_WIDTHS["cf_perm"])
@@ -501,7 +713,15 @@ def main() -> None:
     ensure_dir(run_dir / "splits")
 
     max_blocks = args.max_blocks
-    if not args.smoke and max_blocks is None and args.in_dir.resolve() == Path("ml/source/packed_out").resolve():
+    if (
+        not args.smoke
+        and max_blocks is None
+        and args.in_dir.resolve()
+        in {
+            Path("ml/source/packed_out").resolve(),
+            Path("ml/source/packed_out_entropy0").resolve(),
+        }
+    ):
         max_blocks = 500_000
     dataset = build_dataset(
         run_dir,
@@ -520,6 +740,8 @@ def main() -> None:
         "patience": args.patience,
         "lr": args.lr,
         "batch_size": args.batch_size,
+        "neg_k": args.neg_k,
+        "target_temp": args.target_temp,
         "eval_topn": eval_topn,
         "run_id": run_id,
         "input_dir": str(args.in_dir),
@@ -534,6 +756,10 @@ def main() -> None:
         existing = json.loads(config_path.read_text(encoding="utf-8"))
         if "eval_topn" not in existing:
             existing["eval_topn"] = eval_topn
+        if "neg_k" not in existing:
+            existing["neg_k"] = args.neg_k
+        if "target_temp" not in existing:
+            existing["target_temp"] = args.target_temp
         if existing != config:
             raise SystemExit("config.json exists and differs; use a new run_id for material changes")
     else:
@@ -546,7 +772,14 @@ def main() -> None:
     best_path = run_dir / "best.json"
 
     bits_best = dataset.bits[:, 0]
-    targets = build_soft_targets(dataset.labels_best, bits_best)
+    bits_second = dataset.bits[:, 1]
+    targets = build_soft_targets(
+        dataset.labels_best,
+        dataset.labels_second,
+        bits_best,
+        bits_second,
+        target_temp=args.target_temp,
+    )
 
     if args.smoke:
         train_idx = dataset.train_indices[: min(256, dataset.train_indices.shape[0])]
@@ -573,10 +806,14 @@ def main() -> None:
             continue
         non_pixel_valid = apply_feature_pipeline(dataset.raw_numeric[valid_idx_sorted], feature_spec)
 
-        x_train_np = np.concatenate([dataset.pixels[train_idx_sorted], non_pixel_train], axis=1).astype(
+        non_pixel_train_z, non_pixel_valid_z, non_pixel_mean, non_pixel_std = standardize_features(
+            non_pixel_train, non_pixel_valid
+        )
+
+        x_train_np = np.concatenate([dataset.pixels[train_idx_sorted], non_pixel_train_z], axis=1).astype(
             np.float32, copy=False
         )
-        x_valid_np = np.concatenate([dataset.pixels[valid_idx_sorted], non_pixel_valid], axis=1).astype(
+        x_valid_np = np.concatenate([dataset.pixels[valid_idx_sorted], non_pixel_valid_z], axis=1).astype(
             np.float32, copy=False
         )
         input_dim = int(x_train_np.shape[1])
@@ -602,6 +839,10 @@ def main() -> None:
                 "name": feature_spec.name,
                 "raw_indices": feature_spec.raw_indices,
                 "transforms": feature_spec.transforms,
+            },
+            "feature_norm": {
+                "non_pixel_mean": non_pixel_mean.tolist(),
+                "non_pixel_std": non_pixel_std.tolist(),
             },
             "heads": {},
         }
@@ -715,6 +956,8 @@ def main() -> None:
                 "patience": args.patience,
                 "lr": args.lr,
                 "batch_size": args.batch_size,
+                "neg_k": args.neg_k,
+                "target_temp": args.target_temp,
                 "smoke": args.smoke,
             },
             "valid_loss_mean": valid_loss_mean,

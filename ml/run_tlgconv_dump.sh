@@ -6,7 +6,7 @@ python3 $THIS_DIR/run_tlgconv_dump.py \
     --jobs 15 \
     --input-dir $THIS_DIR/../test/copyrighted/ \
     --tlgconv $THIS_DIR/../build/tlgconv \
+    --tlgconv-args "--tlg8-force-entropy=plain" \
     --out-training-json $THIS_DIR/source/training-json \
     --out-label-cache $THIS_DIR/source/label-cache \
     --tlg8-temp-dir=/tmp/tlg8ml
-

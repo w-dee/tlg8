@@ -35,7 +35,7 @@ except Exception:
         return json.loads(data.decode("utf-8"))
 
 IN_DIR_CACHE_DIRNAME = ".tlg_ml_cache"
-IN_DIR_CACHE_VERSION = 1
+IN_DIR_CACHE_VERSION = 2
 
 LABEL_RECORD_DTYPE = np.dtype(
     [
@@ -142,6 +142,13 @@ def _is_eligible(row: dict[str, Any], labels: dict[str, int]) -> tuple[bool, str
         return False, "components"
     if row.get("best") is None or row.get("second") is None:
         return False, "best_or_second_null"
+    # Entropy is fixed to Plain (0) for the ML search.
+    best = row.get("best")
+    second = row.get("second")
+    if not (isinstance(best, dict) and isinstance(second, dict)):
+        return False, "best_or_second_type"
+    if int(best.get("entropy", -1)) != 0 or int(second.get("entropy", -1)) != 0:
+        return False, "entropy_not_plain"
     if labels["second_predictor"] == -1:
         return False, "second_missing"
     best_tuple = (

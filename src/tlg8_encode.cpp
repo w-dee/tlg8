@@ -687,6 +687,7 @@ namespace tlg::v8::enc
                        std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
                        DumpContext *training_ctx,
                        bool force_hilbert_reorder,
+                       int force_entropy,
                        std::string &err)
   {
     if (components == 0 || components > 4)
@@ -705,6 +706,11 @@ namespace tlg::v8::enc
 
     const auto &predictors = predictor_table();
     const auto &entropy_encoders = entropy_encoder_table();
+    if (force_entropy >= 0 && (force_entropy >= static_cast<int>(kNumEntropyEncoders)))
+    {
+      err = "tlg8: invalid forced entropy index";
+      return false;
+    }
     std::array<std::vector<int16_t>, kGolombRowCount> entropy_values;
     const size_t reserve_per_row = static_cast<size_t>(tile_w) * tile_h;
     for (auto &values : entropy_values)
@@ -816,7 +822,9 @@ namespace tlg::v8::enc
                                         components,
                                         value_count);
 
-                for (uint32_t entropy_index = 0; entropy_index < kNumEntropyEncoders; ++entropy_index)
+                const uint32_t entropy_begin = (force_entropy >= 0) ? static_cast<uint32_t>(force_entropy) : 0u;
+                const uint32_t entropy_end = (force_entropy >= 0) ? (entropy_begin + 1u) : kNumEntropyEncoders;
+                for (uint32_t entropy_index = entropy_begin; entropy_index < entropy_end; ++entropy_index)
                 {
                   const bool uses_interleave_candidate =
                       (interleave_index == static_cast<uint32_t>(InterleaveFilter::Interleave));

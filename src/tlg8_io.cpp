@@ -799,6 +799,7 @@ namespace tlg::v8
                        std::array<uint64_t, kReorderPatternCount> *reorder_histogram,
                        DumpContext *training_ctx,
                        bool force_hilbert_reorder,
+                       int force_entropy,
                        std::string &err);
 
     bool write_raw(FILE *fp,
@@ -818,6 +819,7 @@ namespace tlg::v8
                    const std::string &label_cache_bin_path,
                    const std::string &label_cache_meta_path,
                    bool force_hilbert_reorder,
+                   int force_entropy,
                    std::string &err,
                    uint64_t *out_entropy_bits)
     {
@@ -1113,6 +1115,7 @@ namespace tlg::v8
                                reorder_histogram_ptr,
                                training_ctx_ptr,
                                force_hilbert_reorder,
+                               force_entropy,
                                err))
             return false;
           if (!writer.align_to_u32_zero() || !writer.finish())

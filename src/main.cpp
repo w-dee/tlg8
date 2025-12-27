@@ -45,6 +45,7 @@ static void print_usage()
             << " [--label-cache-bin=<path>]"
             << " [--label-cache-meta=<path>]"
             << " [--tlg8-reorder=hilbert-only]"
+            << " [--tlg8-force-entropy=auto|plain|runlength]"
             << " [--print-entropy-bits]"
             << " [--tlg7-order=predictor-first|filter-first]\n";
   std::cerr << "  --label-cache-bin/--label-cache-meta は TLG8 エンコード時のみ有効で、"
@@ -286,6 +287,28 @@ int main(int argc, char **argv)
         return 2;
       }
     }
+    else if (arg.rfind("--tlg8-force-entropy=", 0) == 0)
+    {
+      const auto eq = arg.find('=');
+      if (eq == std::string::npos || eq + 1 >= arg.size())
+      {
+        std::cerr << "Invalid --tlg8-force-entropy option\n";
+        return 2;
+      }
+      std::string mode = arg.substr(eq + 1);
+      to_lower_inplace(mode);
+      if (mode == "auto")
+        tlgopt.tlg8_force_entropy = -1;
+      else if (mode == "plain" || mode == "0")
+        tlgopt.tlg8_force_entropy = 0;
+      else if (mode == "runlength" || mode == "rle" || mode == "1")
+        tlgopt.tlg8_force_entropy = 1;
+      else
+      {
+        std::cerr << "Invalid --tlg8-force-entropy: " << mode << "\n";
+        return 2;
+      }
+    }
     else if (arg.rfind("--tlg8-dump-training=", 0) == 0)
     {
       const auto eq = arg.find('=');
@@ -374,6 +397,12 @@ int main(int argc, char **argv)
   if (tlgopt.print_entropy_bits && tlgopt.version != 8)
   {
     std::cerr << "--print-entropy-bits は TLG8 エンコード時のみ使用できます\n";
+    return 2;
+  }
+
+  if (tlgopt.tlg8_force_entropy != -1 && tlgopt.version != 8)
+  {
+    std::cerr << "--tlg8-force-entropy は TLG8 エンコード時のみ使用できます\n";
     return 2;
   }
 
