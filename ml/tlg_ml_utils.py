@@ -247,6 +247,10 @@ def clamp_positive(x: np.ndarray) -> np.ndarray:
 
 
 def apply_transform(x: np.ndarray, kind: str, *, clip_min: float | None = None, clip_max: float | None = None) -> np.ndarray:
+    if clip_min is not None or clip_max is not None:
+        lo = -math.inf if clip_min is None else float(clip_min)
+        hi = math.inf if clip_max is None else float(clip_max)
+        x = np.clip(x, lo, hi)
     if kind == "log1p":
         return np.log1p(clamp_positive(x))
     if kind == "sqrt":
@@ -256,9 +260,7 @@ def apply_transform(x: np.ndarray, kind: str, *, clip_min: float | None = None, 
     if kind == "abs":
         return np.abs(x)
     if kind == "clip":
-        lo = -math.inf if clip_min is None else clip_min
-        hi = math.inf if clip_max is None else clip_max
-        return np.clip(x, lo, hi)
+        return x
     raise ValueError(f"unknown transform: {kind}")
 
 

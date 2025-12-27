@@ -188,7 +188,15 @@ def build_command(
     return cmd
 
 
-def run_job(input_path: str, command: List[str], mkdir_targets: List[str], dry_run: bool) -> JobResult:
+def run_job(
+    input_path: str,
+    command: List[str],
+    mkdir_targets: List[str],
+    *,
+    outputs_to_remove: Sequence[str] = (),
+    force: bool,
+    dry_run: bool,
+) -> JobResult:
     """Run a single tlgconv job.
 
     Note: We intentionally use ThreadPoolExecutor and pass only primitives/lists here.
@@ -201,6 +209,12 @@ def run_job(input_path: str, command: List[str], mkdir_targets: List[str], dry_r
 
     try:
         ensure_parent_dirs(mkdir_targets)
+        if force and outputs_to_remove:
+            for out in outputs_to_remove:
+                try:
+                    Path(out).unlink()
+                except FileNotFoundError:
+                    pass
         completed = subprocess.run(command, capture_output=True, text=True)
     except (FileNotFoundError, PermissionError, OSError) as e:
         msg = f"{type(e).__name__}: {e}"
@@ -257,7 +271,7 @@ def main() -> int:
         return 1
 
     extra_args = shlex.split(args.tlgconv_args)
-    runnable: List[tuple[str, List[str], List[str]]] = []
+    runnable: List[tuple[str, List[str], List[str], List[str]]] = []
     skipped: List[JobResult] = []
 
     for p in files:
@@ -281,14 +295,14 @@ def main() -> int:
             extra_args=extra_args,
         )
         mkdir_targets = [str(temp_out)] + [str(x) for x in required_outputs]
-        runnable.append((str(p), cmd, mkdir_targets))
+        runnable.append((str(p), cmd, mkdir_targets, [str(x) for x in required_outputs]))
 
     print(f"対象ファイル数: {len(files)}, 実行: {len(runnable)}, スキップ: {len(skipped)}")
     results: List[JobResult] = []
 
     if args.dry_run:
-        for input_path, cmd, mkdir_targets in runnable:
-            res = run_job(input_path, cmd, mkdir_targets, dry_run=True)
+        for input_path, cmd, mkdir_targets, _required_outputs in runnable:
+            res = run_job(input_path, cmd, mkdir_targets, outputs_to_remove=_required_outputs, force=args.force, dry_run=True)
             print(res.command)
             results.append(res)
     else:
@@ -296,8 +310,16 @@ def main() -> int:
         # and this avoids pickling/argparse.Namespace issues in multiprocessing.
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
             futures = [
-                executor.submit(run_job, input_path, cmd, mkdir_targets, False)
-                for (input_path, cmd, mkdir_targets) in runnable
+                executor.submit(
+                    run_job,
+                    input_path,
+                    cmd,
+                    mkdir_targets,
+                    outputs_to_remove=_required_outputs,
+                    force=args.force,
+                    dry_run=False,
+                )
+                for (input_path, cmd, mkdir_targets, _required_outputs) in runnable
             ]
             for future in concurrent.futures.as_completed(futures):
                 res = future.result()

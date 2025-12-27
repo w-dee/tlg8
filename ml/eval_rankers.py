@@ -64,7 +64,9 @@ def apply_feature_pipeline(raw_numeric: np.ndarray, spec: dict[str, Any]) -> np.
         raw_sel = np.empty((raw_numeric.shape[0], 0), dtype=np.float32)
     else:
         raw_sel = raw_numeric[:, raw_indices]
-    features = [raw_sel]
+    features: list[np.ndarray] = []
+    if bool(spec.get("include_raw", True)):
+        features.append(raw_sel)
     for transform in spec.get("transforms", []):
         kind = transform["kind"]
         if transform.get("apply_to") == "subset":
@@ -114,6 +116,8 @@ def evaluate_hit_rate(
     labels_second: np.ndarray,
     indices: np.ndarray,
     batch_size: int,
+    *,
+    score_mode: str,
 ) -> float:
     hits = 0
     total = indices.shape[0]
@@ -128,7 +132,12 @@ def evaluate_hit_rate(
         for (xb,) in loader:
             xb = xb.to(device)
             batch_size_local = xb.shape[0]
-            logits = {head: torch.log_softmax(model(xb), dim=1).detach().cpu().numpy() for head, model in models.items()}
+            if score_mode == "raw":
+                logits = {head: model(xb).detach().cpu().numpy() for head, model in models.items()}
+            else:
+                logits = {
+                    head: torch.log_softmax(model(xb), dim=1).detach().cpu().numpy() for head, model in models.items()
+                }
             for i in range(batch_size_local):
                 idx = indices[offset + i]
                 best = labels_best[idx]
@@ -174,6 +183,7 @@ def main() -> None:
     device = ensure_cuda()
 
     bundle = json.loads(args.bundle.read_text(encoding="utf-8"))
+    score_mode = str(bundle.get("score_mode", "log_softmax"))
     run_dir = args.run_root / args.run_id
     seed = args.seed
     config_path = run_dir / "config.json"
@@ -201,6 +211,7 @@ def main() -> None:
         dataset.labels_second,
         indices,
         args.batch_size,
+        score_mode=score_mode,
     )
 
     payload = {

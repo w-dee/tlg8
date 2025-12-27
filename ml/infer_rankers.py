@@ -94,7 +94,9 @@ def apply_feature_pipeline(raw_numeric: np.ndarray, spec: dict[str, Any]) -> np.
         raw_sel = np.empty((raw_numeric.shape[0], 0), dtype=np.float32)
     else:
         raw_sel = raw_numeric[:, raw_indices]
-    features = [raw_sel]
+    features: list[np.ndarray] = []
+    if bool(spec.get("include_raw", True)):
+        features.append(raw_sel)
     for transform in spec.get("transforms", []):
         kind = transform["kind"]
         if transform.get("apply_to") == "subset":
@@ -185,9 +187,14 @@ def main() -> None:
         feats = np.stack(batch_features, axis=0).astype(np.float32)
         feats_t = torch.from_numpy(feats).to(device)
         with torch.no_grad():
-            logits = {
-                head: torch.log_softmax(model(feats_t), dim=1).detach().cpu().numpy() for head, model in models.items()
-            }
+            score_mode = str(bundle.get("score_mode", "log_softmax"))
+            if score_mode == "raw":
+                logits = {head: model(feats_t).detach().cpu().numpy() for head, model in models.items()}
+            else:
+                logits = {
+                    head: torch.log_softmax(model(feats_t), dim=1).detach().cpu().numpy()
+                    for head, model in models.items()
+                }
         for i, row in enumerate(batch_rows):
             index = batch_indices[i]
             if args.require_eligible and not is_eligible(row):

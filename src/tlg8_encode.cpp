@@ -759,11 +759,48 @@ namespace tlg::v8::enc
         uint32_t best_reorder_index = 0;
         uint64_t best_bits = std::numeric_limits<uint64_t>::max();
         uint64_t second_bits = std::numeric_limits<uint64_t>::max();
+        uint64_t best_rank = std::numeric_limits<uint64_t>::max();
+        uint64_t second_rank = std::numeric_limits<uint64_t>::max();
         uint32_t second_predictor = 0;
         uint32_t second_filter = 0;
         uint32_t second_entropy = 0;
         uint32_t second_interleave = 0;
         uint32_t second_reorder_index = 0;
+
+        // Per-head best-case projection: for each head value, track the minimum bits across
+        // all evaluated full tuples that share that head value (independent per head).
+        std::array<uint64_t, kNumPredictors> proj_predictor_bits;
+        std::array<uint64_t, 6> proj_cf_perm_bits;
+        std::array<uint64_t, 4> proj_cf_primary_bits;
+        std::array<uint64_t, 4> proj_cf_secondary_bits;
+        std::array<uint64_t, kReorderPatternCount> proj_reorder_bits;
+        std::array<uint64_t, 2> proj_interleave_bits;
+        proj_predictor_bits.fill(std::numeric_limits<uint64_t>::max());
+        proj_cf_perm_bits.fill(std::numeric_limits<uint64_t>::max());
+        proj_cf_primary_bits.fill(std::numeric_limits<uint64_t>::max());
+        proj_cf_secondary_bits.fill(std::numeric_limits<uint64_t>::max());
+        proj_reorder_bits.fill(std::numeric_limits<uint64_t>::max());
+        proj_interleave_bits.fill(std::numeric_limits<uint64_t>::max());
+
+        // Candidate-specific cheap scores (for ML features).
+        constexpr double kBigScore = 1e30;
+        std::array<double, kNumPredictors> score_residual_energy_by_predictor;
+        std::array<double, kColorFilterCodeCount> score_filtered_energy_min_by_filter;
+        score_residual_energy_by_predictor.fill(kBigScore);
+        score_filtered_energy_min_by_filter.fill(kBigScore);
+        std::array<double, 6> score_filtered_energy_min_by_perm;
+        std::array<double, 4> score_filtered_energy_min_by_primary;
+        std::array<double, 4> score_filtered_energy_min_by_secondary;
+        score_filtered_energy_min_by_perm.fill(kBigScore);
+        score_filtered_energy_min_by_primary.fill(kBigScore);
+        score_filtered_energy_min_by_secondary.fill(kBigScore);
+        std::array<uint64_t, kColorFilterCodeCount> score_bits_plain_hilbert_none_min_by_filter;
+        score_bits_plain_hilbert_none_min_by_filter.fill(std::numeric_limits<uint64_t>::max());
+        std::array<uint64_t, kColorFilterCodeCount> score_bits_plain_hilbert_interleave_min_by_filter;
+        score_bits_plain_hilbert_interleave_min_by_filter.fill(std::numeric_limits<uint64_t>::max());
+        std::array<uint64_t, kNumPredictors * kNumInterleaveFilter * kColorFilterCodeCount>
+            bits_plain_hilbert_pred_interleave_filter;
+        bits_plain_hilbert_pred_interleave_filter.fill(std::numeric_limits<uint64_t>::max());
 
         component_colors candidate{};
         workspace.prepare(accessor, block_x, block_y, block_w, block_h, components);
@@ -779,6 +816,8 @@ namespace tlg::v8::enc
                                  block_w,
                                  block_h);
           const double residual_energy = compute_energy(candidate, components, value_count);
+          if (predictor_index < score_residual_energy_by_predictor.size())
+            score_residual_energy_by_predictor[predictor_index] = residual_energy;
           if (best_residual_energy < std::numeric_limits<double>::infinity() &&
               residual_energy > best_residual_energy * kEarlyExitGiveUpRate)
           {
@@ -797,6 +836,9 @@ namespace tlg::v8::enc
 
             component_colors filtered_before_reorder = filtered;
             const double filtered_energy = compute_energy(filtered, components, value_count);
+            if (filter_code < score_filtered_energy_min_by_filter.size())
+              score_filtered_energy_min_by_filter[filter_code] =
+                  std::min(score_filtered_energy_min_by_filter[filter_code], filtered_energy);
             if (best_filtered_energy < std::numeric_limits<double>::infinity() &&
                 filtered_energy > best_filtered_energy * kEarlyExitGiveUpRate)
             {
@@ -832,18 +874,83 @@ namespace tlg::v8::enc
                                                                                                 components,
                                                                                                 value_count,
                                                                                                 uses_interleave_candidate);
-                  if (estimated_bits < best_bits)
+                  const uint64_t tuple_rank =
+                      (((static_cast<uint64_t>(predictor_index) * 96u + static_cast<uint64_t>(filter_code)) * 8u +
+                        static_cast<uint64_t>(actual_reorder_index)) *
+                           2u +
+                       static_cast<uint64_t>(interleave_index));
+                  if (entropy_index == 0u &&
+                      actual_reorder_index == static_cast<uint32_t>(ReorderPattern::Hilbert) &&
+                      filter_code < score_bits_plain_hilbert_none_min_by_filter.size())
                   {
-                    if (best_bits < std::numeric_limits<uint64_t>::max())
+                    if (interleave_index == static_cast<uint32_t>(InterleaveFilter::None))
                     {
-                      second_bits = best_bits;
-                      second_predictor = best_predictor;
-                      second_filter = best_filter;
-                      second_entropy = best_entropy;
-                      second_interleave = best_interleave;
-                      second_reorder_index = best_reorder_index;
+                      score_bits_plain_hilbert_none_min_by_filter[filter_code] =
+                          std::min(score_bits_plain_hilbert_none_min_by_filter[filter_code], estimated_bits);
+                    }
+                    else if (interleave_index == static_cast<uint32_t>(InterleaveFilter::Interleave))
+                    {
+                      score_bits_plain_hilbert_interleave_min_by_filter[filter_code] =
+                          std::min(score_bits_plain_hilbert_interleave_min_by_filter[filter_code], estimated_bits);
+                    }
+                    if (predictor_index < kNumPredictors && interleave_index < kNumInterleaveFilter &&
+                        filter_code < kColorFilterCodeCount)
+                    {
+                      const size_t idx =
+                          (static_cast<size_t>(predictor_index) * kNumInterleaveFilter + interleave_index) *
+                              kColorFilterCodeCount +
+                          filter_code;
+                      bits_plain_hilbert_pred_interleave_filter[idx] =
+                          std::min(bits_plain_hilbert_pred_interleave_filter[idx], estimated_bits);
+                    }
+                  }
+
+                  // Update per-head projected minima.
+                  {
+                    proj_predictor_bits[predictor_index] =
+                        std::min(proj_predictor_bits[predictor_index], estimated_bits);
+                    int16_t perm = 0;
+                    int16_t primary = 0;
+                    int16_t secondary = 0;
+                    split_filter(static_cast<int>(filter_code), perm, primary, secondary);
+                    if (perm >= 0 && static_cast<size_t>(perm) < proj_cf_perm_bits.size())
+                      proj_cf_perm_bits[static_cast<size_t>(perm)] = std::min(
+                          proj_cf_perm_bits[static_cast<size_t>(perm)], estimated_bits);
+                    if (primary >= 0 && static_cast<size_t>(primary) < proj_cf_primary_bits.size())
+                      proj_cf_primary_bits[static_cast<size_t>(primary)] = std::min(
+                          proj_cf_primary_bits[static_cast<size_t>(primary)], estimated_bits);
+                    if (secondary >= 0 && static_cast<size_t>(secondary) < proj_cf_secondary_bits.size())
+                      proj_cf_secondary_bits[static_cast<size_t>(secondary)] = std::min(
+                          proj_cf_secondary_bits[static_cast<size_t>(secondary)], estimated_bits);
+                    if (actual_reorder_index < proj_reorder_bits.size())
+                      proj_reorder_bits[actual_reorder_index] =
+                          std::min(proj_reorder_bits[actual_reorder_index], estimated_bits);
+                    if (interleave_index < proj_interleave_bits.size())
+                      proj_interleave_bits[interleave_index] =
+                          std::min(proj_interleave_bits[interleave_index], estimated_bits);
+                  }
+
+                  const bool better_than_best =
+                      (estimated_bits < best_bits) || (estimated_bits == best_bits && tuple_rank < best_rank);
+                  if (better_than_best)
+                  {
+                    if (best_bits < std::numeric_limits<uint64_t>::max() && best_rank != tuple_rank)
+                    {
+                      const bool better_than_second =
+                          (best_bits < second_bits) || (best_bits == second_bits && best_rank < second_rank);
+                      if (better_than_second)
+                      {
+                        second_bits = best_bits;
+                        second_rank = best_rank;
+                        second_predictor = best_predictor;
+                        second_filter = best_filter;
+                        second_entropy = best_entropy;
+                        second_interleave = best_interleave;
+                        second_reorder_index = best_reorder_index;
+                      }
                     }
                     best_bits = estimated_bits;
+                    best_rank = tuple_rank;
                     best_predictor = predictor_index;
                     best_filter = filter_code;
                     best_entropy = entropy_index;
@@ -855,14 +962,20 @@ namespace tlg::v8::enc
                     best_reorder_pattern = reorder_pattern;
                     best_reorder_index = actual_reorder_index;
                   }
-                  else if (estimated_bits < second_bits)
+                  else if (tuple_rank != best_rank)
                   {
-                    second_bits = estimated_bits;
-                    second_predictor = predictor_index;
-                    second_filter = filter_code;
-                    second_entropy = entropy_index;
-                    second_interleave = interleave_index;
-                    second_reorder_index = actual_reorder_index;
+                    const bool better_than_second =
+                        (estimated_bits < second_bits) || (estimated_bits == second_bits && tuple_rank < second_rank);
+                    if (better_than_second)
+                    {
+                      second_bits = estimated_bits;
+                      second_rank = tuple_rank;
+                      second_predictor = predictor_index;
+                      second_filter = filter_code;
+                      second_entropy = entropy_index;
+                      second_interleave = interleave_index;
+                      second_reorder_index = actual_reorder_index;
+                    }
                   }
                 }
               }
@@ -916,6 +1029,290 @@ namespace tlg::v8::enc
             if (i > 0)
               std::fputc(',', ml_fp);
             std::fprintf(ml_fp, "%u", static_cast<unsigned int>(block_pixels[i]));
+          }
+          std::fputc(']', ml_fp);
+          std::fputc(',', ml_fp);
+
+          auto write_u64_array = [&](const char *key, const auto &arr)
+          {
+            write_json_string(ml_fp, key);
+            std::fputc(':', ml_fp);
+            std::fputc('[', ml_fp);
+            for (std::size_t i = 0; i < arr.size(); ++i)
+            {
+              if (i > 0)
+                std::fputc(',', ml_fp);
+              std::fprintf(ml_fp, "%llu", static_cast<unsigned long long>(arr[i]));
+            }
+            std::fputc(']', ml_fp);
+            std::fputc(',', ml_fp);
+          };
+
+          // Best-case projections used for training targets (not inference features).
+          write_u64_array("proj_predictor_bits", proj_predictor_bits);
+          write_u64_array("proj_cf_perm_bits", proj_cf_perm_bits);
+          write_u64_array("proj_cf_primary_bits", proj_cf_primary_bits);
+          write_u64_array("proj_cf_secondary_bits", proj_cf_secondary_bits);
+          write_u64_array("proj_reorder_bits", proj_reorder_bits);
+          write_u64_array("proj_interleave_bits", proj_interleave_bits);
+
+          auto write_double_array = [&](const char *key, const auto &arr)
+          {
+            write_json_string(ml_fp, key);
+            std::fputc(':', ml_fp);
+            std::fputc('[', ml_fp);
+            for (std::size_t i = 0; i < arr.size(); ++i)
+            {
+              if (i > 0)
+                std::fputc(',', ml_fp);
+              std::fprintf(ml_fp, "%.9g", arr[i]);
+            }
+            std::fputc(']', ml_fp);
+            std::fputc(',', ml_fp);
+          };
+
+          // Candidate-specific cheap score dumps (preferred over adding more neighbor pixels).
+          write_double_array("score_residual_energy_by_predictor", score_residual_energy_by_predictor);
+          write_double_array("score_filtered_energy_min_by_filter", score_filtered_energy_min_by_filter);
+          // Aggregate min energies by split filter components (helps the split heads).
+          for (int code = 0; code < static_cast<int>(kColorFilterCodeCount); ++code)
+          {
+            int16_t perm = 0;
+            int16_t primary = 0;
+            int16_t secondary = 0;
+            split_filter(code, perm, primary, secondary);
+            const double e = score_filtered_energy_min_by_filter[static_cast<size_t>(code)];
+            if (perm >= 0 && static_cast<size_t>(perm) < score_filtered_energy_min_by_perm.size())
+              score_filtered_energy_min_by_perm[static_cast<size_t>(perm)] =
+                  std::min(score_filtered_energy_min_by_perm[static_cast<size_t>(perm)], e);
+            if (primary >= 0 && static_cast<size_t>(primary) < score_filtered_energy_min_by_primary.size())
+              score_filtered_energy_min_by_primary[static_cast<size_t>(primary)] =
+                  std::min(score_filtered_energy_min_by_primary[static_cast<size_t>(primary)], e);
+            if (secondary >= 0 && static_cast<size_t>(secondary) < score_filtered_energy_min_by_secondary.size())
+              score_filtered_energy_min_by_secondary[static_cast<size_t>(secondary)] =
+                  std::min(score_filtered_energy_min_by_secondary[static_cast<size_t>(secondary)], e);
+          }
+          write_double_array("score_filtered_energy_min_by_perm", score_filtered_energy_min_by_perm);
+          write_double_array("score_filtered_energy_min_by_primary", score_filtered_energy_min_by_primary);
+          write_double_array("score_filtered_energy_min_by_secondary", score_filtered_energy_min_by_secondary);
+          std::array<double, kColorFilterCodeCount> score_bits_plain_hilbert_none_min_by_filter_f;
+          score_bits_plain_hilbert_none_min_by_filter_f.fill(1e9);
+          for (std::size_t i = 0; i < score_bits_plain_hilbert_none_min_by_filter.size(); ++i)
+          {
+            const uint64_t v = score_bits_plain_hilbert_none_min_by_filter[i];
+            if (v < std::numeric_limits<uint64_t>::max())
+              score_bits_plain_hilbert_none_min_by_filter_f[i] = static_cast<double>(v);
+          }
+          write_double_array("score_bits_plain_hilbert_none_min_by_filter", score_bits_plain_hilbert_none_min_by_filter_f);
+
+          std::array<double, kColorFilterCodeCount> score_bits_plain_hilbert_interleave_min_by_filter_f;
+          score_bits_plain_hilbert_interleave_min_by_filter_f.fill(1e9);
+          for (std::size_t i = 0; i < score_bits_plain_hilbert_interleave_min_by_filter.size(); ++i)
+          {
+            const uint64_t v = score_bits_plain_hilbert_interleave_min_by_filter[i];
+            if (v < std::numeric_limits<uint64_t>::max())
+              score_bits_plain_hilbert_interleave_min_by_filter_f[i] = static_cast<double>(v);
+          }
+          write_double_array(
+              "score_bits_plain_hilbert_interleave_min_by_filter",
+              score_bits_plain_hilbert_interleave_min_by_filter_f);
+
+          std::array<double, 6> score_bits_plain_hilbert_none_min_by_perm;
+          std::array<double, 4> score_bits_plain_hilbert_none_min_by_primary;
+          std::array<double, 4> score_bits_plain_hilbert_none_min_by_secondary;
+          score_bits_plain_hilbert_none_min_by_perm.fill(1e9);
+          score_bits_plain_hilbert_none_min_by_primary.fill(1e9);
+          score_bits_plain_hilbert_none_min_by_secondary.fill(1e9);
+          std::array<double, 6> score_bits_plain_hilbert_interleave_min_by_perm;
+          std::array<double, 4> score_bits_plain_hilbert_interleave_min_by_primary;
+          std::array<double, 4> score_bits_plain_hilbert_interleave_min_by_secondary;
+          score_bits_plain_hilbert_interleave_min_by_perm.fill(1e9);
+          score_bits_plain_hilbert_interleave_min_by_primary.fill(1e9);
+          score_bits_plain_hilbert_interleave_min_by_secondary.fill(1e9);
+          for (int code = 0; code < static_cast<int>(kColorFilterCodeCount); ++code)
+          {
+            int16_t perm = 0;
+            int16_t primary = 0;
+            int16_t secondary = 0;
+            split_filter(code, perm, primary, secondary);
+            const double b0 = score_bits_plain_hilbert_none_min_by_filter_f[static_cast<size_t>(code)];
+            const double b1 = score_bits_plain_hilbert_interleave_min_by_filter_f[static_cast<size_t>(code)];
+            if (perm >= 0 && static_cast<size_t>(perm) < score_bits_plain_hilbert_none_min_by_perm.size())
+            {
+              score_bits_plain_hilbert_none_min_by_perm[static_cast<size_t>(perm)] =
+                  std::min(score_bits_plain_hilbert_none_min_by_perm[static_cast<size_t>(perm)], b0);
+              score_bits_plain_hilbert_interleave_min_by_perm[static_cast<size_t>(perm)] =
+                  std::min(score_bits_plain_hilbert_interleave_min_by_perm[static_cast<size_t>(perm)], b1);
+            }
+            if (primary >= 0 && static_cast<size_t>(primary) < score_bits_plain_hilbert_none_min_by_primary.size())
+            {
+              score_bits_plain_hilbert_none_min_by_primary[static_cast<size_t>(primary)] =
+                  std::min(score_bits_plain_hilbert_none_min_by_primary[static_cast<size_t>(primary)], b0);
+              score_bits_plain_hilbert_interleave_min_by_primary[static_cast<size_t>(primary)] =
+                  std::min(score_bits_plain_hilbert_interleave_min_by_primary[static_cast<size_t>(primary)], b1);
+            }
+            if (secondary >= 0 && static_cast<size_t>(secondary) < score_bits_plain_hilbert_none_min_by_secondary.size())
+            {
+              score_bits_plain_hilbert_none_min_by_secondary[static_cast<size_t>(secondary)] =
+                  std::min(score_bits_plain_hilbert_none_min_by_secondary[static_cast<size_t>(secondary)], b0);
+              score_bits_plain_hilbert_interleave_min_by_secondary[static_cast<size_t>(secondary)] =
+                  std::min(score_bits_plain_hilbert_interleave_min_by_secondary[static_cast<size_t>(secondary)], b1);
+            }
+          }
+          write_double_array("score_bits_plain_hilbert_none_min_by_perm", score_bits_plain_hilbert_none_min_by_perm);
+          write_double_array("score_bits_plain_hilbert_none_min_by_primary", score_bits_plain_hilbert_none_min_by_primary);
+          write_double_array("score_bits_plain_hilbert_none_min_by_secondary", score_bits_plain_hilbert_none_min_by_secondary);
+          write_double_array(
+              "score_bits_plain_hilbert_interleave_min_by_perm",
+              score_bits_plain_hilbert_interleave_min_by_perm);
+          write_double_array(
+              "score_bits_plain_hilbert_interleave_min_by_primary",
+              score_bits_plain_hilbert_interleave_min_by_primary);
+          write_double_array(
+              "score_bits_plain_hilbert_interleave_min_by_secondary",
+              score_bits_plain_hilbert_interleave_min_by_secondary);
+
+          // Budgeted filter-bit proxy: top-2 predictors (by residual energy) × 96 filters × 2 interleave = 384 tuples.
+          {
+            std::array<std::pair<double, uint32_t>, kNumPredictors> pred_rank{};
+            for (uint32_t p = 0; p < kNumPredictors; ++p)
+              pred_rank[p] = {score_residual_energy_by_predictor[p], p};
+            std::sort(pred_rank.begin(), pred_rank.end(), [](const auto &a, const auto &b) {
+              if (a.first != b.first)
+                return a.first < b.first;
+              return a.second < b.second;
+            });
+            std::array<uint32_t, 2> top2_preds = {pred_rank[0].second, pred_rank[1].second};
+
+            std::array<double, kColorFilterCodeCount> top2_none_bits;
+            std::array<double, kColorFilterCodeCount> top2_interleave_bits;
+            top2_none_bits.fill(1e9);
+            top2_interleave_bits.fill(1e9);
+            for (uint32_t f = 0; f < kColorFilterCodeCount; ++f)
+            {
+              uint64_t best0 = std::numeric_limits<uint64_t>::max();
+              uint64_t best1 = std::numeric_limits<uint64_t>::max();
+              for (uint32_t k = 0; k < 2; ++k)
+              {
+                const uint32_t p = top2_preds[k];
+                const size_t base = static_cast<size_t>(p) * kNumInterleaveFilter * kColorFilterCodeCount;
+                best0 = std::min(best0, bits_plain_hilbert_pred_interleave_filter[base + 0 * kColorFilterCodeCount + f]);
+                best1 = std::min(best1, bits_plain_hilbert_pred_interleave_filter[base + 1 * kColorFilterCodeCount + f]);
+              }
+              if (best0 < std::numeric_limits<uint64_t>::max())
+                top2_none_bits[f] = static_cast<double>(best0);
+              if (best1 < std::numeric_limits<uint64_t>::max())
+                top2_interleave_bits[f] = static_cast<double>(best1);
+            }
+            write_double_array("score_bits_plain_hilbert_none_min_by_filter_top2pred", top2_none_bits);
+            write_double_array("score_bits_plain_hilbert_interleave_min_by_filter_top2pred", top2_interleave_bits);
+
+            std::array<double, 6> top2_none_by_perm;
+            std::array<double, 4> top2_none_by_primary;
+            std::array<double, 4> top2_none_by_secondary;
+            top2_none_by_perm.fill(1e9);
+            top2_none_by_primary.fill(1e9);
+            top2_none_by_secondary.fill(1e9);
+            std::array<double, 6> top2_int_by_perm;
+            std::array<double, 4> top2_int_by_primary;
+            std::array<double, 4> top2_int_by_secondary;
+            top2_int_by_perm.fill(1e9);
+            top2_int_by_primary.fill(1e9);
+            top2_int_by_secondary.fill(1e9);
+            for (int code = 0; code < static_cast<int>(kColorFilterCodeCount); ++code)
+            {
+              int16_t perm = 0;
+              int16_t primary = 0;
+              int16_t secondary = 0;
+              split_filter(code, perm, primary, secondary);
+              const double b0 = top2_none_bits[static_cast<size_t>(code)];
+              const double b1 = top2_interleave_bits[static_cast<size_t>(code)];
+              if (perm >= 0 && static_cast<size_t>(perm) < top2_none_by_perm.size())
+              {
+                top2_none_by_perm[static_cast<size_t>(perm)] = std::min(top2_none_by_perm[static_cast<size_t>(perm)], b0);
+                top2_int_by_perm[static_cast<size_t>(perm)] = std::min(top2_int_by_perm[static_cast<size_t>(perm)], b1);
+              }
+              if (primary >= 0 && static_cast<size_t>(primary) < top2_none_by_primary.size())
+              {
+                top2_none_by_primary[static_cast<size_t>(primary)] = std::min(top2_none_by_primary[static_cast<size_t>(primary)], b0);
+                top2_int_by_primary[static_cast<size_t>(primary)] = std::min(top2_int_by_primary[static_cast<size_t>(primary)], b1);
+              }
+              if (secondary >= 0 && static_cast<size_t>(secondary) < top2_none_by_secondary.size())
+              {
+                top2_none_by_secondary[static_cast<size_t>(secondary)] = std::min(top2_none_by_secondary[static_cast<size_t>(secondary)], b0);
+                top2_int_by_secondary[static_cast<size_t>(secondary)] = std::min(top2_int_by_secondary[static_cast<size_t>(secondary)], b1);
+              }
+            }
+            write_double_array("score_bits_plain_hilbert_none_min_by_perm_top2pred", top2_none_by_perm);
+            write_double_array("score_bits_plain_hilbert_none_min_by_primary_top2pred", top2_none_by_primary);
+            write_double_array("score_bits_plain_hilbert_none_min_by_secondary_top2pred", top2_none_by_secondary);
+            write_double_array("score_bits_plain_hilbert_interleave_min_by_perm_top2pred", top2_int_by_perm);
+            write_double_array("score_bits_plain_hilbert_interleave_min_by_primary_top2pred", top2_int_by_primary);
+            write_double_array("score_bits_plain_hilbert_interleave_min_by_secondary_top2pred", top2_int_by_secondary);
+          }
+          write_json_string(ml_fp, "score_best_residual_energy");
+          std::fprintf(ml_fp, ":%.9g,", best_residual_energy);
+          write_json_string(ml_fp, "score_best_filtered_energy");
+          std::fprintf(ml_fp, ":%.9g,", best_filtered_energy);
+
+          // Neighbor context (RGB only, fixed 8 pixels).
+          // This helps predictor/filter selection which depends on pixels outside the 8x8 block.
+          auto write_rgb_triplet = [&](uint8_t r, uint8_t g, uint8_t b) {
+            std::fprintf(ml_fp, "%u,%u,%u", (unsigned)r, (unsigned)g, (unsigned)b);
+          };
+          auto get_rgb_at = [&](int rel_x, int rel_y, uint8_t &out_r, uint8_t &out_g, uint8_t &out_b) {
+            const size_t base_index =
+                static_cast<size_t>(block_y + 1 + rel_y) * workspace.stride +
+                static_cast<size_t>(block_x + 1 + rel_x);
+            if (components == 3)
+            {
+              out_r = workspace.padded[0][base_index];
+              out_g = workspace.padded[1][base_index];
+              out_b = workspace.padded[2][base_index];
+            }
+            else
+            {
+              out_r = workspace.padded[1][base_index];
+              out_g = workspace.padded[2][base_index];
+              out_b = workspace.padded[3][base_index];
+            }
+          };
+
+          write_json_string(ml_fp, "pixels_top_rgb");
+          std::fputc(':', ml_fp);
+          std::fputc('[', ml_fp);
+          for (int xx = 0; xx < 8; ++xx)
+          {
+            if (xx > 0)
+              std::fputc(',', ml_fp);
+            uint8_t r, g, b;
+            get_rgb_at(xx, -1, r, g, b);
+            write_rgb_triplet(r, g, b);
+          }
+          std::fputc(']', ml_fp);
+          std::fputc(',', ml_fp);
+
+          write_json_string(ml_fp, "pixels_left_rgb");
+          std::fputc(':', ml_fp);
+          std::fputc('[', ml_fp);
+          for (int yy = 0; yy < 8; ++yy)
+          {
+            if (yy > 0)
+              std::fputc(',', ml_fp);
+            uint8_t r, g, b;
+            get_rgb_at(-1, yy, r, g, b);
+            write_rgb_triplet(r, g, b);
+          }
+          std::fputc(']', ml_fp);
+          std::fputc(',', ml_fp);
+
+          write_json_string(ml_fp, "pixel_topleft_rgb");
+          std::fputc(':', ml_fp);
+          std::fputc('[', ml_fp);
+          {
+            uint8_t r, g, b;
+            get_rgb_at(-1, -1, r, g, b);
+            write_rgb_triplet(r, g, b);
           }
           std::fputc(']', ml_fp);
           std::fputc(',', ml_fp);

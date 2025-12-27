@@ -13,12 +13,13 @@ from typing import Any, Iterable
 import numpy as np
 
 from tlg_ml_utils import (
-    RAW_RGB_DIMS,
-    build_raw_feature_names,
-    collect_numeric_schema,
-    ensure_dir,
-    extract_numeric_row,
-    extract_pixels_rgb,
+RAW_RGB_DIMS,
+build_raw_feature_names,
+collect_numeric_schema,
+ensure_dir,
+extract_numeric_row,
+extract_pixels_rgb,
+    HEADS,
     join_filter,
     load_json,
     now_iso,
@@ -35,7 +36,7 @@ except Exception:
         return json.loads(data.decode("utf-8"))
 
 IN_DIR_CACHE_DIRNAME = ".tlg_ml_cache"
-IN_DIR_CACHE_VERSION = 2
+IN_DIR_CACHE_VERSION = 5
 
 LABEL_RECORD_DTYPE = np.dtype(
     [
@@ -51,6 +52,13 @@ LABEL_RECORD_DTYPE = np.dtype(
 
 IGNORE_KEYS = {
     "pixels",
+    # Projections are used to build training targets; do not treat them as inference features.
+    "proj_predictor_bits",
+    "proj_cf_perm_bits",
+    "proj_cf_primary_bits",
+    "proj_cf_secondary_bits",
+    "proj_reorder_bits",
+    "proj_interleave_bits",
     "best",
     "second",
     "entropy",
@@ -60,7 +68,50 @@ IGNORE_KEYS = {
     "block_origin",
     "block_size",
     "components",
+    # Budgeted predictor-subset variants (top-4 omitted to keep schema/memory bounded).
+    "score_bits_plain_hilbert_none_min_by_filter_top4pred",
+    "score_bits_plain_hilbert_interleave_min_by_filter_top4pred",
+    "score_bits_plain_hilbert_none_min_by_perm_top4pred",
+    "score_bits_plain_hilbert_none_min_by_primary_top4pred",
+    "score_bits_plain_hilbert_none_min_by_secondary_top4pred",
+    "score_bits_plain_hilbert_interleave_min_by_perm_top4pred",
+    "score_bits_plain_hilbert_interleave_min_by_primary_top4pred",
+    "score_bits_plain_hilbert_interleave_min_by_secondary_top4pred",
 }
+
+PIXEL_DERIVED_NAMES = [
+    *[f"luma_pool4x4[{i}]" for i in range(16)],
+    *[f"luma_dct4x4[{i}]" for i in range(16)],
+    "luma_mean",
+    "luma_var",
+    "mean_r",
+    "mean_g",
+    "mean_b",
+    "var_r",
+    "var_g",
+    "var_b",
+    "grad_abs_dx_mean",
+    "grad_abs_dy_mean",
+    "grad_abs_mean",
+    "edge_density",
+]
+PIXEL_DERIVED_DIM = len(PIXEL_DERIVED_NAMES)
+
+HEAD_ORDER = ["predictor", "cf_perm", "cf_primary", "cf_secondary", "reorder", "interleave"]
+PROJ_KEYS = {
+    "predictor": "proj_predictor_bits",
+    "cf_perm": "proj_cf_perm_bits",
+    "cf_primary": "proj_cf_primary_bits",
+    "cf_secondary": "proj_cf_secondary_bits",
+    "reorder": "proj_reorder_bits",
+    "interleave": "proj_interleave_bits",
+}
+PROJ_OFFSETS = {}
+_off = 0
+for _head in HEAD_ORDER:
+    PROJ_OFFSETS[_head] = _off
+    _off += int(HEADS[_head])
+PROJ_TOTAL_DIM = _off
 
 
 @dataclass
@@ -74,6 +125,96 @@ class DatasetCache:
     indices: np.ndarray
     train_indices: np.ndarray
     valid_indices: np.ndarray
+    proj_top2: np.ndarray | None
+    proj_scores: np.ndarray | None
+
+
+def _luma_from_pixels(pixels_rgb_flat: np.ndarray) -> np.ndarray:
+    rgb = pixels_rgb_flat.reshape(8, 8, 3)
+    r = rgb[:, :, 0]
+    g = rgb[:, :, 1]
+    b = rgb[:, :, 2]
+    return (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32, copy=False)
+
+
+def _pool4x4(luma: np.ndarray) -> np.ndarray:
+    # Average pooling 2x2 blocks -> 4x4
+    pooled = np.empty((4, 4), dtype=np.float32)
+    for y in range(4):
+        for x in range(4):
+            block = luma[y * 2 : y * 2 + 2, x * 2 : x * 2 + 2]
+            pooled[y, x] = float(block.mean())
+    return pooled.reshape(-1)
+
+
+def _dct4x4(luma: np.ndarray) -> np.ndarray:
+    # Unnormalized low-frequency DCT (u,v < 4) on 8x8 luma.
+    # Precompute basis for speed.
+    n = 8
+    basis = np.empty((4, n), dtype=np.float32)
+    for u in range(4):
+        for x in range(n):
+            basis[u, x] = float(np.cos((2 * x + 1) * u * np.pi / (2 * n)))
+    coeffs = np.empty((4, 4), dtype=np.float32)
+    for v in range(4):
+        for u in range(4):
+            s = 0.0
+            for y in range(n):
+                for x in range(n):
+                    s += float(luma[y, x]) * float(basis[u, x]) * float(basis[v, y])
+            coeffs[v, u] = s
+    return coeffs.reshape(-1)
+
+
+def extract_pixel_derived_features(pixels_rgb_flat: np.ndarray) -> np.ndarray:
+    luma = _luma_from_pixels(pixels_rgb_flat)
+    pooled = _pool4x4(luma)
+    dct = _dct4x4(luma)
+    luma_mean = float(luma.mean())
+    luma_var = float(luma.var())
+
+    rgb = pixels_rgb_flat.reshape(8, 8, 3)
+    mean_r = float(rgb[:, :, 0].mean())
+    mean_g = float(rgb[:, :, 1].mean())
+    mean_b = float(rgb[:, :, 2].mean())
+    var_r = float(rgb[:, :, 0].var())
+    var_g = float(rgb[:, :, 1].var())
+    var_b = float(rgb[:, :, 2].var())
+
+    dx = np.abs(luma[:, 1:] - luma[:, :-1])
+    dy = np.abs(luma[1:, :] - luma[:-1, :])
+    grad_abs_dx_mean = float(dx.mean())
+    grad_abs_dy_mean = float(dy.mean())
+    grad_abs_mean = float(0.5 * (grad_abs_dx_mean + grad_abs_dy_mean))
+    edge_density = float(((dx > 0.08).mean() + (dy > 0.08).mean()) * 0.5)
+
+    feats = np.concatenate(
+        [
+            pooled.astype(np.float32, copy=False),
+            dct.astype(np.float32, copy=False),
+            np.asarray(
+                [
+                    luma_mean,
+                    luma_var,
+                    mean_r,
+                    mean_g,
+                    mean_b,
+                    var_r,
+                    var_g,
+                    var_b,
+                    grad_abs_dx_mean,
+                    grad_abs_dy_mean,
+                    grad_abs_mean,
+                    edge_density,
+                ],
+                dtype=np.float32,
+            ),
+        ],
+        axis=0,
+    )
+    if feats.shape[0] != PIXEL_DERIVED_DIM:
+        raise RuntimeError("pixel-derived feature dim mismatch")
+    return feats
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,7 +248,16 @@ def _iter_rows(training_path: Path, label_path: Path) -> Iterable[tuple[int, dic
         for idx, line in enumerate(tfp):
             if not line or line == b"\n":
                 raise ValueError(f"blank line in training.all.jsonl at line {idx + 1} (alignment would break)")
-            row = _loads_line(line)
+            try:
+                row = _loads_line(line)
+            except Exception as exc:
+                end_off = tfp.tell()
+                start_off = end_off - len(line)
+                preview = line[:256]
+                raise ValueError(
+                    f"failed to parse training.all.jsonl at line {idx + 1} byte_offset={start_off}: {exc}; "
+                    f"preview={preview!r}"
+                ) from exc
             labels = read_label_record(lfp)
             yield idx, row, labels
 
@@ -421,6 +571,8 @@ def load_dataset_cache(run_dir: Path) -> DatasetCache | None:
     labels_second_path = dataset_dir / "labels_second.npy"
     bits_path = dataset_dir / "bits.filtered.npy"
     index_path = dataset_dir / "indices.npy"
+    proj_top2_path = dataset_dir / "proj_top2.i16.npy"
+    proj_scores_path = dataset_dir / "proj_scores.f32.npy"
     split_path = run_dir / "splits" / "split.json"
     if not (
         pixels_path.exists()
@@ -443,6 +595,8 @@ def load_dataset_cache(run_dir: Path) -> DatasetCache | None:
     split = load_json(split_path)
     train_indices = np.asarray(split["train_indices"], dtype=np.int64)
     valid_indices = np.asarray(split["valid_indices"], dtype=np.int64)
+    proj_top2 = np.load(proj_top2_path) if proj_top2_path.exists() else None
+    proj_scores = np.load(proj_scores_path) if proj_scores_path.exists() else None
     return DatasetCache(
         pixels=pixels,
         raw_numeric=raw_numeric,
@@ -453,7 +607,38 @@ def load_dataset_cache(run_dir: Path) -> DatasetCache | None:
         indices=indices,
         train_indices=train_indices,
         valid_indices=valid_indices,
+        proj_top2=proj_top2,
+        proj_scores=proj_scores,
     )
+
+def _top2_from_proj(value: Any, classes: int) -> np.ndarray | None:
+    if not isinstance(value, list) or len(value) != classes:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.uint64)
+    except Exception:
+        return None
+    idx = np.arange(classes, dtype=np.int64)
+    order = np.lexsort((idx, arr))
+    top2 = order[:2].astype(np.int16, copy=False)
+    if top2.shape[0] != 2:
+        return None
+    return top2
+
+def _scores_from_proj(value: Any, classes: int) -> np.ndarray | None:
+    if not isinstance(value, list) or len(value) != classes:
+        return None
+    try:
+        bits = np.asarray(value, dtype=np.float64)
+    except Exception:
+        return None
+    max_u64 = float(np.iinfo(np.uint64).max)
+    # Unreachable entries stay at max_u64; map them to a very bad (large) cost.
+    bad = 1e30
+    bits = np.where(bits >= max_u64 * 0.5, bad, bits)
+    # Convert to a score (higher is better) and compress the dynamic range.
+    scores = -np.log1p(bits)
+    return scores.astype(np.float32, copy=False)
 
 
 def build_dataset(
@@ -514,7 +699,9 @@ def build_dataset(
 
     raw_dim = len(raw_names)
     pixels = np.empty((kept_rows, RAW_RGB_DIMS), dtype=np.float32)
-    raw_numeric = np.empty((kept_rows, raw_dim), dtype=np.float32)
+    raw_numeric = np.empty((kept_rows, raw_dim + PIXEL_DERIVED_DIM), dtype=np.float32)
+    proj_top2 = np.empty((kept_rows, len(HEAD_ORDER), 2), dtype=np.int16)
+    proj_scores = np.empty((kept_rows, PROJ_TOTAL_DIM), dtype=np.float32)
 
     labels_mm = np.memmap(label_path, dtype=LABEL_RECORD_DTYPE, mode="r", shape=(total_rows_expected,))
     labels_all = labels_mm["labels"]
@@ -539,8 +726,33 @@ def build_dataset(
                     f"blank line in training.all.jsonl at line {src_idx_int + 1} (alignment would break)"
                 )
             row = _loads_line(line)
-            pixels[i] = extract_pixels_rgb(row)
-            raw_numeric[i] = extract_numeric_row(row, schema)
+            pix = extract_pixels_rgb(row)
+            pixels[i] = pix
+            raw_row = extract_numeric_row(row, schema)
+            raw_numeric[i, :raw_dim] = raw_row
+            raw_numeric[i, raw_dim:] = extract_pixel_derived_features(pix)
+
+            # Training targets: per-head top-2 classes from best-case projections.
+            for head_idx, head in enumerate(HEAD_ORDER):
+                classes = int(HEADS[head])
+                key = PROJ_KEYS[head]
+                top2 = _top2_from_proj(row.get(key), classes)
+                if top2 is None:
+                    b = int(labels_best[i, head_idx])
+                    s = int(labels_second[i, head_idx])
+                    top2 = np.asarray([b, s], dtype=np.int16)
+                proj_top2[i, head_idx, :] = top2
+
+                scores = _scores_from_proj(row.get(key), classes)
+                if scores is None:
+                    # Fallback: only know best/second head values.
+                    scores = np.full((classes,), -1e6, dtype=np.float32)
+                    b = int(labels_best[i, head_idx])
+                    s = int(labels_second[i, head_idx])
+                    scores[b] = 0.0
+                    scores[s] = 0.0
+                off = int(PROJ_OFFSETS[head])
+                proj_scores[i, off : off + classes] = scores
 
     train_indices, valid_indices = _build_split(run_dir, seed, kept_rows)
 
@@ -548,9 +760,12 @@ def build_dataset(
     ensure_dir(dataset_dir)
     np.save(dataset_dir / "pixels.npy", pixels)
     np.save(dataset_dir / "raw_numeric.npy", raw_numeric)
-    save_json(dataset_dir / "raw_numeric_names.json", {"raw_names": raw_names})
+    raw_names_full = list(raw_names) + list(PIXEL_DERIVED_NAMES)
+    save_json(dataset_dir / "raw_numeric_names.json", {"raw_names": raw_names_full})
     np.save(dataset_dir / "labels_best.npy", labels_best)
     np.save(dataset_dir / "labels_second.npy", labels_second)
+    np.save(dataset_dir / "proj_top2.i16.npy", proj_top2)
+    np.save(dataset_dir / "proj_scores.f32.npy", proj_scores)
     np.save(dataset_dir / "bits.filtered.npy", bits)
     np.save(dataset_dir / "indices.npy", indices)
 
@@ -567,20 +782,26 @@ def build_dataset(
         "in_dir_cache_dir": str(paths["dir"]),
         "in_dir_cache_version": int(IN_DIR_CACHE_VERSION),
         "drop_reasons": drop_reasons,
-        "raw_numeric_dim": raw_dim,
+        "raw_numeric_dim": int(raw_dim + PIXEL_DERIVED_DIM),
+        "raw_numeric_dim_json": int(raw_dim),
+        "raw_numeric_dim_pixel_derived": int(PIXEL_DERIVED_DIM),
+        "proj_top2_shape": [int(kept_rows), int(len(HEAD_ORDER)), 2],
+        "proj_scores_shape": [int(kept_rows), int(PROJ_TOTAL_DIM)],
     }
     save_json(dataset_dir / "dataset_meta.json", meta)
 
     return DatasetCache(
         pixels=pixels,
         raw_numeric=raw_numeric,
-        raw_names=raw_names,
+        raw_names=raw_names_full,
         labels_best=labels_best,
         labels_second=labels_second,
         bits=bits,
         indices=indices,
         train_indices=train_indices,
         valid_indices=valid_indices,
+        proj_top2=proj_top2,
+        proj_scores=proj_scores,
     )
 
 

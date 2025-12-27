@@ -141,9 +141,16 @@ Entropy is NOT part of ML search:
   * components==4: `ARGBARGB...` (alpha dropped; keep RGB)
 * Normalize: `pixel_float = pixel_uint8 / 255.0`.
 
+### Neighbor pixels (policy)
+
+* Do **NOT** add any additional neighbor-pixel context beyond what is already present in the dataset.
+  * In particular, do not expand to larger neighborhoods (e.g., more rows/cols, multi-block context, or wider padding windows).
+  * If more signal is needed, prefer adding **candidate-specific cheap score dumps** (see below) rather than adding more neighbor pixels.
+
 ### Additional features
 
 * Use non-pixel numeric features present in JSONL (e.g., `reorder_tv_mean`, `reorder_tv2_mean`, etc.).
+* Prefer adding per-block **candidate-specific cheap score** features computed by the encoder (e.g., residual energy per predictor, min filtered energy per filter code).
 
 ### Feature search (agent allowed)
 

@@ -9,6 +9,7 @@
 /runs/
 /ml/runs/
 /ml/source/
+/ml/tmp*
 
 # Analysis temporary
 /analysis/
