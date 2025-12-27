@@ -47,10 +47,10 @@ def write_bits_sidecar(in_dir: Path, run_dir: Path, *, force: bool) -> Path:
 
     bits: list[tuple[int, int]] = []
     with training_path.open("r", encoding="utf-8") as fp:
-        for line in fp:
+        for line_no, line in enumerate(fp, start=1):
             line = line.strip()
             if not line:
-                continue
+                raise ValueError(f"blank line in training.all.jsonl at line {line_no} (alignment would break)")
             row = json.loads(line)
             bits.append(extract_bits_row(row))
 

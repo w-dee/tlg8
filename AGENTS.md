@@ -68,6 +68,10 @@ Input artifacts are produced by the C++ extractor and pack step.
 * `index.jsonl` (image offsets)
 * `labels.meta.json` (integrity metadata)
 
+In this repository, the packed artifacts are located at:
+
+* `ml/source/packed_out/`
+
 **Order guarantee:** `training.all.jsonl` and `labels.all.bin` are aligned in identical block order.
 
 ### LabelRecord format
@@ -108,6 +112,8 @@ Spec:
 * col0: `bits_best`
 * col1: `bits_second`
 * Block order MUST match `labels.all.bin`.
+
+Note: `bits_best/bits_second` are present in `training.all.jsonl` under `best.bits` / `second.bits`.
 
 ## Dataset Filtering Rules (MUST)
 
@@ -324,5 +330,11 @@ Required:
 * Always write append-only logs for recoverability.
 
 
-* 元画像から 生成した label-cache と training-json は ml/runs/ の下にあります。
+* 学習元画像から 生成した label-cache と training-json は ml/runs/ の下にあります。
 * 機械学習タスクでは CUDA を使用するようにしてください。
+
+Local defaults / constraints for this workspace:
+
+* Input packed dataset: `ml/source/packed_out/`
+* Budget: up to 60 minutes per trial, up to 100 trials total
+* GPU: default CUDA device (RTX 3070 Ti 16GB)
