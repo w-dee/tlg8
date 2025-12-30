@@ -260,7 +260,7 @@ Higher is better.
 
 ### Output
 
-Return top-3 full tuples (predictor, filter_code 0–95, reorder, interleave).
+Return top-32 full tuples (predictor, filter_code 0–95, reorder, interleave).
 
 Filter code is reconstructed from (perm, primary, secondary) using the inverse mapping consistent with `split_filter()` (implementation detail).
 
@@ -272,11 +272,78 @@ Entropy is fixed to Plain.
 
 A prediction is a hit if:
 
-* among the returned **top-3 full tuples**, at least one matches either of the block’s **true top-2** full tuples.
+* among the returned **top-32 full tuples**, at least one matches either of the block’s **true top-2** full tuples.
 
 ### Hard constraint
 
-* Valid hit-rate must be **≥ 90%**.
+* Valid hit-rate must be **≥ 95%** (hit@32).
+
+## Relaxation Proposals (NON-DEFAULT)
+
+This section is a concrete proposal for alternative objectives/modes beyond the default spec above.
+
+**Compatibility rule:** the strict spec above remains the default. A relaxed mode must be explicitly enabled (e.g., by adding a `--mode` flag to training/eval scripts and saving it into `bundle.json`/`config.json`). Existing runs and bundles remain readable; new modes must not break strict-mode behavior.
+
+### Mode A — Candidate-Reduction / Operational (Relax `top-3`)
+
+**What to relax**
+* **Output:** allow returning top-`K` tuples instead of fixed top-3. Suggested `K ∈ {8,16,32}`.
+* **Primary metric:** use hit@K instead of hit@3; keep hit@3 as a secondary metric for regressions.
+* **Hard constraint:** replace “valid hit-rate ≥ 90% (hit@3)” with a mode-specific threshold, e.g.:
+  * `hit@16 ≥ 90%` (or `hit@32 ≥ 95%`) as the primary gate, plus
+  * `#candidates` (K) bounded as the speed proxy.
+
+**Why this helps**
+* Empirically, increasing beam sizes often improves hit@10/hit@K without moving hit@3, suggesting the model can retrieve good candidates but not reliably place them in the top-3.
+
+**Risks**
+* Higher K reduces speed gains and may increase downstream encode time variance.
+* If encoder search cost is non-linear in candidate count, K increases may be expensive.
+
+**Verification steps**
+* Add `--topk` (or `--eval-topn`) to `ml/infer_rankers.py` and `ml/eval_rankers.py` and log `hit@{3,8,16,32}` side-by-side.
+* Validate on the same split: ensure `hit@K` monotonically increases with K and no unexpected regressions occur at hit@3.
+* End-to-end proxy: optionally measure encoder wall-clock on a fixed image set for K values (8/16/32).
+
+### Mode B — Two-Stage Re-Rank (Relax “independent heads only”)
+
+**What to relax**
+* Keep a light Stage-1 model to generate top-`M` candidates (e.g., 512–4096), then use a heavier Stage-2 model to re-rank and output top-3 (or top-K).
+* Stage-2 can use richer features (including candidate-dependent scores) while keeping Stage-1 lightweight.
+
+**Compatibility**
+* Stage-1 remains compatible with current `bundle.json` schema; Stage-2 introduces an optional `reranker` section in the bundle.
+* Inference stays deterministic: Stage-2 must preserve deterministic tie-break by tuple id.
+
+**Risks**
+* Implementation complexity and higher inference cost (but still far below exhaustive search if M is bounded).
+* More moving parts: failure modes in candidate enumeration or feature alignment.
+
+**Verification steps**
+* Add `ml/train_reranker.py`, `ml/infer_reranker.py`, `ml/eval_reranker.py` (or integrate into existing scripts behind `--mode rerank`).
+* Unit checks: reranker input candidates are stable across runs; no tuple reconstruction mismatch.
+* Compare: strict head-only top-3 vs rerank top-3 on the same valid split; track both hit@3 and “bits regret” (see Mode C).
+
+### Mode C — Objective/Labeling Relaxation (Optimize ranking, not projection top-2)
+
+**What to relax**
+* Replace the per-head projection target with a training objective aligned to the final tuple ranking:
+  * sampled listwise/pairwise ranking (e.g., sampled softmax / contrastive) over candidate tuples, or
+  * joint scorer over `(predictor, filter_i, reorder)` (or full tuple) with candidate sampling.
+* Add a secondary metric that matches candidate-reduction utility:
+  * **bits regret@K:** `min(bits among predicted top-K) - bits_best` (mean/median/95p).
+
+**Compatibility**
+* Keep `bits.all.npy` alignment invariant; log any new sampling strategy and candidate universe definition into `progress.jsonl`.
+
+**Risks**
+* Sampling bias: poor negative sampling can inflate metrics without real gains.
+* More GPU memory pressure; higher risk of training instability.
+
+**Verification steps**
+* Track: hit@{3,8,16}, bits regret@{3,8,16}, and candidate count.
+* Sanity: bits regret@K should be ≤ 0 when the true best is retrieved; distribution should improve with K.
+* Reproducibility: fixed seed sampling and a saved candidate sampling manifest (optional) for exact reruns.
 
 ## Trial Definition (fixed)
 

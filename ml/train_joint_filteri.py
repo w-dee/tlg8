@@ -25,12 +25,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--embed-dim", type=int, default=64)
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--prior-weight", type=float, default=1.0)
     parser.add_argument("--filterbits-temp", type=float, default=20.0)
     parser.add_argument("--energy-temp", type=float, default=1.0)
     parser.add_argument("--eval-samples", type=int, default=50_000)
+    parser.add_argument("--eval-topn", type=str, default="1,3,10")
+    parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
 
@@ -48,10 +51,14 @@ def _find_feature_indices(raw_names: list[str], prefix: str, expected: int) -> l
 
 
 def _filteri_prior(raw_numeric: np.ndarray, raw_names: list[str], idx: np.ndarray, *, temp: float) -> np.ndarray:
-    bits0_idx = _find_feature_indices(raw_names, "score_bits_plain_hilbert_none_min_by_filter[", 96)
-    bits1_idx = _find_feature_indices(raw_names, "score_bits_plain_hilbert_interleave_min_by_filter[", 96)
+    # Prefer predictor-budgeted variants if present (cheap predictor↔filter interaction hint).
+    bits0_idx = _find_feature_indices(raw_names, "score_bits_plain_hilbert_none_min_by_filter_top2pred[", 96)
+    bits1_idx = _find_feature_indices(raw_names, "score_bits_plain_hilbert_interleave_min_by_filter_top2pred[", 96)
     if not bits0_idx or not bits1_idx:
-        raise SystemExit("missing filterbits arrays for filter_i prior")
+        bits0_idx = _find_feature_indices(raw_names, "score_bits_plain_hilbert_none_min_by_filter[", 96)
+        bits1_idx = _find_feature_indices(raw_names, "score_bits_plain_hilbert_interleave_min_by_filter[", 96)
+    if not bits0_idx or not bits1_idx:
+        raise SystemExit("missing filterbits arrays for filter_i prior (expected 96×2 arrays)")
     if temp <= 0:
         raise SystemExit("--filterbits-temp must be positive")
     bits0 = raw_numeric[idx][:, bits0_idx].astype(np.float32, copy=False)
@@ -117,6 +124,12 @@ def main() -> None:
     ensure_dir(run_dir / "artifacts")
     ensure_dir(run_dir / "dataset")
     ensure_dir(run_dir / "splits")
+
+    if args.smoke:
+        args.max_blocks = min(int(args.max_blocks), 50_000)
+        args.max_epochs = min(int(args.max_epochs), 1)
+        args.batch_size = min(int(args.batch_size), 64)
+        args.eval_samples = min(int(args.eval_samples), 5_000)
 
     dataset = build_dataset(run_dir, args.in_dir, int(args.seed), rebuild=False, max_blocks=int(args.max_blocks))
 
@@ -186,6 +199,8 @@ def main() -> None:
     for epoch in range(int(args.max_epochs)):
         model.train()
         order = torch.randperm(n_train, device=device)
+        loss_sum = 0.0
+        loss_n = 0
         for s in range(0, n_train, bs):
             e = min(s + bs, n_train)
             idx = order[s:e]
@@ -203,13 +218,23 @@ def main() -> None:
             lp_s = logp[row, s_idx_t.index_select(0, idx)]
             loss = -0.5 * (lp_b + lp_s).mean()
             loss.backward()
+            if float(args.grad_clip) > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
             opt.step()
-        print(f"[epoch {epoch}] loss={float(loss.item()):.5f}", flush=True)
+            loss_sum += float(loss.item()) * int(idx.shape[0])
+            loss_n += int(idx.shape[0])
+        mean_loss = loss_sum / max(1, loss_n)
+        print(f"[epoch {epoch}] loss={mean_loss:.5f}", flush=True)
 
-    # Evaluate: score tuples for a subset of valid rows, pick top-3, compare to true top-2 tuples.
+    topn = sorted({int(p.strip()) for p in str(args.eval_topn).split(",") if p.strip()})
+    if not topn:
+        raise SystemExit("--eval-topn must not be empty")
+    max_k = max(topn)
+
+    # Evaluate: score tuples for a subset of valid rows, compute hit@K (true top-2 membership).
     model.eval()
     eval_n = min(int(args.eval_samples), int(x_valid.shape[0]))
-    hits = 0
+    hits = {k: 0 for k in topn}
     with torch.no_grad():
         for s in range(0, eval_n, bs):
             e = min(s + bs, eval_n)
@@ -220,26 +245,32 @@ def main() -> None:
                 + prior_r_va_t[s:e][:, tuples_t[:, 2]]
             )
             scores = model.score_many(xb, tuples_t) + prior
-            top3 = torch.topk(scores, k=3, dim=1).indices.detach().cpu().numpy()
+            topk = torch.topk(scores, k=max_k, dim=1).indices.detach().cpu().numpy()
+
             # decode + compare
             b = dataset.labels_best[valid_idx_sorted[s:e]].astype(np.int64)
             sc = dataset.labels_second[valid_idx_sorted[s:e]].astype(np.int64)
             for i in range(e - s):
                 bt = (int(b[i, 0]), join_filter(int(b[i, 1]), int(b[i, 2]), int(b[i, 3])), int(b[i, 4]), int(b[i, 5]))
                 st = (int(sc[i, 0]), join_filter(int(sc[i, 1]), int(sc[i, 2]), int(sc[i, 3])), int(sc[i, 4]), int(sc[i, 5]))
-                ok = False
-                for j in top3[i]:
+
+                # Build a prefix set progressively to compute hit@k.
+                # (max_k is small; keep this simple and deterministic.)
+                prefix: list[tuple[int, int, int, int]] = []
+                for j in topk[i]:
                     p, fi, r = tuples[j]
                     filt = int(fi % 96)
                     inter = int(fi // 96)
-                    tup = (int(p), filt, int(r), inter)
-                    if tup == bt or tup == st:
-                        ok = True
-                        break
-                if ok:
-                    hits += 1
-    hit_rate = float(hits) / float(eval_n)
-    print(f"[eval] hit@3={hit_rate*100:.2f}% (N={eval_n})", flush=True)
+                    prefix.append((int(p), filt, int(r), inter))
+
+                for k in topn:
+                    cand = prefix[:k]
+                    if bt in cand or st in cand:
+                        hits[k] += 1
+
+    hit_rates = {k: float(hits[k]) / float(eval_n) for k in topn}
+    hit_str = " ".join(f"hit@{k}={hit_rates[k]*100:.2f}%" for k in topn)
+    print(f"[eval] {hit_str} (N={eval_n})", flush=True)
 
     trial_dir = run_dir / "artifacts" / "trial_0000"
     ensure_dir(trial_dir)
@@ -263,7 +294,8 @@ def main() -> None:
             "filterbits_temp": float(args.filterbits_temp),
             "energy_temp": float(args.energy_temp),
         },
-        "eval_hit3": hit_rate,
+        "eval_topn": topn,
+        "valid_hit_rates_at": {str(k): float(hit_rates[k]) for k in topn},
         "eval_n": eval_n,
     }
     save_json(trial_dir / "bundle.json", bundle)
@@ -271,7 +303,7 @@ def main() -> None:
         "trial_id": 0,
         "timestamp": now_iso(),
         "bundle_path": str(trial_dir / "bundle.json"),
-        "eval_hit3": hit_rate,
+        "valid_hit_rates_at": {str(k): float(hit_rates[k]) for k in topn},
         "eval_n": eval_n,
         "status": "ok",
     }
@@ -281,7 +313,10 @@ def main() -> None:
         if isinstance(v, Path):
             config[k] = str(v)
     save_json(run_dir / "config.json", config)
-    save_json(run_dir / "best.json", {"best_trial_id": 0, "eval_hit3": hit_rate, "bundle_path": str(trial_dir / "bundle.json")})
+    save_json(
+        run_dir / "best.json",
+        {"best_trial_id": 0, "valid_hit_rates_at": {str(k): float(hit_rates[k]) for k in topn}, "bundle_path": str(trial_dir / "bundle.json")},
+    )
 
 
 if __name__ == "__main__":

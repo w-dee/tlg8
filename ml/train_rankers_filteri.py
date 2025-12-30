@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from dataset_builder import build_dataset
 from tlg_ml_utils import RAW_RGB_DIMS, ensure_dir, join_filter, now_iso, save_json, topk_with_tiebreak
@@ -18,6 +19,7 @@ from tlg_ml_utils import RAW_RGB_DIMS, ensure_dir, join_filter, now_iso, save_js
 
 HEAD_ORDER = ["predictor", "filter_i", "reorder"]
 HEADS = {"predictor": 8, "filter_i": 192, "reorder": 8}
+TRIAD_TUPLES = int(8 * 192 * 8)
 
 
 class MLP(nn.Module):
@@ -61,6 +63,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-temp", type=float, default=1.0)
     parser.add_argument("--target-temp", type=float, default=10.0, help="Temperature for best/second bits soft targets")
     parser.add_argument("--eval-topn", type=str, default="1,3,10")
+    parser.add_argument("--reranker-embed-dim", type=int, default=0)
+    parser.add_argument("--reranker-hidden", type=int, default=256)
+    parser.add_argument("--reranker-epochs", type=int, default=5)
+    parser.add_argument("--reranker-lr", type=float, default=1e-3)
+    parser.add_argument("--reranker-batch-size", type=int, default=256)
+    parser.add_argument("--reranker-candidates", type=int, default=2048)
+    parser.add_argument("--reranker-scale", type=float, default=0.1)
+    parser.add_argument("--reranker-neg-k", type=int, default=64)
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
@@ -138,6 +148,34 @@ def _energy_prior(raw_numeric: np.ndarray, raw_names: list[str], idx: np.ndarray
     return pred.astype(np.float32, copy=False), reorder.astype(np.float32, copy=False)
 
 
+def _pred_reorder_bits_prior(
+    raw_numeric: np.ndarray, raw_names: list[str], idx: np.ndarray, *, temp: float
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    # Optional: min bits by predictor/reorder, computed by encoder (Plain entropy).
+    # If present, use it as an additional logit prior (lower bits => higher logit).
+    if temp <= 0:
+        raise SystemExit("--filterbits-temp must be positive")
+
+    p0_idx = _find_feature_indices(raw_names, "score_bits_plain_none_min_by_predictor[", 8)
+    p1_idx = _find_feature_indices(raw_names, "score_bits_plain_interleave_min_by_predictor[", 8)
+    r0_idx = _find_feature_indices(raw_names, "score_bits_plain_none_min_by_reorder[", 8)
+    r1_idx = _find_feature_indices(raw_names, "score_bits_plain_interleave_min_by_reorder[", 8)
+    if not p0_idx or not p1_idx or not r0_idx or not r1_idx:
+        return None, None
+
+    p0 = raw_numeric[idx][:, p0_idx].astype(np.float32, copy=False)
+    p1 = raw_numeric[idx][:, p1_idx].astype(np.float32, copy=False)
+    r0 = raw_numeric[idx][:, r0_idx].astype(np.float32, copy=False)
+    r1 = raw_numeric[idx][:, r1_idx].astype(np.float32, copy=False)
+
+    p = np.minimum(p0, p1)
+    r = np.minimum(r0, r1)
+
+    p_base = p - p.min(axis=1, keepdims=True)
+    r_base = r - r.min(axis=1, keepdims=True)
+    return (-p_base / float(temp)).astype(np.float32, copy=False), (-r_base / float(temp)).astype(np.float32, copy=False)
+
+
 def _targets_bits_weighted(
     labels_best: np.ndarray, labels_second: np.ndarray, bits: np.ndarray, *, target_temp: float
 ) -> dict[str, np.ndarray]:
@@ -179,6 +217,260 @@ def _targets_bits_weighted(
 
 def _batch_slices(n: int, bs: int) -> list[tuple[int, int]]:
     return [(i, min(i + bs, n)) for i in range(0, n, bs)]
+
+
+def _triad_tuple_id(pred: np.ndarray, filter_i: np.ndarray, reorder: np.ndarray) -> np.ndarray:
+    return ((pred.astype(np.int64) * 192 + filter_i.astype(np.int64)) * 8 + reorder.astype(np.int64)).astype(np.int64)
+
+
+class TriadReranker(nn.Module):
+    def __init__(self, input_dim: int, embed_dim: int, hidden: int) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.embed_dim = int(embed_dim)
+        self.hidden = int(hidden)
+        if self.embed_dim <= 0:
+            raise ValueError("TriadReranker embed_dim must be positive")
+        if self.hidden <= 0:
+            raise ValueError("TriadReranker hidden must be positive")
+        self.x_net = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden),
+            nn.ReLU(),
+            nn.Linear(self.hidden, self.embed_dim),
+            nn.ReLU(),
+        )
+        self.emb_pred = nn.Embedding(8, self.embed_dim)
+        self.emb_fi = nn.Embedding(192, self.embed_dim)
+        self.emb_re = nn.Embedding(8, self.embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.embed_dim * 2, self.hidden),
+            nn.ReLU(),
+            nn.Linear(self.hidden, 1),
+        )
+
+    def score_many(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        # labels: [B,K,3] with columns (pred, filter_i, reorder)
+        x_emb = self.x_net(x).to(torch.float32)  # [B,D]
+        labels = labels.to(torch.int64)
+        t_emb = self.emb_pred(labels[:, :, 0]) + self.emb_fi(labels[:, :, 1]) + self.emb_re(labels[:, :, 2])  # [B,K,D]
+        x_exp = x_emb[:, None, :].expand(-1, t_emb.shape[1], -1)
+        feat = torch.cat([x_exp, t_emb], dim=2).reshape(-1, self.embed_dim * 2)
+        out = self.mlp(feat).reshape(t_emb.shape[0], t_emb.shape[1])
+        return out
+
+    def score_pos(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        # labels: [B,3]
+        x_emb = self.x_net(x).to(torch.float32)
+        labels = labels.to(torch.int64)
+        t_emb = self.emb_pred(labels[:, 0]) + self.emb_fi(labels[:, 1]) + self.emb_re(labels[:, 2])
+        feat = torch.cat([x_emb, t_emb], dim=1)
+        return self.mlp(feat).squeeze(1)
+
+
+def _stage1_topk_candidates(
+    device: torch.device,
+    pred_logp: torch.Tensor,
+    fi_logp: torch.Tensor,
+    re_logp: torch.Tensor,
+    *,
+    k: int,
+) -> torch.Tensor:
+    # pred_logp: [B,8], fi_logp: [B,192], re_logp: [B,8] (log-prob; higher is better)
+    bsz = int(pred_logp.shape[0])
+    k = int(min(k, TRIAD_TUPLES))
+    # [B,8,192,8] -> [B,12288]
+    scores = pred_logp[:, :, None, None] + fi_logp[:, None, :, None] + re_logp[:, None, None, :]
+    flat = scores.reshape(bsz, -1)
+    top = torch.topk(flat, k=k, dim=1).indices  # [B,k] of tuple ids in the fixed order
+    # Decode tuple ids to (pred, fi, re).
+    tid = top.to(torch.int64)
+    re = (tid % 8).to(torch.int64)
+    tmp = (tid // 8).to(torch.int64)
+    fi = (tmp % 192).to(torch.int64)
+    pred = (tmp // 192).to(torch.int64)
+    out = torch.stack([pred, fi, re], dim=2).to(device)
+    return out
+
+
+def _find_pos_in_candidates(cand: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # cand: [B,K,3], b/s: [B,3] -> returns indices in [0..K-1] or -1.
+    # K is modest (<=4096); O(B*K) is acceptable.
+    bsz, k, _ = cand.shape
+    eq_b = (cand == b[:, None, :]).all(dim=2)  # [B,K]
+    eq_s = (cand == s[:, None, :]).all(dim=2)  # [B,K]
+    has_b = eq_b.any(dim=1)
+    has_s = eq_s.any(dim=1)
+    idx_b = torch.where(has_b, eq_b.to(torch.int64).argmax(dim=1), torch.full((bsz,), -1, device=cand.device, dtype=torch.int64))
+    idx_s = torch.where(has_s, eq_s.to(torch.int64).argmax(dim=1), torch.full((bsz,), -1, device=cand.device, dtype=torch.int64))
+    return idx_b, idx_s
+
+
+def _train_reranker(
+    device: torch.device,
+    reranker: TriadReranker,
+    x_train: torch.Tensor,
+    x_valid: torch.Tensor,
+    pred_logp_train: torch.Tensor,
+    fi_logp_train: torch.Tensor,
+    re_logp_train: torch.Tensor,
+    pred_logp_valid: torch.Tensor,
+    fi_logp_valid: torch.Tensor,
+    re_logp_valid: torch.Tensor,
+    best_ids_train: torch.Tensor,
+    second_ids_train: torch.Tensor,
+    best_ids_valid: torch.Tensor,
+    second_ids_valid: torch.Tensor,
+    *,
+    candidates: int,
+    batch_size: int,
+    lr: float,
+    epochs: int,
+    scale: float,
+    neg_k: int,
+) -> dict[str, Any]:
+    opt = torch.optim.Adam(reranker.parameters(), lr=float(lr))
+    n_train = int(x_train.shape[0])
+    n_valid = int(x_valid.shape[0])
+    cand_k = int(min(int(candidates), TRIAD_TUPLES))
+    neg_k = int(max(1, min(int(neg_k), cand_k - 1)))
+
+    best_hit32 = -1.0
+    best_state: dict[str, torch.Tensor] | None = None
+    best_metrics: dict[str, float] = {}
+
+    for epoch in range(int(epochs)):
+        reranker.train()
+        order = torch.randperm(n_train, device=device)
+        loss_sum = 0.0
+        loss_n = 0
+        recall_sum = 0.0
+        recall_n = 0
+        for s, e in _batch_slices(n_train, batch_size):
+            idx = order[s:e]
+            xb = x_train.index_select(0, idx)
+            pb = pred_logp_train.index_select(0, idx)
+            fb = fi_logp_train.index_select(0, idx)
+            rb = re_logp_train.index_select(0, idx)
+            cand = _stage1_topk_candidates(device, pb, fb, rb, k=cand_k)  # [B,K,3]
+
+            b_pos = best_ids_train.index_select(0, idx)
+            s_pos = second_ids_train.index_select(0, idx)
+            idx_b, idx_s = _find_pos_in_candidates(cand, b_pos, s_pos)
+            has_b = idx_b >= 0
+            has_s = idx_s >= 0
+            any_pos = has_b | has_s
+            if any_pos.any():
+                bsz = int(xb.shape[0])
+                row = torch.arange(bsz, device=device)
+
+                # Sample negatives from the candidate set, excluding positives.
+                w = torch.ones((bsz, cand.shape[1]), device=device, dtype=torch.float32)
+                w[row[has_b], idx_b[has_b]] = 0.0
+                w[row[has_s], idx_s[has_s]] = 0.0
+                neg_idx = torch.multinomial(w, num_samples=neg_k, replacement=False)  # [B,neg_k]
+
+                neg_labels = cand.gather(1, neg_idx[:, :, None].expand(-1, -1, 3))  # [B,neg_k,3]
+
+                # Base scores (stage-1) for pos/neg.
+                neg_base = pb.gather(1, neg_labels[:, :, 0]) + fb.gather(1, neg_labels[:, :, 1]) + rb.gather(1, neg_labels[:, :, 2])
+
+                # Reranker scores for neg.
+                neg_r = reranker.score_many(xb, neg_labels)
+                neg_score = neg_base + float(scale) * neg_r
+
+                loss_terms: list[torch.Tensor] = []
+                if has_b.any():
+                    b_lbl = b_pos
+                    b_base = pb.gather(1, b_lbl[:, 0:1]).squeeze(1) + fb.gather(1, b_lbl[:, 1:2]).squeeze(1) + rb.gather(1, b_lbl[:, 2:3]).squeeze(1)
+                    b_score = b_base + float(scale) * reranker.score_pos(xb, b_lbl)
+                    loss_b = -F.logsigmoid((b_score[:, None] - neg_score)).mean(dim=1)
+                    loss_terms.append(torch.where(has_b, loss_b, torch.zeros_like(loss_b)))
+                if has_s.any():
+                    s_lbl = s_pos
+                    s_base = pb.gather(1, s_lbl[:, 0:1]).squeeze(1) + fb.gather(1, s_lbl[:, 1:2]).squeeze(1) + rb.gather(1, s_lbl[:, 2:3]).squeeze(1)
+                    s_score = s_base + float(scale) * reranker.score_pos(xb, s_lbl)
+                    loss_s = -F.logsigmoid((s_score[:, None] - neg_score)).mean(dim=1)
+                    loss_terms.append(torch.where(has_s, loss_s, torch.zeros_like(loss_s)))
+                loss_vec = sum(loss_terms) / float(len(loss_terms)) if loss_terms else torch.zeros((bsz,), device=device, dtype=torch.float32)
+                loss = loss_vec[any_pos].mean()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                loss_sum += float(loss.item()) * int(any_pos.sum().item())
+                loss_n += int(any_pos.sum().item())
+            recall_sum += float(any_pos.to(torch.float32).mean().item()) * int(xb.shape[0])
+            recall_n += int(xb.shape[0])
+
+        train_loss = loss_sum / max(1, loss_n)
+        train_recall = recall_sum / max(1, recall_n)
+
+        # Eval: hit@{3,10,16,32} on full valid split for the reranker output (within candidate set).
+        reranker.eval()
+        topn = [3, 10, 16, 32]
+        hits = {k: 0 for k in topn}
+        recall_any = 0
+        with torch.no_grad():
+            for s, e in _batch_slices(n_valid, batch_size):
+                xb = x_valid[s:e]
+                pb = pred_logp_valid[s:e]
+                fb = fi_logp_valid[s:e]
+                rb = re_logp_valid[s:e]
+                cand = _stage1_topk_candidates(device, pb, fb, rb, k=cand_k)
+                b_pos = best_ids_valid[s:e]
+                s_pos = second_ids_valid[s:e]
+                idx_b, idx_s = _find_pos_in_candidates(cand, b_pos, s_pos)
+                has_b = idx_b >= 0
+                has_s = idx_s >= 0
+                any_pos = has_b | has_s
+                recall_any += int(any_pos.sum().item())
+
+                pred_ids = cand[:, :, 0]
+                fi_ids = cand[:, :, 1]
+                re_ids = cand[:, :, 2]
+                base = pb.gather(1, pred_ids) + fb.gather(1, fi_ids) + rb.gather(1, re_ids)
+                scores = base + float(scale) * reranker.score_many(xb, cand)
+                max_k = max(topn)
+                top = torch.topk(scores, k=min(max_k, cand.shape[1]), dim=1).indices  # [B,max_k]
+                cand_cpu = cand.detach().cpu()
+                top_cpu = top.detach().cpu()
+                b_cpu = b_pos.detach().cpu()
+                s_cpu = s_pos.detach().cpu()
+                for i in range(int(xb.shape[0])):
+                    rows = cand_cpu[i, top_cpu[i], :]  # [max_k,3]
+                    for k in topn:
+                        r = rows[:k]
+                        if bool(((r == b_cpu[i]).all(dim=1)).any() or ((r == s_cpu[i]).all(dim=1)).any()):
+                            hits[k] += 1
+        eval_hit = {k: float(hits[k]) / float(n_valid) for k in topn}
+        eval_recall = float(recall_any) / float(n_valid)
+
+        hit32 = float(eval_hit[32])
+        if hit32 > best_hit32 + 1e-9:
+            best_hit32 = hit32
+            best_metrics = {
+                "train_loss": float(train_loss),
+                "train_recall_any": float(train_recall),
+                "valid_recall_any": float(eval_recall),
+                **{f"valid_hit@{k}": float(eval_hit[k]) for k in topn},
+            }
+            best_state = {n: v.detach().cpu().clone() for n, v in reranker.state_dict().items()}
+
+        hit_str = " ".join(f"hit@{k}={eval_hit[k]*100:.2f}%" for k in topn)
+        print(
+            f"[reranker epoch {epoch}] train_loss={train_loss:.4f} train_recall={train_recall*100:.2f}% "
+            f"valid_recall={eval_recall*100:.2f}% valid {hit_str}",
+            flush=True,
+        )
+
+    if best_state is not None:
+        reranker.load_state_dict(best_state)
+    return {
+        "best_metrics": best_metrics,
+        "best_hit32": float(best_hit32),
+        "candidates": cand_k,
+        "scale": float(scale),
+        "neg_k": int(neg_k),
+    }
 
 
 def _train_head(
@@ -259,26 +551,47 @@ def evaluate_hit_rates(
     max_n = int(max(topn))
     hits = {n: 0 for n in topn}
     total = int(labels_best.shape[0])
+
+    pK = int(beam["predictor"])
+    fK = int(beam["filter_i"])
+    rK = int(beam["reorder"])
+
     for i in range(total):
         b = labels_best[i]
         s = labels_second[i]
         bt = (int(b[0]), join_filter(int(b[1]), int(b[2]), int(b[3])), int(b[4]), int(b[5]))
         st = (int(s[0]), join_filter(int(s[1]), int(s[2]), int(s[3])), int(s[4]), int(s[5]))
-        p_top = _topk_np(logits["predictor"][i], beam["predictor"])
-        f_top = _topk_np(logits["filter_i"][i], beam["filter_i"])
-        r_top = _topk_np(logits["reorder"][i], beam["reorder"])
-        cand: list[tuple[float, tuple[int, int, int, int]]] = []
-        for pid, ps in p_top:
-            for fid, fs in f_top:
-                filt = int(fid % 96)
-                inter = int(fid // 96)
-                for rid, rs in r_top:
-                    cand.append((float(ps + fs + rs), (int(pid), filt, int(rid), inter)))
-        cand.sort(key=lambda x: (-x[0], x[1]))
-        top = [t for _, t in cand[:max_n]]
+
+        # Stable top-k by class id (deterministic tie-break).
+        p_idx = np.argsort(-logits["predictor"][i], kind="stable")[:pK]
+        f_idx = np.argsort(-logits["filter_i"][i], kind="stable")[:fK]
+        r_idx = np.argsort(-logits["reorder"][i], kind="stable")[:rK]
+
+        p_scores = logits["predictor"][i][p_idx]  # [pK]
+        f_scores = logits["filter_i"][i][f_idx]  # [fK]
+        r_scores = logits["reorder"][i][r_idx]  # [rK]
+
+        # Scores in deterministic tuple order (pid-major, then fid, then rid).
+        score = (p_scores[:, None, None] + f_scores[None, :, None] + r_scores[None, None, :]).astype(np.float32, copy=False)
+        flat = score.reshape(-1)
+
+        # Sort by (-score, tuple_id) with tuple_id ascending.
+        order = np.lexsort((np.arange(flat.shape[0], dtype=np.int64), -flat))[:max_n]
+
+        top: list[tuple[int, int, int, int]] = []
+        for t in order.tolist():
+            pid = int(p_idx[t // (fK * rK)])
+            rem = int(t % (fK * rK))
+            fid = int(f_idx[rem // rK])
+            rid = int(r_idx[rem % rK])
+            filt = int(fid % 96)
+            inter = int(fid // 96)
+            top.append((pid, filt, rid, inter))
+
         for n_top in topn:
             if bt in top[:n_top] or st in top[:n_top]:
                 hits[n_top] += 1
+
     return {k: float(hits[k]) / float(total) for k in topn}
 
 
@@ -299,6 +612,10 @@ def main() -> None:
         args.max_epochs = min(int(args.max_epochs), 2)
         args.patience = min(int(args.patience), 1)
         args.batch_size = min(int(args.batch_size), 256)
+        args.reranker_epochs = min(int(args.reranker_epochs), 1)
+        args.reranker_batch_size = min(int(args.reranker_batch_size), 128)
+        args.reranker_candidates = min(int(args.reranker_candidates), 512)
+        args.reranker_neg_k = min(int(args.reranker_neg_k), 32)
 
     dataset = build_dataset(run_dir, args.in_dir, int(args.seed), rebuild=False, max_blocks=int(args.max_blocks))
 
@@ -329,10 +646,21 @@ def main() -> None:
     prior_filter_i_v = _filteri_prior(dataset.raw_numeric, dataset.raw_names, valid_idx_sorted, temp=float(args.filterbits_temp)) * prior_w
     prior_pred, prior_re = _energy_prior(dataset.raw_numeric, dataset.raw_names, train_idx_sorted, temp=float(args.energy_temp))
     prior_pred_v, prior_re_v = _energy_prior(dataset.raw_numeric, dataset.raw_names, valid_idx_sorted, temp=float(args.energy_temp))
+    bits_pred, bits_re = _pred_reorder_bits_prior(
+        dataset.raw_numeric, dataset.raw_names, train_idx_sorted, temp=float(args.filterbits_temp)
+    )
+    bits_pred_v, bits_re_v = _pred_reorder_bits_prior(
+        dataset.raw_numeric, dataset.raw_names, valid_idx_sorted, temp=float(args.filterbits_temp)
+    )
     prior_pred = prior_pred * prior_w
     prior_re = prior_re * prior_w
     prior_pred_v = prior_pred_v * prior_w
     prior_re_v = prior_re_v * prior_w
+    if bits_pred is not None and bits_re is not None and bits_pred_v is not None and bits_re_v is not None:
+        prior_pred = prior_pred + bits_pred * prior_w
+        prior_re = prior_re + bits_re * prior_w
+        prior_pred_v = prior_pred_v + bits_pred_v * prior_w
+        prior_re_v = prior_re_v + bits_re_v * prior_w
 
     priors_train = {
         "predictor": torch.from_numpy(prior_pred).to(device),
@@ -396,10 +724,63 @@ def main() -> None:
         beam=beam,
     )
 
+    rerank_metrics: dict[str, Any] | None = None
+    reranker: TriadReranker | None = None
+    if int(args.reranker_embed_dim) > 0:
+        # Stage-1 log-prob tables used to generate candidates.
+        with torch.no_grad():
+            logp_train = {h: torch.log_softmax(models[h](x_train) + priors_train[h], dim=1) for h in HEAD_ORDER}
+            logp_valid = {h: torch.log_softmax(models[h](x_valid) + priors_valid[h], dim=1) for h in HEAD_ORDER}
+
+        # Best/second labels for triad (predictor, filter_i, reorder).
+        def _labels_to_triad(lb: np.ndarray, ls: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            lb = lb.astype(np.int64, copy=False)
+            ls = ls.astype(np.int64, copy=False)
+            b_filter = (lb[:, 1] << 4) | (lb[:, 2] << 2) | lb[:, 3]
+            s_filter = (ls[:, 1] << 4) | (ls[:, 2] << 2) | ls[:, 3]
+            b_fi = b_filter + 96 * lb[:, 5]
+            s_fi = s_filter + 96 * ls[:, 5]
+            b = np.stack([lb[:, 0], b_fi, lb[:, 4]], axis=1)
+            s = np.stack([ls[:, 0], s_fi, ls[:, 4]], axis=1)
+            return b, s
+
+        b_tr_np, s_tr_np = _labels_to_triad(dataset.labels_best[train_idx_sorted], dataset.labels_second[train_idx_sorted])
+        b_va_np, s_va_np = _labels_to_triad(dataset.labels_best[valid_idx_sorted], dataset.labels_second[valid_idx_sorted])
+        b_tr = torch.from_numpy(b_tr_np).to(device)
+        s_tr = torch.from_numpy(s_tr_np).to(device)
+        b_va = torch.from_numpy(b_va_np).to(device)
+        s_va = torch.from_numpy(s_va_np).to(device)
+
+        reranker = TriadReranker(int(x_train.shape[1]), int(args.reranker_embed_dim), int(args.reranker_hidden)).to(device)
+        rerank_metrics = _train_reranker(
+            device,
+            reranker,
+            x_train,
+            x_valid,
+            logp_train["predictor"],
+            logp_train["filter_i"],
+            logp_train["reorder"],
+            logp_valid["predictor"],
+            logp_valid["filter_i"],
+            logp_valid["reorder"],
+            b_tr,
+            s_tr,
+            b_va,
+            s_va,
+            candidates=int(args.reranker_candidates),
+            batch_size=int(args.reranker_batch_size),
+            lr=float(args.reranker_lr),
+            epochs=int(args.reranker_epochs),
+            scale=float(args.reranker_scale),
+            neg_k=int(args.reranker_neg_k),
+        )
+
     trial_dir = run_dir / "artifacts" / "trial_0000"
     ensure_dir(trial_dir)
     for head in HEAD_ORDER:
         torch.save(models[head].state_dict(), trial_dir / f"{head}.pt")
+    if reranker is not None:
+        torch.save(reranker.state_dict(), trial_dir / "reranker.pt")
 
     bundle = {
         "run_id": args.run_id,
@@ -423,6 +804,22 @@ def main() -> None:
         "eval_topn": topn,
         "valid_hit_rates_at": {str(k): float(v) for k, v in hit_rates.items()},
         "beam": beam,
+        "reranker": (
+            None
+            if reranker is None
+            else {
+            "path": str(trial_dir / "reranker.pt"),
+            "embed_dim": int(args.reranker_embed_dim),
+            "hidden": int(args.reranker_hidden),
+            "epochs": int(args.reranker_epochs),
+            "lr": float(args.reranker_lr),
+            "batch_size": int(args.reranker_batch_size),
+            "candidates": int(args.reranker_candidates),
+            "scale": float(args.reranker_scale),
+            "neg_k": int(args.reranker_neg_k),
+            "best_metrics": None if rerank_metrics is None else rerank_metrics.get("best_metrics", {}),
+            }
+        ),
     }
     save_json(trial_dir / "bundle.json", bundle)
     save_json(trial_dir / "eval.json", {"valid_hit_rates_at": {str(k): float(v) for k, v in hit_rates.items()}})
@@ -435,6 +832,7 @@ def main() -> None:
         "head_losses": losses,
         "head_best_epoch": epochs,
         "valid_hit_rates_at": {str(k): float(v) for k, v in hit_rates.items()},
+        "reranker": None if rerank_metrics is None else rerank_metrics.get("best_metrics", {}),
         "bundle_path": str(trial_dir / "bundle.json"),
         "status": "ok",
     }

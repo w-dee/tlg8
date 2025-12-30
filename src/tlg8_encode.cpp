@@ -798,6 +798,16 @@ namespace tlg::v8::enc
         score_bits_plain_hilbert_none_min_by_filter.fill(std::numeric_limits<uint64_t>::max());
         std::array<uint64_t, kColorFilterCodeCount> score_bits_plain_hilbert_interleave_min_by_filter;
         score_bits_plain_hilbert_interleave_min_by_filter.fill(std::numeric_limits<uint64_t>::max());
+        // Min bits by predictor/reorder across all tuples (Plain entropy only).
+        // These are cheap candidate-dependent priors and help recover interactions without adding pixels.
+        std::array<uint64_t, kNumPredictors> score_bits_plain_none_min_by_predictor;
+        std::array<uint64_t, kNumPredictors> score_bits_plain_interleave_min_by_predictor;
+        score_bits_plain_none_min_by_predictor.fill(std::numeric_limits<uint64_t>::max());
+        score_bits_plain_interleave_min_by_predictor.fill(std::numeric_limits<uint64_t>::max());
+        std::array<uint64_t, kReorderPatternCount> score_bits_plain_none_min_by_reorder;
+        std::array<uint64_t, kReorderPatternCount> score_bits_plain_interleave_min_by_reorder;
+        score_bits_plain_none_min_by_reorder.fill(std::numeric_limits<uint64_t>::max());
+        score_bits_plain_interleave_min_by_reorder.fill(std::numeric_limits<uint64_t>::max());
         std::array<uint64_t, kNumPredictors * kNumInterleaveFilter * kColorFilterCodeCount>
             bits_plain_hilbert_pred_interleave_filter;
         bits_plain_hilbert_pred_interleave_filter.fill(std::numeric_limits<uint64_t>::max());
@@ -879,6 +889,27 @@ namespace tlg::v8::enc
                         static_cast<uint64_t>(actual_reorder_index)) *
                            2u +
                        static_cast<uint64_t>(interleave_index));
+                  if (entropy_index == 0u)
+                  {
+                    if (predictor_index < score_bits_plain_none_min_by_predictor.size() &&
+                        actual_reorder_index < score_bits_plain_none_min_by_reorder.size())
+                    {
+                      if (interleave_index == static_cast<uint32_t>(InterleaveFilter::None))
+                      {
+                        score_bits_plain_none_min_by_predictor[predictor_index] =
+                            std::min(score_bits_plain_none_min_by_predictor[predictor_index], estimated_bits);
+                        score_bits_plain_none_min_by_reorder[actual_reorder_index] =
+                            std::min(score_bits_plain_none_min_by_reorder[actual_reorder_index], estimated_bits);
+                      }
+                      else if (interleave_index == static_cast<uint32_t>(InterleaveFilter::Interleave))
+                      {
+                        score_bits_plain_interleave_min_by_predictor[predictor_index] =
+                            std::min(score_bits_plain_interleave_min_by_predictor[predictor_index], estimated_bits);
+                        score_bits_plain_interleave_min_by_reorder[actual_reorder_index] =
+                            std::min(score_bits_plain_interleave_min_by_reorder[actual_reorder_index], estimated_bits);
+                      }
+                    }
+                  }
                   if (entropy_index == 0u &&
                       actual_reorder_index == static_cast<uint32_t>(ReorderPattern::Hilbert) &&
                       filter_code < score_bits_plain_hilbert_none_min_by_filter.size())
@@ -1116,6 +1147,38 @@ namespace tlg::v8::enc
           write_double_array(
               "score_bits_plain_hilbert_interleave_min_by_filter",
               score_bits_plain_hilbert_interleave_min_by_filter_f);
+
+          std::array<double, kNumPredictors> score_bits_plain_none_min_by_predictor_f;
+          std::array<double, kNumPredictors> score_bits_plain_interleave_min_by_predictor_f;
+          score_bits_plain_none_min_by_predictor_f.fill(1e9);
+          score_bits_plain_interleave_min_by_predictor_f.fill(1e9);
+          for (std::size_t i = 0; i < kNumPredictors; ++i)
+          {
+            const uint64_t v0 = score_bits_plain_none_min_by_predictor[i];
+            const uint64_t v1 = score_bits_plain_interleave_min_by_predictor[i];
+            if (v0 < std::numeric_limits<uint64_t>::max())
+              score_bits_plain_none_min_by_predictor_f[i] = static_cast<double>(v0);
+            if (v1 < std::numeric_limits<uint64_t>::max())
+              score_bits_plain_interleave_min_by_predictor_f[i] = static_cast<double>(v1);
+          }
+          write_double_array("score_bits_plain_none_min_by_predictor", score_bits_plain_none_min_by_predictor_f);
+          write_double_array("score_bits_plain_interleave_min_by_predictor", score_bits_plain_interleave_min_by_predictor_f);
+
+          std::array<double, kReorderPatternCount> score_bits_plain_none_min_by_reorder_f;
+          std::array<double, kReorderPatternCount> score_bits_plain_interleave_min_by_reorder_f;
+          score_bits_plain_none_min_by_reorder_f.fill(1e9);
+          score_bits_plain_interleave_min_by_reorder_f.fill(1e9);
+          for (std::size_t i = 0; i < kReorderPatternCount; ++i)
+          {
+            const uint64_t v0 = score_bits_plain_none_min_by_reorder[i];
+            const uint64_t v1 = score_bits_plain_interleave_min_by_reorder[i];
+            if (v0 < std::numeric_limits<uint64_t>::max())
+              score_bits_plain_none_min_by_reorder_f[i] = static_cast<double>(v0);
+            if (v1 < std::numeric_limits<uint64_t>::max())
+              score_bits_plain_interleave_min_by_reorder_f[i] = static_cast<double>(v1);
+          }
+          write_double_array("score_bits_plain_none_min_by_reorder", score_bits_plain_none_min_by_reorder_f);
+          write_double_array("score_bits_plain_interleave_min_by_reorder", score_bits_plain_interleave_min_by_reorder_f);
 
           std::array<double, 6> score_bits_plain_hilbert_none_min_by_perm;
           std::array<double, 4> score_bits_plain_hilbert_none_min_by_primary;
