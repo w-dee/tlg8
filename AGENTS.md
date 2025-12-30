@@ -305,6 +305,12 @@ This section is a concrete proposal for alternative objectives/modes beyond the 
 * Validate on the same split: ensure `hit@K` monotonically increases with K and no unexpected regressions occur at hit@3.
 * End-to-end proxy: optionally measure encoder wall-clock on a fixed image set for K values (8/16/32).
 
+**Current recommended bundle (distilled student)**
+* Use `ml/runs/codex_filteri_student_64_32_20251230a/artifacts/trial_0000/bundle.json` (hidden sizes `[64,32]`).
+  * Source: distilled from `ml/runs/codex_distill_filteri_20251230a/artifacts/trial_0001/bundle.json`.
+  * Reported valid: `hit@32 ≈ 98.125%`, `hit@16 ≈ 96.655%`.
+* To promote a different bundle into a new run dir: `python ml/promote_bundle.py --src-bundle <path/to/bundle.json> --run-id <new_run_id>`.
+
 ### Mode B — Two-Stage Re-Rank (Relax “independent heads only”)
 
 **What to relax**
